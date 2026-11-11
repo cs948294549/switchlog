@@ -1,0 +1,15 @@
+# 实际配置带数据库口令，只提交 config_example.py
+config/config.py
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+logs/
+*.log
+
+.idea/
+.vscode/
+.DS_Store
