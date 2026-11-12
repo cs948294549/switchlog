@@ -2,11 +2,11 @@
 """
 测试样本：mock 表数据 + 现场报文
 
-四张表的数据字段名和 sql/schema.sql 一字不差，表定稿后整段搬进 insert 即可。
+五张表的数据字段名和 sql/schema.sql 一字不差，表定稿后整段搬进 insert 即可。
 报文样本取自现网日志（已脱敏），覆盖三种兜底路径：
 未纳管 IP、报文不可读、mnemonic 没配规则。
 
-数据在这里，替身在 mock_db.py，跑法在 replay.py。
+数据在这里，替身在 mock_db.py，跑法在 ../test.py。
 """
 import logging
 
@@ -44,6 +44,20 @@ MOCK_DEVICES = {
                    "hardware": "FortiGate-600E", "syscontact": "ZC2022004510",
                    "sysdesc": "FortiGate-600E v7.0.12",
                    "sys_type": "firewall"},
+    # 下面三台专门给定级规则用：同一条 IF_DOWN 日志，三台设备三个结果。
+    # 命名前缀的含义见 docs/network/设备命名规范.md，csw=内网核心、rsw=接入
+    "10.19.19.1":  {"vendor": "cisco_nx", "sysname": "csw1_dc19_m01",
+                    "hardware": "N9K-C9336C-FX2", "syscontact": "ZC2024003001",
+                    "sysdesc": "Cisco Nexus Operating System (NX-OS) Software",
+                    "sys_type": "switch"},
+    "10.19.19.11": {"vendor": "cisco_nx", "sysname": "rsw1_dc19_m05",
+                    "hardware": "N9K-C93180YC-FX", "syscontact": "ZC2024003011",
+                    "sysdesc": "Cisco Nexus Operating System (NX-OS) Software",
+                    "sys_type": "switch"},
+    "10.19.9.31":  {"vendor": "cisco_nx", "sysname": "rsw1_corp_ts_m21",
+                    "hardware": "N9K-C93180YC-FX", "syscontact": "ZC2022004531",
+                    "sysdesc": "Cisco Nexus Operating System (NX-OS) Software",
+                    "sys_type": "switch"},
     # 纳管了但 vendor 还没采到，走 UNMANAGED_SRC 的另一条路径
     "10.19.9.99": {"vendor": "",         "sysname": "unknown_dev",
                    "hardware": "", "syscontact": "", "sysdesc": "",
@@ -81,6 +95,16 @@ MOCK_PORTS = {
         {"if_name": "GigabitEthernet0/0/1", "alias": "to asw1_dc08_m02"},
         {"if_name": "XGigabitEthernet0/0/1", "alias": "to bbs1_dc08_m02"},
         {"if_name": "Eth-Trunk1", "alias": "uplink-lag"},
+    ],
+    # 定级用的三台
+    "10.19.19.1": [
+        {"if_name": "Ethernet1/10", "alias": "pT:rsw1_dc19_m05:100G1/49"},
+    ],
+    "10.19.19.11": [
+        {"if_name": "Ethernet1/10", "alias": "srv:dc19-m05-rack03"},
+    ],
+    "10.19.9.31": [
+        {"if_name": "Ethernet1/10", "alias": "office:ts-m21-3F-ap07"},
     ],
 }
 
@@ -282,52 +306,124 @@ MOCK_RULES = [
 # ============================================================
 # syslog_event：事件属性，按 event_code 一行
 #
-# severity / state / object_type / window_sec / threshold / clear_code
-# 都在这里，不在匹配行上 —— IF_DOWN 有三条 mnemonic × 几家厂商，
-# 属性存一份，改级别改一行、全厂商同时生效。
+# state / object_type / window_sec / threshold / clear_code 都在这里，
+# 不在匹配行上 —— IF_DOWN 有三条 mnemonic × 几家厂商，属性存一份，
+# 改窗口改一行、全厂商同时生效。
+#
+# 没有 severity：级别取决于"哪个事件 + 哪台设备"，在下面那张
+# MOCK_SEVERITY_RULES 里定。
 #
 # L1 不读这张表：它在 L2 富化之后才查。
-# 前三行是解析器自己产生的兜底码，必须存在，否则级别没地方调。
+# 前三行是解析器自己产生的兜底码，必须存在，否则窗口没地方调。
 # ============================================================
 MOCK_EVENTS = [
-    {"event_code": "UNKNOWN_MNEMONIC", "severity": 3, "state": "stateless", "object_type": "none",
+    {"event_code": "UNKNOWN_MNEMONIC", "state": "stateless", "object_type": "none",
      "window_sec": 600, "threshold": 1, "clear_code": "",
      "descr": "mnemonic 在规则表里没有对应规则，同时是规则缺口清单"},
-    {"event_code": "PARSE_FAIL", "severity": 3, "state": "stateless", "object_type": "none",
+    {"event_code": "PARSE_FAIL", "state": "stateless", "object_type": "none",
      "window_sec": 600, "threshold": 5, "clear_code": "",
      "descr": "信封解析失败，单台设备持续发垃圾日志即配置错误"},
-    {"event_code": "UNMANAGED_SRC", "severity": 3, "state": "stateless", "object_type": "none",
+    {"event_code": "UNMANAGED_SRC", "state": "stateless", "object_type": "none",
      "window_sec": 600, "threshold": 1, "clear_code": "",
      "descr": "src_ip 在 devices 表里查不到厂商，用于发现未纳管设备"},
 
-    {"event_code": "IF_DOWN", "severity": 2, "state": "raise", "object_type": "interface",
+    {"event_code": "IF_DOWN", "state": "raise", "object_type": "interface",
      "window_sec": 300, "threshold": 1, "clear_code": "IF_UP", "descr": "端口 down"},
-    {"event_code": "IF_UP", "severity": 3, "state": "clear", "object_type": "interface",
+    {"event_code": "IF_UP", "state": "clear", "object_type": "interface",
      "window_sec": 300, "threshold": 1, "clear_code": "", "descr": "端口 up"},
-    {"event_code": "LAG_DOWN", "severity": 1, "state": "raise", "object_type": "interface",
+    {"event_code": "LAG_DOWN", "state": "raise", "object_type": "interface",
      "window_sec": 300, "threshold": 1, "clear_code": "LAG_UP", "descr": "聚合口 down"},
-    {"event_code": "LAG_UP", "severity": 3, "state": "clear", "object_type": "interface",
+    {"event_code": "LAG_UP", "state": "clear", "object_type": "interface",
      "window_sec": 300, "threshold": 1, "clear_code": "", "descr": "聚合口 up"},
-    {"event_code": "LAG_MEMBER_CHG", "severity": 3, "state": "stateless", "object_type": "interface",
+    {"event_code": "LAG_MEMBER_CHG", "state": "stateless", "object_type": "interface",
      "window_sec": 600, "threshold": 1, "clear_code": "", "descr": "聚合口成员变化"},
-    {"event_code": "BGP_DOWN", "severity": 1, "state": "raise", "object_type": "peer",
+    {"event_code": "BGP_DOWN", "state": "raise", "object_type": "peer",
      "window_sec": 300, "threshold": 1, "clear_code": "BGP_UP", "descr": "BGP 邻居 down"},
-    {"event_code": "BGP_UP", "severity": 3, "state": "clear", "object_type": "peer",
+    {"event_code": "BGP_UP", "state": "clear", "object_type": "peer",
      "window_sec": 300, "threshold": 1, "clear_code": "", "descr": "BGP 邻居 up"},
-    {"event_code": "MAC_FLAP", "severity": 2, "state": "stateless", "object_type": "mac",
+    {"event_code": "MAC_FLAP", "state": "stateless", "object_type": "mac",
      "window_sec": 600, "threshold": 3, "clear_code": "", "descr": "MAC 漂移，到阈值才告警"},
     # 下面两个是噪声码：enabled=1 让 L1 认得它们、不落进规则缺口清单，
     # 真正的拦截在 L3 配 drop 规则，不在这里靠 enabled=0 关
-    {"event_code": "BFD_SESSION_CHG", "severity": 3, "state": "stateless", "object_type": "peer",
+    {"event_code": "BFD_SESSION_CHG", "state": "stateless", "object_type": "peer",
      "window_sec": 600, "threshold": 1, "clear_code": "",
      "descr": "BFD 会话删除/迁移，BGP_DOWN 的伴生日志，L3 drop"},
-    {"event_code": "IF_ATTR_CHG", "severity": 3, "state": "stateless", "object_type": "interface",
+    {"event_code": "IF_ATTR_CHG", "state": "stateless", "object_type": "interface",
      "window_sec": 600, "threshold": 1, "clear_code": "",
-     "descr": "速率/双工/流控变化，端口 up 的伴生日志，L3 drop"},
-    {"event_code": "CONFIG_CHG", "severity": 3, "state": "stateless", "object_type": "none",
+     "descr": "速率/双工/流控变化，端口 up 的伴生日志，建议配黑名单"},
+    # L5 自己产生的码，没有对应 mnemonic，不在 MOCK_RULES 里。
+    # clear_code 留空是故意的：闪断禁止自动恢复，必须人工确认
+    {"event_code": "IF_FLAP", "state": "raise", "object_type": "interface",
+     "window_sec": 1800, "threshold": 3, "clear_code": "",
+     "descr": "端口闪断，L5 长窗口计数升级产生，禁止自动恢复"},
+    {"event_code": "CONFIG_CHG", "state": "stateless", "object_type": "none",
      "window_sec": 600, "threshold": 1, "clear_code": "", "descr": "配置变更"},
-    {"event_code": "LOGIN_FAIL", "severity": 3, "state": "stateless", "object_type": "none",
+    {"event_code": "LOGIN_FAIL", "state": "stateless", "object_type": "none",
      "window_sec": 600, "threshold": 1, "clear_code": "", "descr": "登录失败"},
+]
+
+# ============================================================
+# syslog_severity_rule：(event_code, ip, sysname) -> severity
+#
+# 字段与 sql/schema.sql 的 syslog_severity_rule 一致：
+#   rule_id event_code ip_reg sysname_reg severity action priority descr
+#
+# 级别不是事件的固有属性 —— 同一个 IF_DOWN，csw 掉口是核心网段断了，
+# rsw 掉口是一个机柜的接入，corp 职场的 rsw 掉口压根不用看。
+#
+# IF_DOWN 的候选链（priority 升序，首条命中即停）：
+#     corp rsw -> csw -> rsw -> IF_DOWN 默认 -> *
+# 其余事件码没写专门行，直接落最后那条 '*'。
+#
+# 几条刻意保留的用法：
+#   * priority 控顺序：corp 那条必须小于通用 rsw，否则 rsw1_corp_ts_m21
+#     会先命中 ^rsw 被降成 P3，而不是被忽略
+#   * action=ignore：不开告警，但事件照样走完管线、日志照样归档
+#   * event_code='*' 的全局兜底，缺了加载时会打 error
+#   * rule 7 用 ip_reg 而不是 sysname_reg，验证两种判据都能走
+# ============================================================
+MOCK_SEVERITY_RULES = [
+    # 判据最窄的排最前。severity 填 3 只是占位，action=ignore 时级别不参与告警
+    {"rule_id": 1, "event_code": "IF_DOWN", "ip_reg": "", "sysname_reg": r"^rsw.*corp",
+     "severity": 3, "action": "ignore", "priority": 10, "enabled": 1,
+     "descr": "corp 职场接入口 down 不告警，单机柜接入无冗余且有人值守"},
+    # 同一个 IF_DOWN，核心和接入不是一个量级
+    {"rule_id": 2, "event_code": "IF_DOWN", "ip_reg": "", "sysname_reg": r"^csw",
+     "severity": 1, "action": "", "priority": 50, "enabled": 1,
+     "descr": "核心口 down 升 P1，csw 是内网网段网关"},
+    {"rule_id": 3, "event_code": "IF_DOWN", "ip_reg": "", "sysname_reg": r"^rsw",
+     "severity": 3, "action": "", "priority": 50, "enabled": 1,
+     "descr": "接入口 down 降 P3，rsw 是 ToR，影响一个机柜"},
+    # 各事件码的默认级别，没有设备判据
+    {"rule_id": 4, "event_code": "IF_DOWN", "ip_reg": "", "sysname_reg": "",
+     "severity": 2, "action": "", "priority": 100, "enabled": 1,
+     "descr": "端口 down 的默认级别"},
+    {"rule_id": 5, "event_code": "LAG_DOWN", "ip_reg": "", "sysname_reg": "",
+     "severity": 1, "action": "", "priority": 100, "enabled": 1,
+     "descr": "聚合口全断，不分角色都是 P1"},
+    {"rule_id": 6, "event_code": "BGP_DOWN", "ip_reg": "", "sysname_reg": "",
+     "severity": 1, "action": "", "priority": 100, "enabled": 1,
+     "descr": "BGP 邻居 down"},
+    # 按网段定级：10.19.9.x 是测试环境，级别压一档
+    {"rule_id": 7, "event_code": "MAC_FLAP", "ip_reg": r"^10[.]19[.]9[.]",
+     "sysname_reg": "", "severity": 3, "action": "", "priority": 50, "enabled": 1,
+     "descr": "测试网段的 MAC 漂移降 P3，验证 ip_reg 判据"},
+    {"rule_id": 8, "event_code": "MAC_FLAP", "ip_reg": "", "sysname_reg": "",
+     "severity": 2, "action": "", "priority": 100, "enabled": 1,
+     "descr": "MAC 漂移"},
+    # 闪断不分角色都是 P1。注意它不继承 IF_DOWN 的定级：corp rsw 的
+    # IF_DOWN 配了 ignore，但同一个口真闪起来照样升出 IF_FLAP 按 P1 告警
+    {"rule_id": 11, "event_code": "IF_FLAP", "ip_reg": "", "sysname_reg": "",
+     "severity": 1, "action": "", "priority": 100, "enabled": 1,
+     "descr": "端口闪断，L5 升级产生"},
+    # 停用的规则：加载时被 enabled 过滤掉，验证开关
+    {"rule_id": 9, "event_code": "BGP_UP", "ip_reg": "", "sysname_reg": "",
+     "severity": 1, "action": "", "priority": 50, "enabled": 0,
+     "descr": "停用示例：恢复事件没有升 P1 的道理，留着验证 enabled"},
+    # 全局兜底。唯一允许匹配全网所有事件的规则，删了会打 error
+    {"rule_id": 10, "event_code": "*", "ip_reg": "", "sysname_reg": "",
+     "severity": 3, "action": "", "priority": 999, "enabled": 1,
+     "descr": "全局兜底，没写专门规则的事件码都是 P3"},
 ]
 MOCK_MESSAGES = [
     # ---- §4.7 一次 port-channel 掉线 ----
@@ -433,6 +529,33 @@ MOCK_MESSAGES = [
     ("10.19.7.1",
      "<189>Nov 11 09:31:40 pcs1_dc07_m01 Configured from vty by admin on 10.1.2.3",
      "CONFIG_CHG", "-"),
+
+    # ---- L2.5 定级：同一条 IF_DOWN，三台设备三个结果 ----
+    # 报文除了设备名一模一样，event_code 和 object 也一样，
+    # 差别只在 severity —— 期望值这两列对不出区别，看 test.py 的定级那段
+    ("10.19.19.1",
+     "<189>Nov 11 10:00:01 csw1_dc19_m01 %ETHPORT-5-IF_DOWN: "
+     "Interface Ethernet1/10, changed state to down",
+     "IF_DOWN", "Ethernet1/10"),              # csw  -> P1，rule 2
+    ("10.19.19.11",
+     "<189>Nov 11 10:00:02 rsw1_dc19_m05 %ETHPORT-5-IF_DOWN: "
+     "Interface Ethernet1/10, changed state to down",
+     "IF_DOWN", "Ethernet1/10"),              # rsw  -> P3，rule 3
+    ("10.19.9.31",
+     "<189>Nov 11 10:00:03 rsw1_corp_ts_m21 %ETHPORT-5-IF_DOWN: "
+     "Interface Ethernet1/10, changed state to down",
+     "IF_DOWN", "Ethernet1/10"),              # corp rsw -> ignore，rule 1
+    # 同一台 csw 的 LAG_DOWN 没有专门规则，落 LAG_DOWN 的默认行 P1
+    ("10.19.19.1",
+     "<189>Nov 11 10:00:04 csw1_dc19_m01 "
+     "%ETHPORT-5-IF_DOWN_PORT_CHANNEL_MEMBERS_DOWN: Interface port-channel10 is down "
+     "(No operational members)",
+     "LAG_DOWN", "port-channel10"),
+    # csw 的 IF_UP 没有专门规则，落全局兜底 '*' 的 P3
+    ("10.19.19.1",
+     "<189>Nov 11 10:05:01 csw1_dc19_m01 %ETHPORT-5-IF_UP: "
+     "Interface Ethernet1/10, operational state changed to up",
+     "IF_UP", "Ethernet1/10"),
 ]
 
 # ============================================================

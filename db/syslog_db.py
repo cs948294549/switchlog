@@ -2,10 +2,11 @@
 """
 syslog_* 规则表读取
 
-三张表对应管线的三层，各读各的，互不依赖：
-    syslog_black_list   L0.5 解析前拦截（mnemonic / 全文子串）
-    syslog_rule         L1   匹配规则（vendor + mnemonic -> event_code）
-    syslog_event        L2.5 事件属性（severity/state/object_type/窗口/clear_code）
+四张表对应管线的三层，各读各的，互不依赖：
+    syslog_black_list     L0.5 解析前拦截（mnemonic / 全文子串）
+    syslog_rule           L1   匹配规则（vendor + mnemonic -> event_code）
+    syslog_event          L2.5 事件属性（state/object_type/窗口/clear_code）
+    syslog_severity_rule  L2.5 事件定级（event_code + 设备 -> severity）
 """
 import logging
 
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class SyslogRuleDB(object):
-    """syslog_black_list / syslog_rule / syslog_event 的读"""
+    """syslog_black_list / syslog_rule / syslog_event / syslog_severity_rule 的读"""
 
     # ---------------- L0.5 ----------------
 
@@ -66,18 +67,43 @@ class SyslogRuleDB(object):
 
     def getSyslogEvents(self):
         """
-        事件属性。一个 event_code 一行，改级别只改一处、全厂商同时生效。
+        事件属性。一个 event_code 一行，改窗口只改一处、全厂商同时生效。
+
+        不含 severity —— 级别取决于"哪个事件 + 哪台设备"两个维度，
+        在 syslog_severity_rule 里定，见 getSeverityRules()。
         """
         sql = '''
-        select event_code, severity, state, object_type, window_sec, threshold,
+        select event_code, state, object_type, window_sec, threshold,
                clear_code, descr
         from syslog_event where enabled=1 order by event_code
         '''
-        proper = ["event_code", "severity", "state", "object_type", "window_sec",
+        proper = ["event_code", "state", "object_type", "window_sec",
                   "threshold", "clear_code", "descr"]
         try:
             with MySQLConnection() as conn:
                 return conn.query(sql, proper=proper)
         except Exception as err:
             logger.error("======SyslogRuleDB getSyslogEvents error========\n%s", err)
+            return []
+
+    def getSeverityRules(self):
+        """
+        事件定级规则。同一个事件码在不同角色的设备上不是一个级别
+        （csw 的 IF_DOWN 是 P1，rsw 的是 P3），所以按 event_code + 设备判。
+
+        order by 只为让加载日志稳定；真正的匹配顺序由 SeverityIndex
+        按 (priority, rule_id) 排，priority 小的先判，首条命中即停。
+        """
+        sql = '''
+        select rule_id, event_code, ip_reg, sysname_reg, severity, action,
+               priority, descr
+        from syslog_severity_rule where enabled=1 order by priority, rule_id
+        '''
+        proper = ["rule_id", "event_code", "ip_reg", "sysname_reg", "severity",
+                  "action", "priority", "descr"]
+        try:
+            with MySQLConnection() as conn:
+                return conn.query(sql, proper=proper)
+        except Exception as err:
+            logger.error("======SyslogRuleDB getSeverityRules error========\n%s", err)
             return []

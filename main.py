@@ -157,17 +157,42 @@ class Worker(threading.Thread):
     @staticmethod
     def _on_event(event):
         """
-        L3~L6 未实现时的出口：把解析结果打出来
+        每条日志的解析结果 + 告警动作
 
-        这一版的作用是验证链路和统计规则缺口。L6 落地后这里改成
-        写 alarm_list，日志降为 debug。
+        落库和通知都在 L6 里做完了，这里只是打日志。解析那行是 debug，
+        日志量大的时候不该刷屏；真产生了告警动作的打 warning。
         """
-        logger.info(
+        logger.debug(
             "%s %s %s %s severity=%s object=%s if=%s alias=%s",
             event.get("ip"), event.get("hostname"),
             event.get("event_code"), event.get("vendor"),
             event.get("severity_name", "-"), event.get("alarm_object"),
             event.get("if_name") or "-", event.get("if_alias") or "-")
+        log_decision(event.get("decision"))
+
+
+def log_decision(decision):
+    """
+    把告警动作打一行到 switchlog.log
+
+    这是给人看的那份，机器读的在 logs/notify.log（一行一条 JSON）。
+    被静默的也打，但标出来 —— 割接期间得能看出"告警产生了，只是没通知"，
+    否则看着像管线漏了。
+    """
+    if not decision or not decision.get("notify"):
+        return
+    tail = ""
+    if decision.get("muted"):
+        tail = "  [静默 rule {}，不通知]".format(decision.get("mute_rule_id"))
+    if decision.get("flapping"):
+        tail += "  [闪断，需人工确认]"
+    if decision.get("reason") == "mute_expired":
+        tail += "  [静默窗口已结束，故障仍未恢复]"
+    logger.warning(
+        "告警 %s  %s  %s %s  %s  count=%s%s",
+        decision.get("action"), decision.get("severity_name", "-"),
+        decision.get("ip"), decision.get("alarm_object", "-"),
+        decision.get("event_code"), decision.get("counter", 0), tail)
 
 
 # ============================================================
@@ -176,6 +201,22 @@ class Worker(threading.Thread):
 
 class Maintenance(threading.Thread):
     """定时刷新规则、清理缓存、打统计"""
+
+    # alarm_log 清理间隔。删的是 7 天前的数据，一小时跑一次足够，
+    # 和规则刷新分开 —— 那个 300s 一次，带上删表会把刷新也拖慢
+    PURGE_INTERVAL = 3600
+
+    # 到期扫描间隔。两件事等不了 5 分钟：stateless 事件静默恢复、
+    # 静默窗口过了但故障还在要恢复通知
+    SWEEP_INTERVAL = 60
+
+    # 落库间隔。和规则刷新（300s）分开：
+    #   alarm_log 攒着的原子记录
+    #   syslog_alarm_state 变动过的告警状态 —— 隔得越久，崩了丢得越多
+    #   alarm_list.counter 累加出来的值 —— 隔得越久，看板滞后越久
+    # 10s 是个折中：看板看着是实时的，写入量又不跟日志量涨
+    # （dirty 是 set，一个指纹一轮最多写一次）
+    PERSIST_INTERVAL = 10
 
     def __init__(self, runner, queues, stop_event,
                  refresh_interval, stats_interval):
@@ -189,22 +230,45 @@ class Maintenance(threading.Thread):
     def run(self):
         next_refresh = time.time() + self.refresh_interval
         next_stats = time.time() + self.stats_interval
+        next_sweep = time.time() + self.SWEEP_INTERVAL
+        next_persist = time.time() + self.PERSIST_INTERVAL
+        # 启动时不立刻删表，等一个间隔 —— 刚起来的时候让收包先稳住
+        next_purge = time.time() + self.PURGE_INTERVAL
         while not self.stop_event.is_set():
             if self.stop_event.wait(1):
                 break
             now = time.time()
+            if now >= next_persist:
+                next_persist = now + self.PERSIST_INTERVAL
+                try:
+                    self.runner.persist(now=now)
+                except Exception as err:
+                    logger.error("落库失败：%s", err)
             if now >= next_refresh:
                 next_refresh = now + self.refresh_interval
                 try:
                     self.runner.tick()
                 except Exception as err:
                     logger.error("规则刷新失败：%s", err)
+            if now >= next_sweep:
+                next_sweep = now + self.SWEEP_INTERVAL
+                try:
+                    for decision in self.runner.sweep(now=now):
+                        log_decision(decision)
+                except Exception as err:
+                    logger.error("到期扫描失败：%s", err)
             if now >= next_stats:
                 next_stats = now + self.stats_interval
                 try:
                     stats.log_interval([q.qsize() for q in self.queues])
                 except Exception as err:
                     logger.error("统计输出失败：%s", err)
+            if now >= next_purge:
+                next_purge = now + self.PURGE_INTERVAL
+                try:
+                    self.runner.purge_logs(now=now)
+                except Exception as err:
+                    logger.error("alarm_log 清理失败：%s", err)
 
 
 # ============================================================
@@ -219,8 +283,24 @@ def run_service(args):
 
     # 先把规则加载一遍，起服务时就知道规则表和事件表读没读到；
     # 加载失败的话，收进来的日志会全线落 UNKNOWN_MNEMONIC
-    logger.info("规则表：黑名单 %s 条，匹配规则 %s 条，事件属性 %s 个",
-                runner.blacklist.size(), runner.parser.size(), runner.attrs.size())
+    logger.info("规则表：黑名单 %s 条，匹配规则 %s 条，事件属性 %s 个，定级规则 %s 条",
+                runner.blacklist.size(), runner.parser.size(),
+                runner.attrs.size(), runner.attrs.severity_size())
+
+    logger.info("静默规则 %s 条", runner.mute.size())
+    # 两个开关都该是 True，关掉任一个都会让告警看不见或者推不出去，
+    # 起服务时打出来，免得配错了找半天
+    logger.info("告警出口：落 alarm_list=%s，推通知=%s（通道 %s）",
+                Config.alarm_write_db, Config.alarm_notify, Config.notify_channel)
+
+    # 回放未恢复的告警。不放的话重启后同一个还没好的故障会重新开告警，
+    # 等于重复通知一次。两层各回放自己的：L4 回放窗口、L5 回放告警状态
+    restored = runner.aggregator.restore()
+    if restored:
+        logger.info("回放 %s 个指纹的聚合窗口", restored)
+    restored = runner.state_machine.restore()
+    if restored:
+        logger.info("回放 %s 条未恢复告警", restored)
 
     workers = [Worker(i, queues[i], runner, stop_event) for i in range(args.workers)]
     for worker in workers:

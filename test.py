@@ -1,397 +1,333 @@
 # -*- coding: utf-8 -*-
 """
-拿样本报文跑一遍管线，逐条对 (event_code, object)
+贴一条报文，看它在管线每一层被改成什么样
 
-链路是 L0 prepare -> L0.5 黑名单 -> L1 解析 -> L2 富化 -> L2.5 事件属性：
-mnemonic 在 prepare 里剥一次，黑名单和 parser 共用；黑名单命中的直接丢，不进 parser。
-L2 按源 IP 查 devices 补 sysname/hardware/syscontact(资产号)，查 ports 补接口描述。
-L2.5 按 event_code 查 syslog_event 补 severity/state/窗口/clear_code。
+改下面的 a 然后跑：
+    cd projects/switchlog
+    python test.py
+
+链路 L0 prepare -> L0.5 黑名单 -> L1 解析 -> L2 富化 -> L2.5 属性 + 定级，
+每层打一次完整记录，新增或变化的字段前面标 +。
+
+L2.5 分两步打：syslog_event 给 state/窗口/clear_code，
+syslog_severity_rule 按 (event_code, ip, sysname) 定 severity。
+定级那段会打出命中的规则和它为什么命中。
 
 数据全部来自 tests/fixtures.py 的内存表，不连 MySQL，也不看 config.use_mock_db。
-
-跑：
-    cd projects/switchlog
-    python test.py                   # 全部样本
-    python test.py -v                # 多打 L2 富化 / L2.5 属性 / 指纹收敛 / 黑名单四张表
-    python test.py dc05              # 只跑 bbs1_dc05_m01_new 那段现场日志
-    python test.py black             # 只跑黑名单的拦/放判定
-    python test.py 10.16.249.5       # 位置参数当源 IP 过滤
-    python test.py -i "2026 Nov  4 00:13:08.109 sw %ETHPORT-5-IF_UP: ..."
-
-样本带期望值，对不上打 FAIL，退出码非 0，规则表改动后可以直接当回归用。
-自己贴的报文没有期望值，判定列是 "-"，只看解析结果。
-
-回放真实日志文件走 main.py：
-    python main.py --replay syslog/xxx.txt --ip 10.16.249.5
+样本报文可以从 tests/fixtures.py 的 MOCK_MESSAGES / MOCK_MESSAGES_DC05 里挑。
+回放真实日志走 main.py --replay。
 """
-import sys
-import hashlib
 import logging
 
 from pipeline.prepare import prepare
 from pipeline.blacklist import BlacklistFilter
 from pipeline.parser import SyslogParser
 from pipeline.enrich import DeviceEnricher
-from pipeline.attrs import EventAttrs
-from pipeline.runner import Runner
+from pipeline.attrs import EventAttrs, severity_name, STATE_IGNORE
+from pipeline.aggregate import Aggregator
+from pipeline.state_machine import StateMachine
+from pipeline.suppress import MuteFilter
 from tests.mock_db import MockSyslogDB
-from tests.fixtures import (
-    MOCK_MESSAGES_ALL, MOCK_MESSAGES_DC05, MOCK_MESSAGES_BLACK
-)
 
 logger = logging.getLogger(__name__)
 
-MSG_WIDTH = 96
+# 值打多宽，超了截断
+VAL_WIDTH = 110
 
-# 黑名单拦掉的日志不进 parser，event_code 列显示这个
-BLOCKED = "(blacklist)"
+# 第一步打表时挡掉的字段：定级那三个归第二步，raise_code 是给 L4 用的
+GRADE_FIELDS = ("severity", "severity_name", "severity_rule_id", "raise_code")
+
+# ============================================================
+# 要跑的报文：ip 是源 IP，message 是原始报文，timestamp 是采集时间
+# ============================================================
+a = {
+    "ip": "10.16.249.5",
+    "message": '''2026 Sep 22 15:15:25.144 bbs1_dc05_m01_new %ETHPORT-5-IF_DOWN_LINK_FAILURE: Interface Ethernet1/1 (description:pT:bbs1_dc07_m01:100G1/4) is down (Link failure)''',
+    "timestamp": 1762800000,
+}
+
+# 换着试的几条（取消注释即可）：
+# a = {"ip": "10.19.7.1", "message": "<189>2026 Oct  9 05:18:56.565 pcs1_dc07_m01 "
+#      "%ETH_PORT_CHANNEL-5-FOP_CHANGED: port-channel38: first operational port "
+#      "changed from Ethernet1/38 to none"}                      # LAG_DOWN
+# a = {"ip": "10.19.8.11", "message": "<189>Nov 11 09:12:33 asw1_dc08_m02 "
+#      "%%10IFNET/3/PHY_UPDOWN: Physical state on the interface "
+#      "GigabitEthernet1/0/1 changed to down."}                  # H3C IF_DOWN
+# a = {"ip": "10.16.249.5", "message": "2026 Nov  4 09:00:01.100 bbs1_dc05_m01_new "
+#      "%SSHD-6-SESSION_CONNECTED: ssh session connected from 10.1.2.3"}  # 黑名单拦掉
+# a = {"ip": "10.19.250.8", "message": "<189>Oct 11 14:03:08.109 some_dev "
+#      "%ETHPORT-5-IF_DOWN: Interface Ethernet1/1, changed state to down"}  # 未纳管
+#
+# 定级：下面三条报文除了设备名一模一样，event_code 和 object 也一样，
+# 级别分别是 P1 / P3 / 不告警。换着跑看定级那段
+# a = {"ip": "10.19.19.1", "message": "<189>Nov 11 10:00:01 csw1_dc19_m01 "
+#      "%ETHPORT-5-IF_DOWN: Interface Ethernet1/10, changed state to down"}  # csw -> P1
+# a = {"ip": "10.19.19.11", "message": "<189>Nov 11 10:00:02 rsw1_dc19_m05 "
+#      "%ETHPORT-5-IF_DOWN: Interface Ethernet1/10, changed state to down"}  # rsw -> P3
+# a = {"ip": "10.19.9.31", "message": "<189>Nov 11 10:00:03 rsw1_corp_ts_m21 "
+#      "%ETHPORT-5-IF_DOWN: Interface Ethernet1/10, changed state to down"}  # corp -> ignore
 
 
-def build(**kwargs):
-    """
-    建一条完整的 L0 ~ L2.5 链路，各层共用同一个 mock 库。
+# 静默规则。默认给一条进行中的割接，盖住 10.16.249.5 ——
+# 默认那条样本报文就是这台设备，一跑就能看到 mute 的效果。
+# 想看不静默的样子，把 MUTE_RULES 改成 []
+MUTE_RULES = [
+    {"rule_id": 1, "ip_reg": r"^10[.]16[.]249[.]5$", "event_code_reg": "",
+     "object_reg": "", "start_time": "", "end_time": "", "enabled": 1,
+     "descr": "示例：这台设备在割接窗口里，告警入库但不通知"},
+]
+
+
+def build():
+    """一条完整的 L0 ~ L3 链路，各层共用同一个 mock 库
 
     refresh_interval=0：不起刷新线程，规则只加载一次
-    enricher 用默认 TTL：同一台设备只查一次库，和线上行为一致
     """
-    db = MockSyslogDB(**kwargs)
-    blacklist = BlacklistFilter(refresh_interval=0, db=db)
-    parser = SyslogParser(refresh_interval=0, db=db)
-    enricher = DeviceEnricher(db=db)
-    attrs = EventAttrs(refresh_interval=0, db=db)
-    runner = Runner(blacklist=blacklist, parser=parser, enricher=enricher, attrs=attrs)
-    return blacklist, runner, db
+    db = MockSyslogDB(mute_rules=MUTE_RULES)
+    return (
+        BlacklistFilter(refresh_interval=0, db=db),
+        SyslogParser(refresh_interval=0, db=db),
+        DeviceEnricher(db=db),
+        EventAttrs(refresh_interval=0, db=db),
+        Aggregator(db=db),
+        StateMachine(db=db),
+        MuteFilter(refresh_interval=0, db=db),
+        db,
+    )
 
 
-def fingerprint_of(ip, event_code, alarm_object):
-    """L4 指纹，这里只为看收敛效果，真实计算在 aggregate.py"""
-    key = "{}|{}|{}".format(ip or "-", event_code or "-", alarm_object or "-")
-    return hashlib.md5(key.encode("utf-8")).hexdigest()
+def shorten(value):
+    text = str(value).replace("\n", " ").replace("\r", " ")
+    return text if len(text) <= VAL_WIDTH else text[:VAL_WIDTH - 3] + "..."
 
 
-def shorten(text, width=MSG_WIDTH):
-    text = str(text or "").replace("\n", " ").replace("\r", " ")
-    return text if len(text) <= width else text[:width - 3] + "..."
-
-
-def run(messages=None, verbose=False, blacklist=None, runner=None):
+def show(layer, record, before=None, skip=()):
     """
-    逐条走链路并打表
+    打一层的结果，新增或变化的字段标 +
 
-    :param messages: [(ip, msg)] 或 [(ip, msg, want_code, want_object)]
-    :return: {"total", "failed", "blocked", "rows"}
+    :param skip: 不打的字段。L2.5 两步都在 fill() 里做完，
+                 第一步要把第二步的字段挡掉，否则看不出是哪步补的
     """
-    if blacklist is None or runner is None:
-        blacklist, runner, _ = build()
-    messages = messages if messages is not None else MOCK_MESSAGES_ALL
-    rows = []
-    failed = 0
-    blocked_count = 0
-
-    for item in messages:
-        ip, message = item[0], item[1]
-        want_code = item[2] if len(item) > 2 else None
-        want_object = item[3] if len(item) > 3 else None
-
-        event = runner.handle({"ip": ip, "message": message, "timestamp": 1762800000})
-        if event is None:
-            blocked_count += 1
-            row = _blocked_row(ip, message, blacklist)
-        else:
-            row = _event_row(ip, message, event)
-
-        # 没给期望值就只看结果，不判定
-        if want_code is None:
-            row["ok"] = None
-        else:
-            row["ok"] = (row["event_code"] == want_code and row["object"] == want_object)
-            if not row["ok"]:
-                failed += 1
-        row["want_code"] = want_code
-        row["want_object"] = want_object
-        # 行号跟着行走，收敛表过滤掉被拦的行之后编号仍对得上主表
-        row["line"] = len(rows) + 1
-        rows.append(row)
-
-    _print_rows(rows, verbose=verbose)
-    if verbose:
-        # 被拦的不参与指纹收敛，它们根本没进告警链路
-        _print_groups([row for row in rows if not row["blocked"]])
-        _print_l2(rows)
-        _print_attrs(rows)
-        _print_blacklist(blacklist)
-
-    checked = len([row for row in rows if row["ok"] is not None])
-    print("\n样本 {} 条，黑名单拦 {} 条，判定 {} 条，FAIL {} 条".format(
-        len(rows), blocked_count, checked, failed))
-    return {"total": len(rows), "failed": failed, "blocked": blocked_count, "rows": rows}
+    before = before if before is not None else {}
+    print("\n--- {} ---".format(layer))
+    for key, value in record.items():
+        if key in skip:
+            continue
+        mark = "+" if key not in before or before[key] != value else " "
+        print(" {} {:<18}{}".format(mark, key, shorten(value)))
 
 
-def _blocked_row(ip, message, blacklist):
-    """被拦的日志：从黑名单规则里取命中的那一条，没有上下文可补"""
-    rule = blacklist.match({"ip": ip, "message": message})
-    return {
-        "ip": ip, "msg": message, "object": "-", "event_code": BLOCKED,
-        "vendor": "-", "rule_id": rule.rule_id if rule else 0,
-        "blocked": True,
-        "black_pattern": "{}={}".format(rule.scope, rule.pattern) if rule else "",
-        "sysname": "-", "hardware": "-", "syscontact": "-",
-        "if_name": "", "if_alias": "", "src_state": "",
-        "severity": "", "severity_name": "", "state": "", "object_type": "",
-        "clear_code": "",
-    }
+def main():
+    blacklist, parser, enricher, attrs, aggregator, machine, mute, db = build()
 
+    print("== 原始报文 ==")
+    print("  ip      {}".format(a.get("ip", "-")))
+    print("  message {}".format(shorten(a.get("message", ""))))
 
-def _event_row(ip, message, event):
-    return {
-        "ip": ip, "msg": message,
-        "object": event.get("alarm_object", "-"),
-        "event_code": event.get("event_code", ""),
-        "vendor": event.get("vendor", ""),
-        "rule_id": event.get("rule_id", 0),
-        "blocked": False,
-        "black_pattern": "",
-        # L2 补的
-        "sysname": event.get("sysname", "-"),
-        "hardware": event.get("hardware", "-"),
-        "syscontact": event.get("syscontact", "-"),
-        "if_name": event.get("if_name", ""),
-        "if_alias": event.get("if_alias", ""),
-        "src_state": event.get("src_state", ""),
-        # L2.5 补的
-        "severity": event.get("severity", ""),
-        "severity_name": event.get("severity_name", ""),
-        "state": event.get("state", ""),
-        "object_type": event.get("object_type", ""),
-        "clear_code": event.get("clear_code", ""),
-        "window_sec": event.get("window_sec", ""),
-        "threshold": event.get("threshold", ""),
-    }
+    # L0 剥信封 + 剥 mnemonic。不可读也往下走，由 L1 落 PARSE_FAIL
+    prepared = prepare(a)
+    show("L0 prepare 剥信封 + 剥 mnemonic", prepared)
+    if not prepared["readable"]:
+        print("\n  readable=False，报文不可读，L1 会落 PARSE_FAIL")
 
+    # L0.5 黑名单，命中即终止，不进后面任何一层
+    rule = blacklist.match(prepared)
+    print("\n--- L0.5 blacklist 命中即丢 ---")
+    if rule is not None:
+        print("   命中 rule {}  scope={}  pattern={}".format(
+            rule.rule_id, rule.scope, rule.pattern))
+        print("   {}".format(rule.descr))
+        print("\n整条终止，runner.handle() 返回 None")
+        return 0
+    print("   没命中，放行")
 
-def _print_rows(rows, verbose=False):
-    """主表：ip / msg / object / event_code，-v 多给 severity 和命中的规则"""
-    print("\n== 管线解析结果 ==")
-    if verbose:
-        header = "{:<4}{:<14}{:<8}{:<22}{:<26}{:<18}{:<6}{}".format(
-            "#", "ip", "vendor", "event_code", "object", "severity", "rule", "判定")
+    # L1 (vendor, mnemonic) -> event_code / alarm_object
+    event = parser.parse(prepared)
+    show("L1 parser -> event_code / alarm_object", event, prepared)
+
+    # L2 按源 IP 查 devices 补 sysname/hardware/syscontact，查 ports 补接口描述
+    before = dict(event)
+    enricher.enrich(event)
+    show("L2 enrich devices + ports", event, before)
+
+    # L2.5 两步走。fill() 一次做完两步，打的时候拆开 ——
+    # 第一步先把定级的字段挡掉，否则看不出是哪步补的
+    before = dict(event)
+    attrs.fill(event)
+    show("L2.5 第一步 syslog_event 事件属性", event, before, skip=GRADE_FIELDS)
+    show_grade(attrs, event)
+
+    # L4 算指纹 + 滑动窗口，顺便把原子记录攒进 alarm_log 的批
+    before = dict(event)
+    aggregator.handle(event)
+    show("L4 aggregate 指纹 + 滑动窗口", event, before)
+    show_window(aggregator, attrs, event, db)
+
+    # L5 状态机 -> 决策，L3 在决策上盖静默标记
+    decision = machine.handle(event)
+    show_decision(machine, decision)
+    mute.handle(decision)
+    show_mute(mute, decision)
+
+    print("\n最终 {}  {}  {}  {}".format(
+        event.get("sysname", "-"), decision.get("event_code", "-"),
+        event.get("alarm_object", "-"), decision.get("severity_name", "-")))
+    if decision.get("action") == "ignore":
+        print("     定级规则判定不开告警（state=ignore），不往 L3 交")
+    elif not decision.get("notify"):
+        print("     action={} —— 不产生告警动作（累加或未到阈值）".format(
+            decision.get("action")))
+    elif decision.get("muted"):
+        print("     告警会入库，但命中静默规则 {} 不发通知".format(
+            decision.get("mute_rule_id")))
     else:
-        header = "{:<4}{:<14}{:<" + str(MSG_WIDTH + 2) + "}{:<18}{:<22}{}"
-        header = header.format("#", "ip", "msg", "object", "event_code", "判定")
-    print(header)
-    print("-" * len(header))
-
-    for num, row in enumerate(rows, 1):
-        if row["ok"] is None:
-            mark = "-"
-        elif row["ok"]:
-            mark = "ok"
-        else:
-            mark = "FAIL 期望 {} / {}".format(row["want_code"], row["want_object"])
-        if row["blocked"]:
-            mark = "拦截 " + mark if mark != "-" else "拦截"
-
-        if verbose:
-            code = row["event_code"]
-            if row["black_pattern"]:
-                code = "{}[{}]".format(code, row["black_pattern"])
-            print("{:<4}{:<14}{:<8}{:<22}{:<26}{:<18}{:<6}{}".format(
-                num, row["ip"], row["vendor"] or "-", shorten(code, 20),
-                shorten(row["object"], 24), row["severity_name"] or "-",
-                row["rule_id"], mark))
-        else:
-            fmt = "{:<4}{:<14}{:<" + str(MSG_WIDTH + 2) + "}{:<18}{:<22}{}"
-            print(fmt.format(num, row["ip"], shorten(row["msg"]),
-                             shorten(row["object"], 16), row["event_code"], mark))
+        print("     告警入库并发通知")
+    return 0
 
 
-def _print_groups(rows):
-    """按 md5(ip|event_code|object) 收敛，看同一故障的几条日志是否落到一个桶"""
-    groups = {}
-    for row in rows:
-        fingerprint = fingerprint_of(row["ip"], row["event_code"], row["object"])
-        key = "{}|{}|{}".format(row["ip"], row["event_code"], row["object"])
-        bucket = groups.setdefault(fingerprint, {"key": key, "lines": []})
-        bucket["lines"].append(row.get("line", 0))
+def show_decision(machine, decision):
+    """L5 的决策，以及同一条日志反复来会怎样"""
+    print("\n--- L5 state_machine 状态机 ---")
+    for key in ("action", "notify", "state", "counter", "severity_name",
+                "flapping", "raise_count"):
+        if key in decision:
+            print(" + {:<18}{}".format(key, decision[key]))
 
-    print("\n== L4 指纹收敛 md5(ip|event_code|object) ==")
-    print("{:<20}{:<56}{:<7}{}".format("fingerprint", "ip|event_code|object", "count", "命中行"))
-    for fingerprint, bucket in sorted(groups.items(), key=lambda kv: -len(kv[1]["lines"])):
-        print("{:<20}{:<56}{:<7}{}".format(
-            fingerprint[:18], shorten(bucket["key"], 54), len(bucket["lines"]),
-            ",".join(str(i) for i in bucket["lines"])))
-    print("\n共 {} 个指纹".format(len(groups)))
-
-
-def _print_l2(rows):
-    """L2 富化结果：哪台设备、什么硬件、资产号、接口描述"""
-    enriched = [row for row in rows if not row["blocked"]]
-    if not enriched:
-        return
-
-    print("\n== L2 富化 devices + ports ==")
-    print("{:<4}{:<14}{:<22}{:<18}{:<14}{:<10}{:<18}{:<26}".format(
-        "#", "ip", "sysname", "hardware", "syscontact", "src_state",
-        "object", "if_name / if_alias"))
-    for row in enriched:
-        port_text = "-"
-        if row["if_name"]:
-            port_text = row["if_name"]
-            if row["if_alias"]:
-                port_text += " / " + row["if_alias"]
-        elif row["object"] not in ("-", ""):
-            port_text = "(接口表里没有)"
-        print("{:<4}{:<14}{:<22}{:<18}{:<14}{:<10}{:<18}{:<26}".format(
-            row["line"], row["ip"], shorten(row["sysname"], 20),
-            shorten(row["hardware"], 16), shorten(row["syscontact"], 12),
-            row["src_state"] or "-", shorten(row["object"], 16),
-            shorten(port_text, 24)))
-
-    # 设备维度的汇总：一条日志一个设备，重复的行只算一次
-    devices = {}
-    for row in enriched:
-        devices.setdefault(row["ip"], row)
-    unmanaged = [ip for ip, row in devices.items() if row["src_state"] != "MANAGED"]
-    # 对象是接口但接口表里查不到的，要么表没采到，要么短名展开没覆盖这种写法
-    missed = [row for row in enriched
-              if row["object"] not in ("-", "") and not row["if_name"]]
-    print("\n涉及设备 {} 台，其中未纳管 {} 台{}".format(
-        len(devices), len(unmanaged),
-        "：" + ", ".join(sorted(unmanaged)) if unmanaged else ""))
-    if missed:
-        print("接口表里对不上的对象 {} 条（peer IP 这类非接口对象属正常）：{}".format(
-            len(missed),
-            ", ".join(sorted({row["object"] for row in missed}))))
-
-
-def _print_attrs(rows):
-    """L2.5 事件属性：有没有事件码在 syslog_event 里是空的"""
-    enriched = [row for row in rows if not row["blocked"]]
-    if not enriched:
-        return
-
-    codes = {}
-    for row in enriched:
-        code = row["event_code"]
-        if code not in codes:
-            codes[code] = row
-
-    print("\n== L2.5 事件属性 syslog_event ==")
-    print("{:<24}{:<8}{:<12}{:<14}{:<8}{:<10}{}".format(
-        "event_code", "级别", "state", "object_type", "窗口", "阈值", "恢复码"))
-    for code, row in sorted(codes.items()):
-        print("{:<24}{:<8}{:<12}{:<14}{:<8}{:<10}{}".format(
-            shorten(code, 22), row["severity_name"] or "-",
-            row["state"] or "-", row["object_type"] or "-",
-            row.get("window_sec", "-"), row.get("threshold", "-"),
-            row["clear_code"] or "-"))
-
-
-def _print_blacklist(blacklist):
-    """哪条黑名单在吃量。hits=0 的要么没用上，要么 pattern 写错了"""
-    stats = blacklist.stats()
-    print("\n== L0.5 黑名单命中 ==")
-    print("{:<6}{:<10}{:<16}{:<40}{:<7}{}".format(
-        "rule", "scope", "ip", "pattern", "hits", "说明"))
-    for rule in stats["rules"]:
-        print("{:<6}{:<10}{:<16}{:<40}{:<7}{}".format(
-            rule["rule_id"], rule["scope"], rule["ip"], shorten(rule["pattern"], 38),
-            rule["hits"], shorten(rule["descr"], 40)))
-    print("\n进 {} 条，拦 {} 条，放行 {} 条；索引 mnemonic {} 条 / 全文扫 {} 条".format(
-        stats["total"], stats["blocked"], stats["passed"],
-        stats["mnemonic_rules"], stats["message_rules"]))
-
-
-def run_blacklist(messages=None, verbose=True):
-    """
-    单测黑名单：样本的第三个字段是"该不该被拦"的布尔值
-
-    误拦比漏拦更要紧，所以两个方向都判：该拦的没拦住是漏，
-    不该拦的拦了是误拦，后者会把真告警吃掉。
-    """
-    blacklist, runner, _ = build()
-    del runner  # 只跑黑名单，不需要后续层
-    messages = messages if messages is not None else MOCK_MESSAGES_BLACK
-    rows = []
-    failed = 0
-
-    for ip, message, want_blocked in messages:
-        prepared = prepare({"ip": ip, "message": message})
-        rule = blacklist.match(prepared)
-        is_blocked = rule is not None
-        if is_blocked:
-            blacklist.blocked(prepared)
-        ok = (is_blocked == bool(want_blocked))
-        if not ok:
-            failed += 1
-        rows.append({
-            "ip": ip, "msg": message, "blocked": is_blocked,
-            "mnemonic": prepared["mnemonic"],
-            "rule_id": rule.rule_id if rule else 0,
-            "scope": rule.scope if rule else "",
-            "pattern": rule.pattern if rule else "",
-            "want_blocked": bool(want_blocked), "ok": ok,
-        })
-
-    print("\n== L0.5 黑名单判定 ==")
-    print("{:<4}{:<14}{:<44}{:<6}{:<10}{:<34}{}".format(
-        "#", "ip", "mnemonic", "rule", "scope", "命中 pattern", "判定"))
-    for num, row in enumerate(rows, 1):
-        if row["ok"]:
-            mark = "ok 拦截" if row["blocked"] else "ok 放行"
-        else:
-            mark = "FAIL 误拦" if row["blocked"] else "FAIL 漏拦"
-        print("{:<4}{:<14}{:<44}{:<6}{:<10}{:<34}{}".format(
-            num, row["ip"], shorten(row["mnemonic"] or "(无)", 42),
-            row["rule_id"] or "-", row["scope"] or "-",
-            shorten(row["pattern"] or "-", 32), mark))
-
-    if verbose:
-        _print_blacklist(blacklist)
-
-    print("\n样本 {} 条，FAIL {} 条".format(len(rows), failed))
-    return {"total": len(rows), "failed": failed, "rows": rows}
-
-
-def main(argv=None):
-    argv = list(argv if argv is not None else sys.argv[1:])
-    verbose = False
-    for flag in ("-v", "--verbose"):
-        if flag in argv:
-            verbose = True
-            argv.remove(flag)
-
-    # -i 自己贴一条报文，第二个参数给源 IP（默认用样本里的 cisco_nx 设备）
-    if argv and argv[0] in ("-i", "--input"):
-        message = argv[1] if len(argv) > 1 else ""
-        ip = argv[2] if len(argv) > 2 else "10.16.249.5"
-        run([(ip, message)], verbose=True)
+    if decision.get("action") == "ignore":
+        print("\n   state=ignore 在这一层就截住，不写状态、不往 L3 交")
         return 0
 
-    # dc05 只跑那段现场日志
-    if argv and argv[0] == "dc05":
-        result = run(MOCK_MESSAGES_DC05, verbose=True)
-        return 1 if result["failed"] else 0
+    print("\n   判据是\"有没有活跃告警\"，不是 L4 的 is_first ——")
+    print("   一个口持续 down 一小时，L4 切两段都给 is_first=True，但那是一条告警")
+    print("   stats:", machine.stats())
+    return 0
 
-    # black 只跑黑名单的拦/放判定
-    if argv and argv[0] == "black":
-        result = run_blacklist(verbose=True)
-        return 1 if result["failed"] else 0
 
-    # 位置参数当 IP 过滤
-    if argv:
-        wanted = set(argv)
-        messages = [item for item in MOCK_MESSAGES_ALL if item[0] in wanted]
-        if not messages:
-            print("没有匹配 {} 的样本，样本里的源 IP：{}".format(
-                ", ".join(sorted(wanted)),
-                ", ".join(sorted({item[0] for item in MOCK_MESSAGES_ALL}))))
-            return 2
-        result = run(messages, verbose=verbose)
+def show_mute(mute, decision):
+    """L3 的静默判定"""
+    print("\n--- L3 mute 告警静默 ---")
+    if not decision.get("notify"):
+        print("   L5 说不用通知，跳过（不白跑正则）")
+        return 0
+
+    print("   判据 ip={}  event_code={}  object={}".format(
+        decision.get("ip"), decision.get("event_code"),
+        decision.get("alarm_object")))
+    rule = mute.rule_of(decision.get("ip"), decision.get("event_code"),
+                        decision.get("alarm_object"))
+    if rule is None:
+        print("   没命中静默规则，正常通知")
     else:
-        result = run(verbose=verbose)
+        judge = []
+        if rule.ip_pattern:
+            judge.append("ip_reg=" + rule.ip_pattern)
+        if rule.event_pattern:
+            judge.append("event_code_reg=" + rule.event_pattern)
+        if rule.object_pattern:
+            judge.append("object_reg=" + rule.object_pattern)
+        window = "{} ~ {}".format(rule.start_time or "立即",
+                                  rule.end_time or "永久")
+        print("   命中 rule {}  判据 {}  窗口 {}".format(
+            rule.rule_id, "  ".join(judge) or "无（所有告警）", window))
+        print("   {}".format(rule.descr))
+    print(" + {:<18}{}".format("muted", decision.get("muted")))
+    print(" + {:<18}{}".format("mute_rule_id", decision.get("mute_rule_id")))
+    print("\n   muted 是记录上的状态，不是入库开关 —— 被静默的告警照样入库")
+    print("   窗口过了靠 mute.sweep() 把还没好的放出来，不能等日志驱动")
+    return 0
 
-    return 1 if result["failed"] else 0
+
+def show_window(aggregator, attrs, event, db):
+    """L4 的窗口怎么算的，以及恢复事件落到了谁的指纹上"""
+    code = event.get("event_code", "")
+    raise_code = event.get("raise_code") or ""
+    window_sec = event.get("window_sec", "-")
+
+    print("\n   指纹 = md5(ip | {} | alarm_object)".format(raise_code or code))
+    if raise_code:
+        print("   {} 是 {} 的恢复事件，所以按 {} 算指纹 —— "
+              "否则关不掉故障告警".format(code, raise_code, raise_code))
+
+    print("   窗口 {}s，比的是相邻两条日志的间隔，不是固定分桶的边界".format(window_sec))
+    print("   同一段内再来一条就 count+1；间隔超过 {}s 开新段；"
+          "一段最长活 1800s".format(window_sec))
+
+    # 再来一条同样的日志，看隔多久会切新段。
+    # 每个间隔用一个干净的聚合器，否则前一次探测会把 last_seen 往后推，
+    # 后面的间隔就不是从原始那条日志算的了
+    base = int(event.get("ingest_ts") or 0)
+    gap_window = window_sec if isinstance(window_sec, int) else 300
+    print("\n   第二条日志隔多久会切新段（每次都从这条日志算）：")
+    for gap in (60, gap_window - 1, gap_window + 1, 2000):
+        probe_agg = Aggregator(db=MockSyslogDB())
+        probe_agg.handle(dict(event), now=base)
+        probe = dict(event)
+        probe_agg.handle(probe, now=base + gap)
+        print("   隔 {:<6}s  count={:<4}{}".format(
+            gap, probe["count"], "同一段" if probe["count"] > 1 else "切了新段"))
+    print("   所以 5 分钟窗口 + 日志持续 10 分钟是一段，不是两段 ——"
+          " 只要中间没有超过窗口的空档")
+
+    aggregator.flush()
+    print("\n   alarm_log 攒了 {} 条（一条日志一行，只留 7 天）".format(len(db.alarm_logs)))
+    print("   alarm_list 本层不写 —— 阈值 {} 的判断是 L5 的事".format(
+        event.get("threshold", "-")))
+    return 0
+
+
+def show_grade(attrs, event):
+    """
+    L2.5 第二步：定级。打出命中的规则和它凭什么命中
+
+    级别按 (event_code, ip, sysname) 判，所以必须排在 L2 富化之后 ——
+    sysname 是富化补的
+    """
+    event_code = event.get("event_code", "")
+    ip = event.get("ip", "-")
+    sysname = event.get("sysname", "-")
+
+    print("\n--- L2.5 第二步 syslog_severity_rule 定级 ---")
+    print("   判据 event_code={}  ip={}  sysname={}".format(event_code, ip, sysname))
+
+    rule = attrs.grade_of(event_code, ip, sysname)
+    if rule is None:
+        print("   没命中任何规则，按 P3 兜底")
+        print("   定级表缺 event_code='*' 的全局兜底行，补一条")
+    else:
+        judge = []
+        if rule.event_code != "*":
+            judge.append("event_code={}".format(rule.event_code))
+        if rule.ip_pattern:
+            judge.append("ip_reg={}".format(rule.ip_pattern))
+        if rule.sysname_pattern:
+            judge.append("sysname_reg={}".format(rule.sysname_pattern))
+        print("   命中 rule {}  priority={}  判据 {}".format(
+            rule.rule_id, rule.priority, "  ".join(judge) or "无（全局兜底）"))
+        print("   {}".format(rule.descr))
+
+    print(" + {:<18}{}（{}）".format("severity", event.get("severity"),
+                                     event.get("severity_name", "-")))
+    print(" + {:<18}{}".format("severity_rule_id", event.get("severity_rule_id", 0)))
+    if event.get("state") == STATE_IGNORE:
+        print(" + {:<18}{}".format(
+            "state", "ignore —— 走完管线并落 ES，但 L5 不开告警"))
+
+    # 同一条日志换台设备会是什么级别。定级规则改完之后最容易错的就是
+    # priority 顺序，这几行能直接看出 corp 那条有没有排在通用 rsw 前面
+    others = [("csw1_dc19_m01", "10.19.19.1"), ("rsw1_dc19_m05", "10.19.19.11"),
+              ("rsw1_corp_ts_m21", "10.19.9.31"), ("pcs1_dc07_m01", "10.19.7.1")]
+    print("\n   同一个 {} 换设备的级别：".format(event_code or "-"))
+    for other_name, other_ip in others:
+        other = attrs.grade_of(event_code, other_ip, other_name)
+        if other is None:
+            text = "P3  兜底"
+        else:
+            text = "{}  rule {}".format(severity_name(other.severity), other.rule_id)
+            if other.action == "ignore":
+                text += "  不告警"
+        mark = "<-" if other_name == sysname else "  "
+        print("   {} {:<20}{}".format(mark, other_name, text))
+    return 0
 
 
 if __name__ == "__main__":

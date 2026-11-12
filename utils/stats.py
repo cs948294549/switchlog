@@ -27,11 +27,15 @@ class Stats(object):
         parse_fail    报文不可读
         unmanaged     devices 表里查不到源 IP
         unknown       规则表没命中，规则缺口
+        ignored       L2.5 定级规则判定不开告警（state=ignore）
+        alarms        L5 产生的告警动作（开/升级/恢复）
+        muted         其中被 L3 静默的，不发通知
         errors        管线里抛异常的
     """
 
     KEYS = ("received", "dropped", "blocked", "parsed",
-            "parse_fail", "unmanaged", "unknown", "errors")
+            "parse_fail", "unmanaged", "unknown", "ignored",
+            "alarms", "muted", "errors")
 
     def __init__(self):
         self._counters = dict.fromkeys(self.KEYS, 0)
@@ -87,8 +91,12 @@ class Stats(object):
         if delta["blocked"]:
             parts.append("黑名单拦 {}".format(delta["blocked"]))
         parts.append("解析 {}".format(delta["parsed"]))
+        if delta["alarms"]:
+            muted = "（静默 {}）".format(delta["muted"]) if delta["muted"] else ""
+            parts.append("告警 {}{}".format(delta["alarms"], muted))
         for key, label in (("unknown", "规则缺口"), ("unmanaged", "未纳管"),
-                           ("parse_fail", "不可读"), ("errors", "异常")):
+                           ("parse_fail", "不可读"), ("ignored", "不告警"),
+                           ("errors", "异常")):
             if delta[key]:
                 parts.append("{} {}".format(label, delta[key]))
         if queue_sizes:

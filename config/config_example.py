@@ -52,8 +52,23 @@ class Config:
     }
 
     # ---------------- 告警出口 ----------------
-    # L6 未实现前置 False，管线跑到 L2.5 就停，只打日志不落库
-    alarm_enable = False
+    # L6 落 alarm_list。关掉的话告警只在 notify.log 里，看板上什么都没有，
+    # 所以正常运行必须是 True。
+    # 置 False 的唯一场景：规则刚配完、怕误报刷库，先只看 notify.log 对一遍
+    alarm_write_db = True
+
+    # L6 推通知。规则没调稳之前可以先关掉，只落库不打扰人 ——
+    # 看板上能看到告警，但不会推出去
+    alarm_notify = True
+
+    # 通知通道：file=一条通知一行 JSON 写 logs/notify.log
+    # http 通道还没实现，接口在 pipeline/emit.py 的 Notifier
+    notify_channel = "file"
+
+    # http 通道的参数，notify_channel="http" 时才用到。
+    # 超时必须短：接口卡住等于 worker 卡住
+    notify_http_url = ""
+    notify_http_timeout = 3
 
     # ---------------- 日志 ----------------
     log_level = "INFO"

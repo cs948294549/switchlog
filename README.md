@@ -27,14 +27,40 @@
    L0.5  blacklist    黑名单，命中即丢
    L1    parser       (vendor, mnemonic) -> event_code / object
    L2    enrich       sysname / hardware / 资产号 / 接口描述
-   L2.5  attrs        severity / state / 窗口 / clear_code
-   L3    suppress     drop / mute / depend          [未实现]
-   L4    aggregate    指纹滑动窗口 + 计数            [未实现]
-   L5    state_machine raise / clear + 闪断升级      [未实现]
-   L6    emit         写 alarm_list                 [未实现]
+   L2.5  attrs        state / 窗口 / clear_code，再按设备定 severity
+                      ↓ 到这里是一条原子告警
+   L4    aggregate    指纹 + 滑动窗口，写 alarm_log
+   L5    state_machine raise / clear + 闪断升级
+   L3    mute         时间窗静默，填 muted
+   L6    emit         写 alarm_list + 发通知        [未实现]
 ```
 
-现在跑到 L2.5，解析结果打到日志里。L3~L6 逐层补。
+现在跑到 L3，告警动作和静默判定都有了，只剩 L6 落库发通知。
+`alarm_log` 已经在写，`alarm_list` 等 L6。
+
+**两件事靠定时扫描，不能等日志驱动**，因为它们的触发条件就是"没有新日志"
+或"时间到了"（`Runner.sweep()`，维护线程 60s 一次）：
+
+- L5 的 `stateless` 事件静默超过窗口 → 自动恢复。没有日志来正是恢复的条件
+- L3 的静默窗口过了但故障还在 → 恢复通知。否则割接期间 down 了一直没好的口，
+  窗口结束后不会再有新日志进管线，这条告警就永远静默
+
+**L3 排在 L5 之后**，层号和执行顺序不一致。它原来是 L2.5 之后的
+drop/mute/depend 三档，收窄成只有 mute 之后挪到了状态机后面：判据里的
+object 要等 L4、告警状态要等 L5，而且挪过去之后它从热路径（每条日志）
+变成冷路径（只有待通知的告警），判据用正则也不心疼。层号保持 L3 是为了
+不动已有文档和表名。
+
+**两张告警表靠 `fingerprint` 关联**：`alarm_log` 一条日志一行（L4 写，
+只留 7 天，排查下钻用），`alarm_list` 一个指纹一行（L5 写，带 count，看板用）。
+指纹在 `alarm_list` 里查不到说明这组日志没到告警阈值，这本身是有用的信息。
+阈值判断在 L5 不在 L4：`MAC_FLAP` 配 `600/3`，第一条日志进来时
+`alarm_list` 里不该有行，攒到第 3 条才算告警。
+
+**窗口是间隔上限，不是固定分桶的边界**。`window_sec=300` 的事件，日志持续
+10 分钟只要中间没有超过 5 分钟的空档就是一段、一条告警；要分成两段，间隔
+得大于窗口。另有 `max_life=1800`：一段最长活 30 分钟，持续闪断的接口每
+30 分钟重新开一段，不会像老实现那样无限继承 label 之后永久静默。
 
 **一切按表来**，代码里不内置任何厂商正则或关键字。设备型号、版本差异
 全部下沉到规则表，加一条规则就能支持新事件，不用发版。
@@ -58,11 +84,8 @@ docs/            设计文档
 ```bash
 cp config/config_example.py config/config.py    # 填 MySQL 口令
 
-# 1. 不连库，用内存样本跑回归
-python test.py                      # 全部样本，带 (event_code, object) 判定
-python test.py -v                   # 多打 L2 富化 / L2.5 属性 / 指纹收敛 / 黑名单四张表
-python test.py dc05                 # 只跑那段 bbs1_dc05 现场日志
-python test.py black                # 黑名单拦/放判定，误拦和漏拦分开标
+# 1. 不连库，贴一条报文看它在每一层被改成什么样
+python test.py                      # 报文写在 test.py 顶部的 a = {...}
 
 # 2. 建表
 mysql -h <host> -P <port> -u netops -p netops < sql/schema.sql
@@ -96,17 +119,43 @@ python main.py --replay syslog/xxx.txt --ip 10.16.249.5
 
 ## 规则怎么配
 
-三张表，职责分开：
+五张表，职责分开：
 
 | 表 | 管什么 | 谁读 |
 |---|---|---|
 | `syslog_black_list` | 解析前拦掉的噪声 | L0.5 |
 | `syslog_rule` | `(vendor, mnemonic)` → `event_code`，对象抽取正则 | L1 |
-| `syslog_event` | 事件属性：级别、状态、窗口、恢复码 | L2.5 |
+| `syslog_event` | 事件属性：状态、窗口、阈值、恢复码 | L2.5 |
+| `syslog_severity_rule` | 事件定级：`event_code` + 设备 → 级别 | L2.5 |
+| `syslog_mute_rule` | 告警静默：设备 + 事件 + 时间窗 | L3 |
 
 **事件属性单独一张表**是有原因的：`IF_DOWN` 在三家厂商下共十几行匹配规则，
-属性挂在匹配行上就有十几份副本，改一次 P2→P1 要改十几行，漏一行就出现
-"华为的端口 down 是 P1、Cisco 的同一个事件还是 P2"这种谁都发现不了的错。
+属性挂在匹配行上就有十几份副本，改一次窗口要改十几行，漏一行就出现
+"华为的端口 down 窗口 300s、Cisco 的同一个事件还是 600s"这种谁都发现不了的错。
+
+**级别又从事件属性里拆出来**，因为它不是事件的固有属性。同一个 `IF_DOWN`，
+`csw` 掉口是核心网段断了（P1），`rsw` 掉口是一个机柜的接入（P3），corp 职场的
+`rsw` 掉口压根不用看。一个事件码一行存不下"哪个事件 + 哪台设备"两个维度，
+所以定级按规则表走，`priority` 小的先判、首条命中即停：
+
+```
+IF_DOWN 的候选链   corp rsw -> csw -> rsw -> IF_DOWN 默认 -> *
+```
+
+现网 20 个事件码里 14 个是 P3，所以种子数据用"一条全局兜底 + 只给非 P3 的码
+写行"，10 行覆盖全部。新增事件码不写行就是 P3 —— 宁可级别偏低也不要误报 P1。
+定级必须排在 L2 富化之后，要按 `sysname` 判设备角色。
+
+**三种"不告警"的区别**，配错了很难查：
+
+| | 配在哪 | 什么时候用 | 日志还在吗 |
+|---|---|---|---|
+| 黑名单 | `syslog_black_list` | 确定永远是噪声，解析它纯属浪费 | 只在 ES 归档里 |
+| `action=ignore` | `syslog_severity_rule` | 这类设备的这个事件永久不用看 | 在，走完整条管线 |
+| `muted` | `syslog_mute_rule` | 割接窗口期临时不看，窗口过了自动恢复 | 在，照样写 `alarm_list` |
+
+人工屏蔽（`alarm_list.status=4`）和 `muted` 是两个字段：人工屏蔽要等人去改，
+`muted` 是时间窗一过自动恢复通知。
 
 **补规则的依据是 `UNKNOWN_MNEMONIC` 的计数**，不是厂商手册。
 `./docker/logs.sh gap` 打出的高频未命中就是下一批该补的，
@@ -144,7 +193,11 @@ python main.py --replay syslog/xxx.txt --ip 10.16.249.5
 ## 数据库
 
 共用 netops 库。`devices` / `ports` 由 central-server 采集侧维护，这边只读；
-`syslog_*` 四张表归 switchlog；`alarm_list` 两边都用（switchlog 写，看板读）。
+`syslog_*` 六张表归 switchlog（四张规则表 + `syslog_alarm_state` + `alarm_log`）；
+`alarm_list` 两边都用（switchlog 写，看板读）。
+
+`alarm_log` 的写入量是收到的日志量，日志风暴时一分钟几万行，所以只留 7 天，
+维护线程按 `ingest_ts` 分批删。再往前的排查靠 ES 归档。
 
 规则表的增删改查仍在 `central-server/api/api_alarm.py`，switchlog 不带 API。
 
