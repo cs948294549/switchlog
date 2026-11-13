@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-L6 告警出口
+L9 告警出口
 
 两件事：落 alarm_list，再把要通知的推出去。
 
-    L5 决策 -> L3 填 muted -> L6: 写库 + 通知
+    L7 决策 -> L8 填 muted -> L9: 写库 + 通知
 
 落库：
     action=raise                    addAlarm，insert 一行
     action=update/escalate/clear    updateAlarmByFingerprint，更新那一行
-    action=none/ignore              不落库也不通知，L3 那边就没往下交
+    action=none/ignore              不落库也不通知，L8 那边就没往下交
 
 muted 在 insert 的时候一次写进去，不是先写 0 再 UPDATE —— 中间那一瞬间
-看板轮询到会显示成"割接期间有条没静默的告警"。L3 的判定在这之前就有结果。
+看板轮询到会显示成"割接期间有条没静默的告警"。L8 的判定在这之前就有结果。
 
 通知：
     被静默的（muted=1）只落库不推送，这是 mute 的全部意义
@@ -70,7 +70,7 @@ ACTION_TEXT = {
     "notify_only": "告警",
 }
 
-# L3 静默到期放出来的动作：告警早就在库里，muted 那一列 L3 也改过了，
+# L8 静默到期放出来的动作：告警早就在库里，muted 那一列 L8 也改过了，
 # 本层只补通知，一个字段都别再写
 ACTION_NOTIFY_ONLY = "notify_only"
 
@@ -173,7 +173,7 @@ class HttpNotifier(Notifier):
         # 推送失败的兜底，通知不能凭空消失
         self._fallback = fallback if fallback is not None else FileNotifier()
         logger.warning("HttpNotifier 还没实现，通知走文件通道。"
-                       "接口和注意事项见 pipeline/emit.py")
+                       "接口和注意事项见 pipeline/l9_emit.py")
 
     def send(self, payload):
         # 实现之后这里换成带超时的 POST，失败再落 fallback
@@ -198,7 +198,7 @@ def build_notifier():
 
 class AlarmEmitter(object):
     """
-    L6：落 alarm_list + 推通知
+    L9：落 alarm_list + 推通知
 
     worker 共享一个实例。落库走数据库连接各自开，通知通道内部自己加锁。
     """
@@ -207,7 +207,7 @@ class AlarmEmitter(object):
                  write_db=None, notify=None):
         """
         :param notifier:      通知通道，不传按 config.notify_channel 建
-        :param state_machine: L5 实例，insert 之后要把 alarm_id 回填进状态
+        :param state_machine: L7 实例，insert 之后要把 alarm_id 回填进状态
         :param db:            数据源，由 db.get_alarm_db() 注入
         :param write_db:      落不落 alarm_list，不传读 config.alarm_write_db
         :param notify:        推不推通知，不传读 config.alarm_notify
@@ -255,7 +255,7 @@ class AlarmEmitter(object):
         """
         落库 + 通知
 
-        :param decision: L5 产出、L3 填过 muted 的决策
+        :param decision: L7 产出、L8 填过 muted 的决策
         :return: {"alarm_id", "notified", "muted"}；不用处理的返回 None
         """
         if not decision or not decision.get("notify"):
@@ -290,17 +290,17 @@ class AlarmEmitter(object):
         """
         新开的走 insert，已开着的走 update
 
-        escalate 也算新开：L5 的 _escalate() 只在 _open() 里调，也就是
+        escalate 也算新开：L7 的 _escalate() 只在 _open() 里调，也就是
         "无活跃告警 -> 开告警"那一跳顺手判出了闪断。所以它和 raise 一样
         是一条新告警，只是级别提过、event_code 换成了 IF_FLAP。
         按 update 处理会落空 —— 闪断的前一跳是 clear，alarm_list 里那行
         已经是 state=clear，而 update 只认 state=open 的行。
 
-        notify_only 不写库：那是 L3 静默到期放出来的，告警早就在
-        alarm_list 里，muted 那一列 L3 也改过了。再 update 一次会拿
+        notify_only 不写库：那是 L8 静默到期放出来的，告警早就在
+        alarm_list 里，muted 那一列 L8 也改过了。再 update 一次会拿
         决策里的默认值把 last_seen 和 counter 冲掉
 
-        :return: alarm_id。update 的时候返回决策里带的那个（L5 回填过）
+        :return: alarm_id。update 的时候返回决策里带的那个（L7 回填过）
         """
         if action == ACTION_NOTIFY_ONLY:
             return decision.get("alarm_id", 0)
@@ -321,6 +321,12 @@ class AlarmEmitter(object):
             "msg": decision.get("message", ""),
             "alarm_object": decision.get("alarm_object", "-"),
             "fingerprint": decision.get("fingerprint", ""),
+            # L4 富化结果，排查用，只在新开告警时写一次 ——
+            # 恢复/更新走 _update，不碰这些列，老行也不受影响
+            "vendor": decision.get("vendor", ""),
+            "hardware": decision.get("hardware", ""),
+            "object_name": decision.get("object_name", ""),
+            "object_alias": decision.get("object_alias", ""),
             "severity": decision.get("severity", 3),
             "state": "open",
             "status": "0",
@@ -329,7 +335,7 @@ class AlarmEmitter(object):
             "last_seen": str(decision.get("last_seen") or now),
             "clear_time": "",
             "create_time": str(now),
-            # L3 判完了，一次写进去
+            # L8 判完了，一次写进去
             "muted": decision.get("muted", False),
             "mute_rule_id": decision.get("mute_rule_id", 0),
         }
@@ -350,7 +356,7 @@ class AlarmEmitter(object):
 
         with self._lock:
             self._counts["inserted"] += 1
-        # alarm_id 回填进 L5 的状态，下次更新同一条告警要用
+        # alarm_id 回填进 L7 的状态，下次更新同一条告警要用
         if self._state_machine is not None:
             try:
                 self._state_machine.bind_alarm(decision.get("fingerprint"), alarm_id)
@@ -368,7 +374,7 @@ class AlarmEmitter(object):
         if action == "escalate":
             # 闪断升级：event_code 从 IF_DOWN 变成 IF_FLAP，keyword 要跟着改，
             # 否则看板上级别提了但事件码还是 IF_DOWN，看不出这是闪断。
-            # 指纹不动（L5 升级时就没动），所以这一行还找得到
+            # 指纹不动（L7 升级时就没动），所以这一行还找得到
             code = decision.get("event_code", "")
             data["keyword"] = code
             data["group_name"] = code
@@ -386,7 +392,7 @@ class AlarmEmitter(object):
             with self._lock:
                 self._counts["failed"] += 1
         elif result == 0:
-            # 没有未恢复的行可更新。L5 认为有活跃告警但 alarm_list 里没有，
+            # 没有未恢复的行可更新。L7 认为有活跃告警但 alarm_list 里没有，
             # 多半是上次进程 insert 失败或者库被手工清过。状态表和看板
             # 不一致，得能看出来
             logger.warning("alarm_list 里没有 %s 的未恢复告警，%s 动作没落库 —— "
@@ -466,8 +472,8 @@ class AlarmEmitter(object):
         """
         把还开着的告警的 counter / last_seen 刷进 alarm_list
 
-        为什么需要这个：L5 对已有活跃告警的后续日志返回 ACTION_NONE
-        （不重复通知，这是对的），于是 L6 整个不跑，alarm_list.counter
+        为什么需要这个：L7 对已有活跃告警的后续日志返回 ACTION_NONE
+        （不重复通知，这是对的），于是 L9 整个不跑，alarm_list.counter
         停在开告警那一刻。一次端口 down 产生三条同指纹日志，
         schema 说 counter 是"窗口内日志条数"，看板上却显示 1。
 
@@ -495,13 +501,18 @@ class AlarmEmitter(object):
                 continue
             alive.add(fingerprint)
             counter = row.get("counter", 1)
-            # counter 没动就不写。一个 down 了一天的口每轮都 UPDATE 一次
-            # 是纯浪费 —— 它的 counter 早就不涨了
-            if self._synced.get(fingerprint) == counter:
+            last_seen = row.get("last_seen") or ""
+            # counter 和 last_seen 都没动才不写。stateless 事件一旦开告警
+            # 后 counter 就封顶不再涨（_on_stateless 的 is_open() 分支只
+            # 推 last_seen，不碰 counter），只按 counter 判断会让这类
+            # 事件的 last_seen 永远停在第一次同步时的值，详情下钻的时间
+            # 窗口越往后收到的日志越漏得多
+            mark = (counter, last_seen)
+            if self._synced.get(fingerprint) == mark:
                 continue
             data = {
                 "counter": counter,
-                "last_seen": str(row.get("last_seen") or ""),
+                "last_seen": str(last_seen),
                 "severity": row.get("severity", 3),
             }
             try:
@@ -510,7 +521,7 @@ class AlarmEmitter(object):
                 logger.error("======AlarmEmitter sync_counters error========\n%s", err)
                 continue
             if result not in ("failed", 0):
-                self._synced[fingerprint] = counter
+                self._synced[fingerprint] = mark
                 synced += 1
 
         # 告警恢复了就从表里去掉，否则这个 dict 跟着历史告警无限涨。

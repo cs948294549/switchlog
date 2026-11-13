@@ -2,45 +2,49 @@
 """
 管线串联
 
-worker 拿到一条原始报文，调 runner.handle() 走完 L0 ~ L4。
-L5 之后还没实现，跑到聚合就返回。
+worker 拿到一条原始报文，调 runner.handle() 走完 L1 ~ L9。
 
     raw {"ip", "message", "timestamp"}
       │
-      ├─ L0   prepare    剥信封 + 剥 mnemonic
-      │        ↓ 不可读也往下走，落 PARSE_FAIL
-      ├─ L0.5 blacklist  命中即返回 None，整条终止
-      ├─ L1   parser     (vendor, mnemonic) -> event_code / object
-      ├─ L2   enrich     sysname / hardware / syscontact / 接口描述
-      ├─ L2.5 attrs      state / window / clear_code，再按设备定 severity
-      │        ↓ 原子告警
-      └─ L4   aggregate  指纹 + 滑动窗口，攒批写 alarm_log
-               ↓
-         L5   state_machine raise / clear / 闪断升级          [未实现]
-         L3   mute          时间窗静默，回写 muted            [未实现]
-         L6   emit          发通知                            [未实现]
+      ├─ L1 prepare       剥信封 + 剥 mnemonic
+      │      ↓ 不可读也往下走，落 PARSE_FAIL
+      ├─ L2 blacklist     命中即返回 None，整条终止
+      ├─ L3 parser        (vendor, mnemonic) -> event_code / object
+      ├─ L4 enrich        sysname / hardware / syscontact / 接口描述
+      ├─ L5 attrs         state / 窗口 / clear_code，再按设备定 severity
+      │      ↓ 原子告警
+      ├─ L6 aggregate     指纹 + 滑动窗口，攒批写 alarm_log
+      ├─ L7 state_machine raise / clear / stateless + 闪断升级
+      │      ↓ 告警决策
+      ├─ L8 suppress      时间窗静默，填 muted
+      └─ L9 emit          写 alarm_list + 发通知
 
-L3 排在 L5 之后，层号和顺序不一致，原因见 pipeline/suppress.py。
+层号就是执行顺序，文件名带前缀（l1_prepare.py ... l9_emit.py）。
+L8 静默排在状态机之后是有原因的，见 pipeline/l8_suppress.py：
+判据里的 object 要等 L6、告警状态要等 L7，而且挪到这里之后它从热路径
+（每条日志）变成冷路径（只有待通知的告警）。
 
-tick() 里带 aggregator 的 flush 和 purge；alarm_log 的清理是
-purge_logs()，由维护线程按小时单独调，不跟规则刷新挤在一起。
+三个周期动作，间隔各不相同，别混在一起：
+    tick()        刷规则、清内存缓存，不写库
+    persist()     落库，比 tick 频繁得多
+    purge_logs()  删过期 alarm_log，按小时
 
-性能相关的一点：四层各自持有规则的快照，读路径不加锁，
+性能相关的一点：各层各自持有规则的快照，读路径不加锁，
 刷新线程整体替换索引。worker 之间共享这些实例是安全的。
 """
 import logging
 import time
 
-from pipeline.prepare import prepare
-from pipeline.blacklist import BlacklistFilter
-from pipeline.parser import SyslogParser
-from pipeline.enrich import DeviceEnricher
-from pipeline import attrs as attrs_mod
-from pipeline.attrs import EventAttrs
-from pipeline.aggregate import Aggregator
-from pipeline.state_machine import StateMachine
-from pipeline.suppress import MuteFilter
-from pipeline.emit import AlarmEmitter
+from pipeline.l1_prepare import prepare
+from pipeline.l2_blacklist import BlacklistFilter
+from pipeline.l3_parser import SyslogParser
+from pipeline.l4_enrich import DeviceEnricher
+from pipeline import l5_attrs as attrs_mod
+from pipeline.l5_attrs import EventAttrs
+from pipeline.l6_aggregate import Aggregator
+from pipeline.l7_state_machine import StateMachine
+from pipeline.l8_suppress import MuteFilter
+from pipeline.l9_emit import AlarmEmitter
 from utils import stats as stats_mod
 
 logger = logging.getLogger(__name__)
@@ -137,7 +141,7 @@ class Runner(object):
         """
         clock = int(now if now is not None else time.time())
 
-        # L0 预处理。mnemonic 在这里剥一次，后面各层共用
+        # L1 预处理。mnemonic 在这里剥一次，后面各层共用
         prepared = self._prepare(raw, now=clock)
         self._stats.incr("received")
 
@@ -146,22 +150,22 @@ class Runner(object):
         # 聚合、状态机、恢复时间全是错的
         clock = int(prepared.get("ingest_ts") or clock)
 
-        # L0.5 黑名单。命中即丢，不进任何后续层
+        # L2 黑名单。命中即丢，不进任何后续层
         if self.blacklist.blocked(prepared):
             self._stats.incr("blocked")
             return None
 
-        # L1 解析
+        # L3 解析
         event = self.parser.parse(prepared)
 
-        # L2 富化。失败不影响主流程，只标记 src_state
+        # L4 富化。失败不影响主流程，只标记 src_state
         try:
             self.enricher.enrich(event, now=clock)
         except Exception as err:
             logger.error("======Runner enrich error========\n%s", err)
             event.setdefault("src_state", "SRC_LOOKUP_FAILED")
 
-        # L2.5 事件属性 + 定级
+        # L5 事件属性 + 定级
         try:
             self.attrs.fill(event)
         except Exception as err:
@@ -169,7 +173,7 @@ class Runner(object):
 
         self._count_codes(event)
 
-        # L4 聚合。算不出指纹后面各层都没法做，但事件本身不丢 ——
+        # L6 聚合。算不出指纹后面各层都没法做，但事件本身不丢 ——
         # 原子告警已经成形，至少能落日志
         try:
             self.aggregator.handle(event, now=clock)
@@ -177,7 +181,7 @@ class Runner(object):
             logger.error("======Runner aggregate error========\n%s", err)
             return event
 
-        # L5 状态机。出错就不往下走了 —— 状态不可信的话 L3/L6 做的决定
+        # L7 状态机。出错就不往下走了 —— 状态不可信的话 L8/L9 做的决定
         # 也不可信，宁可这条不告警，也不要开一条关不掉的
         try:
             decision = self.state_machine.handle(event, now=clock)
@@ -185,7 +189,7 @@ class Runner(object):
             logger.error("======Runner state_machine error========\n%s", err)
             return event
 
-        # L3 静默。出错按"不静默"处理 —— 漏静默是多发一条通知，
+        # L8 静默。出错按"不静默"处理 —— 漏静默是多发一条通知，
         # 误静默是真故障没人知道，前者代价小得多
         try:
             self.mute.handle(decision, now=clock)
@@ -196,7 +200,7 @@ class Runner(object):
 
         self._count_decision(decision)
 
-        # L6 落库 + 通知
+        # L9 落库 + 通知
         try:
             self.emitter.handle(decision, now=clock)
         except Exception as err:
@@ -280,9 +284,9 @@ class Runner(object):
         落库。维护线程按自己的间隔调，比 tick() 频繁得多
 
         三件事：
-            L4  flush          攒着的原子记录写 alarm_log
-            L5  persist        变动过的告警状态写 syslog_alarm_state
-            L6  sync_counters  累加出来的 counter 刷进 alarm_list
+            L6  flush          攒着的原子记录写 alarm_log
+            L7  persist        变动过的告警状态写 syslog_alarm_state
+            L9  sync_counters  累加出来的 counter 刷进 alarm_list
 
         为什么不跟 tick() 一起：规则刷新 300s 一次合理，但这三件 300s
         才做一次的后果是看板 counter 滞后 5 分钟、进程崩了丢 5 分钟状态。
@@ -309,7 +313,7 @@ class Runner(object):
         except Exception as err:
             logger.error("======Runner state persist error========\n%s", err)
 
-        # L5 对已有活跃告警的后续日志返回 ACTION_NONE，L6 不跑，所以
+        # L7 对已有活跃告警的后续日志返回 ACTION_NONE，L9 不跑，所以
         # alarm_list.counter 会停在开告警那一刻 —— 一次端口 down 三条日志，
         # 看板上显示 1。这里把内存里累加的值刷过去补齐
         if self._emitter is not None:
@@ -325,10 +329,10 @@ class Runner(object):
         两个到期扫描，都不能等日志驱动 —— 它们的触发条件就是"没有新日志"
         或者"时间到了"：
 
-            L5  stateless 静默超过窗口 -> 自动恢复
-            L3  静默窗口过了但故障还在 -> 恢复通知
+            L7  stateless 静默超过窗口 -> 自动恢复
+            L8  静默窗口过了但故障还在 -> 恢复通知
 
-        返回待通知的决策，L6 落地后由它发出去。现在 L6 还没实现，
+        返回待通知的决策，L9 落地后由它发出去。现在 L9 还没实现，
         调用方拿到的就是列表本身
 
         :return: [决策]
@@ -339,7 +343,7 @@ class Runner(object):
         if self._state_machine is not None:
             try:
                 for decision in self._state_machine.sweep(now=now):
-                    # 自动恢复的也要过 L3：割接窗口内的恢复通知同样该压住
+                    # 自动恢复的也要过 L8：割接窗口内的恢复通知同样该压住
                     if self._mute is not None:
                         self._mute.handle(decision, now=now)
                     pending.append(decision)
@@ -348,7 +352,7 @@ class Runner(object):
 
         if self._mute is not None:
             try:
-                # 静默到期放出来的已经在 L3 里改过库了，这里只补通知
+                # 静默到期放出来的已经在 L8 里改过库了，这里只补通知
                 pending.extend(self._mute.sweep(now=now))
             except Exception as err:
                 logger.error("======Runner mute sweep error========\n%s", err)

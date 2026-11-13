@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-L0 预处理：剥信封 + 剥 mnemonic
+L1 预处理：剥信封 + 剥 mnemonic
 
 管线上黑名单和 parser 都要知道 mnemonic，所以在进任何一层之前剥好、往下透传。
 两层各剥一遍是纯浪费 —— 实测 162 字节的报文剥一次 0.44us，命中第三条正则的
@@ -9,7 +9,7 @@ L0 预处理：剥信封 + 剥 mnemonic
 这也顺带决定了黑名单的匹配方式：mnemonic 已经在手上，dict 一级命中就够，
 不用逐条规则扫全文（实测 20 条规则以上就比剥 mnemonic 还贵）。
 
-不解析报文自带时间：设备时钟漂移会把 L4 滑动窗口算乱，时间统一用采集时间。
+不解析报文自带时间：设备时钟漂移会把 L6 滑动窗口算乱，时间统一用采集时间。
 """
 import re
 import time
@@ -40,8 +40,10 @@ PRI_REG = re.compile(r"^<(\d{1,3})>")
 TS_REGS = (
     # 2026 Oct  9 05:18:56.565   带年份，日期空格补位
     re.compile(r"^\d{4}\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s*"),
-    # Oct 11 14:03:22.412        无年份
-    re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s*"),
+    # Nov 12 18:39:05.412 2026   年份在时间之后（H3C 部分版本、rsyslog
+    # timereported 渲染）。年份可选，不加的话 2026 会被 HOSTNAME_REG
+    # 当成设备名取走
+    re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:\s+\d{4})?\s*"),
     # 2026-11-11T14:03:22.412+08:00   RFC5424 ISO8601
     re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+\-]\d{2}:?\d{2})?\s*"),
 )
@@ -103,7 +105,7 @@ def prepare(raw, now=None):
 
     :param raw: {"ip": 源IP, "message": 原始报文, "timestamp": 采集时间}
                 ip 和 timestamp 由收包侧填好；timestamp 是采集时间，不是设备时间
-    :return: L0 输出，字段见 pipeline/__init__.py 的契约
+    :return: L1 输出，字段见 pipeline/__init__.py 的契约
     """
     ingest_ts = int(now if now is not None else time.time())
     raw = raw if isinstance(raw, dict) else {}

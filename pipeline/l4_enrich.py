@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-L2 富化
+L4 富化
 
-L1 只看报文本身，出来的事件只有 ip / event_code / object，
+L3 只看报文本身，出来的事件只有 ip / event_code / object，
 光这些没法看：值班要知道**哪台设备**、**哪条链路**出的事。
 这一层去查现网已有的两张表补上，不改 event_code，也不改 object。
 
@@ -35,7 +35,7 @@ STATE_LOOKUP_FAILED = "SRC_LOOKUP_FAILED"
 
 class DeviceEnricher(object):
     """
-    L2 富化：devices 补设备归属，ports 补接口描述
+    L4 富化：devices 补设备归属，ports 补接口描述
 
     缓存按 IP 存一份 (设备信息, 接口索引)，两者一起过期 ——
     devices 和 ports 都由采集侧定期刷新，TTL 一致就够。
@@ -89,9 +89,13 @@ class DeviceEnricher(object):
             }
             return info, PortIndex([])
 
+        # devices 命中走的是网关反查时，resolved_ip 才是真实采集 ip ——
+        # ports 表按真实采集 ip 登记，查接口表不能再用原始传入的网关地址
+        ports_ip = str(device.get("resolved_ip", "") or "").strip() or ip
+
         ports = PortIndex([])
         try:
-            rows = self.db.getPorts(ip)
+            rows = self.db.getPorts(ports_ip)
             if rows != "failed":
                 ports = PortIndex(rows)
         except Exception as err:
@@ -159,12 +163,12 @@ class DeviceEnricher(object):
         info, ports = self.get(ip, now=now)
 
         if info is None:
-            # 数据库不可用，保留 L1 的结果，标记一下继续走
+            # 数据库不可用，保留 L3 的结果，标记一下继续走
             event.setdefault("sysname", NO_VALUE)
             event.setdefault("hardware", NO_VALUE)
             event.setdefault("syscontact", NO_VALUE)
-            event.setdefault("if_name", "")
-            event.setdefault("if_alias", "")
+            event.setdefault("object_name", "")
+            event.setdefault("object_alias", "")
             event["managed"] = False
             event["src_state"] = STATE_LOOKUP_FAILED
             return event
@@ -178,35 +182,47 @@ class DeviceEnricher(object):
             "managed": info["managed"],
             "src_state": info["src_state"],
         })
-        # L1 已经按 devices.vendor 定好了厂商键，这里只在它没取到时补；
+        # L3 已经按 devices.vendor 定好了厂商键，这里只在它没取到时补；
         # 覆盖会把规则匹配用的键冲掉
         if not event.get("vendor"):
             event["vendor"] = info["vendor"]
-        # 报文里没带设备名（很多设备默认不带），用表里的
-        if event.get("hostname") in ("", NO_VALUE, None):
+        # 设备名一律以 devices 表为准，覆盖 L1 剥出来的值 ——
+        # L1 只是按正则猜信封结构，碰到年份在时间后面的格式会把年份
+        # 当成设备名（Nov 12 18:39:05 2026 -> hostname=2026）。
+        # 查到了设备就说明身份已经确定，不用管正文里写了什么。
+        # sysname 取不到（未纳管设备）时才保留 L1 的结果
+        if info["sysname"] not in ("", NO_VALUE, None):
             event["hostname"] = info["sysname"]
 
-        self._enrich_port(event, ports)
+        self._enrich_object(event, ports)
         return event
 
     @staticmethod
-    def _enrich_port(event, ports):
+    def _enrich_object(event, ports):
         """
-        补接口描述。object 是 L1 抽的，不动它 ——
-        它参与 L4 指纹，改了就关不掉原来的告警
+        给 alarm_object 补一个人类可读的别名。object 是 L3 抽的，不动它 ——
+        它参与 L6 指纹，改了就关不掉原来的告警。
+
+        L4 跑在 L5 attrs 之前，这里还拿不到 object_type（L5 按 event_code
+        查 syslog_event 才产出），没法先按类型分支再查表。现在只接了
+        interface 一种：直接拿 alarm_object 去 ports 表试查，查到了就是
+        接口、填 object_alias；查不到就留空，不强行判断它是不是接口。
+
+        以后要接 peer/mac/slot 的别名，在这里按各自的数据源加一段
+        "查不到就跳过" 的尝试，和接口这段并列，不要依赖 object_type。
         """
         alarm_object = str(event.get("alarm_object", "") or "")
         if not alarm_object or alarm_object == NO_VALUE or ports is None:
-            event.setdefault("if_name", "")
-            event.setdefault("if_alias", "")
+            event.setdefault("object_name", "")
+            event.setdefault("object_alias", "")
             return
 
         row = ports.lookup(alarm_object)
         if not row:
             # 对象不是接口（peer IP / 槽位 / none），或接口表里没有这个口
-            event["if_name"] = ""
-            event["if_alias"] = ""
+            event["object_name"] = ""
+            event["object_alias"] = ""
             return
 
-        event["if_name"] = row.get("if_name", "")
-        event["if_alias"] = str(row.get("alias", "") or "")
+        event["object_name"] = row.get("if_name", "")
+        event["object_alias"] = str(row.get("alias", "") or "")

@@ -10,30 +10,145 @@ switchlog 服务入口
 三个线程角色：
 
     receiver      recvfrom -> hash(ip) % N -> worker 队列。只做这两件事
-    worker x N    从队列取报文，跑 L0 ~ L2.5
+    worker x N    从队列取报文，跑 L1 ~ L5
     maintenance   定时刷新规则表、清理缓存、打一行统计
 
 收包和解析必须分开：解析是 CPU 密集，跑在收包线程里会让 recvfrom 迟滞、
 内核 socket buffer 溢出丢包，那是无声丢包。
 
-按 IP hash 分区是硬要求，不是优化：L4 聚合和 L5 状态机依赖同设备事件的
+按 IP hash 分区是硬要求，不是优化：L6 聚合和 L7 状态机依赖同设备事件的
 先后顺序，随机分配会让 IF_UP 先于 IF_DOWN 被处理，告警关不掉。
+
+经中转站转发的日志，UDP 包的源地址是中转站自己的 IP，不是交换机的
+真实 IP。中转站用 rsyslog 的模板把整条日志包成一行 JSON 转发过来，见
+parse_relay_payload()。没走中转、设备直连的仍然是原始 syslog 文本，
+两种格式自动识别，不需要分别配置。
 """
 import os
 import sys
+import json
 import time
 import socket
 import argparse
 import logging
 import threading
 import queue
+import datetime
+from logging.handlers import TimedRotatingFileHandler
 
 from config.config import Config
-from utils.logger import setup_logger
+from utils.logger import setup_logger, LOG_DIR
 from utils.stats import stats
 from pipeline.runner import Runner
 
 logger = logging.getLogger(__name__)
+
+# 中转站 rsyslog 的转发模板：
+#
+#   template(name="fwd-json" type="list") {
+#       constant(value="{")
+#         constant(value="\"time\":\"")        property(name="timegenerated" dateFormat="rfc3339")
+#         constant(value="\",\"src_ip\":\"")   property(name="fromhost-ip")
+#         constant(value="\",\"severity\":\"") property(name="syslogseverity-text")
+#         constant(value="\",\"facility\":\"") property(name="syslogfacility-text")
+#         constant(value="\",\"message\":\"")  property(name="rawmsg-after-pri" format="json")
+#       constant(value="\"}")
+#   }
+#
+# 中转站收到交换机原始报文后，包成一行 JSON 转发给 switchlog——不这么做的话，
+# switchlog 这边 socket.recvfrom() 拿到的 addr[0] 会是中转站自己的 IP
+# （比如 172.25.40.11），不是交换机的真实 IP。按 ip 查 devices 表、
+# 按 ip hash 分 worker 全部会查到中转站身上。
+#
+# time 字段是 rfc3339，取的是中转站 rsyslog 收到这条日志的时刻
+# （timegenerated），不是交换机自己写在报文正文里的时间——这正是
+# l1_prepare.py 一直要的"采集时间"，比 switchlog 收到 UDP 包的时刻
+# 更接近设备实际发出日志的那一刻，网络转发的几毫秒延迟可以忽略。
+
+
+def parse_rfc3339(text):
+    """
+    rfc3339 时间串转 epoch 秒。转不动返回 None，不往上抛——
+    上一条日志的时间格式异常不该让整个 UDP 收包线程挂掉
+    """
+    try:
+        text = str(text or "").strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return int(datetime.datetime.fromisoformat(text).timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_relay_payload(text):
+    """
+    自动识别中转站的 JSON 转发格式，解不出来就当原始 syslog 文本处理
+
+    :return: (ip 或 None, message, timestamp 或 None)
+             ip/timestamp 为 None 表示没取到，调用方退回各自的默认值
+             （UDP 包的 addr[0] / 本机当前时间）
+    """
+    text = text.strip()
+    if not text.startswith("{"):
+        return None, text, None
+
+    try:
+        payload = json.loads(text)
+    except (ValueError, TypeError):
+        # 开头是 { 但不是合法 JSON，大概率是设备正文本身凑巧带了个花括号，
+        # 当原始文本处理，不要因为解析失败丢整条日志
+        return None, text, None
+
+    if not isinstance(payload, dict) or "message" not in payload:
+        # 合法 JSON 但不是预期的转发格式（没有 message 字段），同样退回
+        # 原始文本 —— 整个 JSON 字符串当 message 正文，至少不丢日志
+        return None, text, None
+
+    ip = str(payload.get("src_ip") or "").strip() or None
+    message = str(payload.get("message") or "")
+    ts = parse_rfc3339(payload.get("time"))
+    return ip, message, ts
+
+
+# ============================================================
+# 原始报文留档
+# ============================================================
+
+RAW_PACKET_LOG_FILE = os.path.join(LOG_DIR, "raw_packets.log")
+
+
+def build_raw_packet_logger():
+    """
+    建一个独立的 logger 专门记收到的原始 UDP 报文，不走根 logger
+
+    和 switchlog.log 分开是因为用途、量级都不一样：switchlog.log 记的是
+    应用事件（启动、错误、告警动作），这里记的是每一个收到的包，日志
+    风暴时一分钟几万行，混在一起会把应用日志冲没，排查反而更难。
+
+    只记 addr[0]（UDP 包的真实来源，可能是中转站）+ 原始 message，不做
+    任何解析 —— 解析可能失败、可能抛异常，记录这一步必须比解析更可靠，
+    否则这份档案本身就不可信。真正的 ip 识别结果（剥没剥出 src_ip、
+    走没走中转）该看 switchlog.log 里 L3 产出的 event，这里只保证
+    "设备确实发了这条、长什么样"这件事能查到。
+
+    按天切割，和 switchlog.log 用同一套 TimedRotatingFileHandler，
+    保留天数单独配置 —— 这份文件写入量比应用日志大得多，留的天数
+    短一些更合适，不和 log_backup_days 共用一个值。
+    """
+    raw_logger = logging.getLogger("switchlog.raw_packets")
+    raw_logger.setLevel(logging.INFO)
+    raw_logger.propagate = False  # 不往根 logger 冒泡，不进 switchlog.log
+
+    for handler in raw_logger.handlers[:]:
+        raw_logger.removeHandler(handler)
+
+    handler = TimedRotatingFileHandler(
+        RAW_PACKET_LOG_FILE, when="midnight", interval=1,
+        backupCount=Config.raw_packet_log_backup_days, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s",
+                                           datefmt="%Y-%m-%d %H:%M:%S"))
+    raw_logger.addHandler(handler)
+    return raw_logger
 
 
 # ============================================================
@@ -49,7 +164,8 @@ class UdpReceiver(object):
     起服务时把真实值打出来，免得以为调大了其实没生效。
     """
 
-    def __init__(self, ip, port, max_packet_size, rcvbuf, queues, stop_event):
+    def __init__(self, ip, port, max_packet_size, rcvbuf, queues, stop_event,
+                 raw_logger=None):
         self.ip = ip
         self.port = port
         self.max_packet_size = int(max_packet_size)
@@ -59,6 +175,11 @@ class UdpReceiver(object):
         self._sock = None
         self._thread = None
         self._workers = len(queues)
+        self._raw_logger = raw_logger
+        # 来源 IP 黑名单，配置里的固定集合，收包线程只做一次 in 判断
+        self._drop_sources = frozenset(Config.drop_source_ips or ())
+        if self._drop_sources:
+            logger.info("来源IP黑名单已启用：%s", ", ".join(sorted(self._drop_sources)))
 
     def start(self):
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -96,13 +217,39 @@ class UdpReceiver(object):
 
             if not data:
                 continue
-            source_ip = addr[0]
+            text = data.decode("utf-8", "replace").strip()
+
+            # 原始留档，排在任何解析之前：只记"收到了什么"，不依赖后面
+            # 解析成不成功。addr[0] 是 UDP 包的真实来源，走中转时就是
+            # 中转站自己的 IP，不是设备 IP ——要看最终识别到的设备 IP，
+            # 去 switchlog.log 里对应时刻的 L3 解析结果
+            if self._raw_logger is not None:
+                try:
+                    self._raw_logger.info("%s %s", addr[0], text)
+                except Exception:
+                    pass  # 留档失败不能影响正常收包，静默跳过
+
+            # 中转站转发的是一行 JSON，剥出真实设备 IP / 正文 / 采集时间；
+            # 不是 JSON 说明设备直连，三者都退回现有行为
+            relay_ip, message, relay_ts = parse_relay_payload(text)
+            source_ip = relay_ip or addr[0]
+
+            # 来源 IP 黑名单：本机回环转发的日志（rsyslog 把本机日志也
+            # 转过来）不是任何一台纳管设备，进管线只会变成 UNMANAGED_SRC
+            # 噪声。拦在入队之前，连 worker 都不占
+            if source_ip in self._drop_sources:
+                stats.incr("dropped_source")
+                continue
+
             raw = {
                 "ip": source_ip,
-                "message": data.decode("utf-8", "replace").strip(),
-                "timestamp": int(time.time()),
+                "message": message,
+                "timestamp": relay_ts if relay_ts is not None else int(time.time()),
             }
-            # 同一设备的日志必须落到同一个 worker，顺序是聚合和状态机的前提
+            # 同一设备的日志必须落到同一个 worker，顺序是聚合和状态机的前提。
+            # 这里的 source_ip 已经是剥过中转前缀的真实设备 IP ——
+            # 如果漏剥，走中转站的所有设备会被 addr[0]（中转站自己的 IP）
+            # 统一哈希到一个 worker，等于失去了按设备分区的意义
             index = hash(source_ip) % self._workers
             try:
                 self.queues[index].put_nowait(raw)
@@ -159,15 +306,15 @@ class Worker(threading.Thread):
         """
         每条日志的解析结果 + 告警动作
 
-        落库和通知都在 L6 里做完了，这里只是打日志。解析那行是 debug，
+        落库和通知都在 L9 里做完了，这里只是打日志。解析那行是 debug，
         日志量大的时候不该刷屏；真产生了告警动作的打 warning。
         """
         logger.debug(
-            "%s %s %s %s severity=%s object=%s if=%s alias=%s",
+            "%s %s %s %s severity=%s object=%s object_name=%s object_alias=%s",
             event.get("ip"), event.get("hostname"),
             event.get("event_code"), event.get("vendor"),
             event.get("severity_name", "-"), event.get("alarm_object"),
-            event.get("if_name") or "-", event.get("if_alias") or "-")
+            event.get("object_name") or "-", event.get("object_alias") or "-")
         log_decision(event.get("decision"))
 
 
@@ -294,7 +441,7 @@ def run_service(args):
                 Config.alarm_write_db, Config.alarm_notify, Config.notify_channel)
 
     # 回放未恢复的告警。不放的话重启后同一个还没好的故障会重新开告警，
-    # 等于重复通知一次。两层各回放自己的：L4 回放窗口、L5 回放告警状态
+    # 等于重复通知一次。两层各回放自己的：L6 回放窗口、L7 回放告警状态
     restored = runner.aggregator.restore()
     if restored:
         logger.info("回放 %s 个指纹的聚合窗口", restored)
@@ -311,10 +458,17 @@ def run_service(args):
         Config.rule_refresh_interval, Config.stats_interval)
     maintenance.start()
 
+    raw_logger = None
+    if Config.raw_packet_log_enable:
+        raw_logger = build_raw_packet_logger()
+        logger.info("原始报文留档已开启：%s（保留 %s 天）",
+                    RAW_PACKET_LOG_FILE, Config.raw_packet_log_backup_days)
+
     receiver = UdpReceiver(
         args.listen_ip or Config.listen_ip,
         args.port or Config.listen_port,
-        Config.max_packet_size, Config.socket_rcvbuf, queues, stop_event)
+        Config.max_packet_size, Config.socket_rcvbuf, queues, stop_event,
+        raw_logger=raw_logger)
     try:
         receiver.start()
     except PermissionError:
@@ -435,8 +589,9 @@ def main(argv=None):
     setup_logger(args.log_level or None)
 
     logger.info("=" * 60)
-    logger.info("switchlog 启动，数据源 %s",
-                "mock（config.use_mock_db=True）" if Config.use_mock_db else "MySQL")
+    logger.info("switchlog 启动，数据源 MySQL %s:%s/%s",
+                Config.mysql_config["db_host"], Config.mysql_config["db_port"],
+                Config.mysql_config["db_name"])
     logger.info("=" * 60)
 
     if args.selftest:

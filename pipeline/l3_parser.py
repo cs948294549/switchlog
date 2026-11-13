@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-L1 解析归一
+L3 解析归一
 
-输入是 L0 prepare 的输出，信封和 mnemonic 已经剥好。本层只剩两步：
+输入是 L1 prepare 的输出，信封和 mnemonic 已经剥好。本层只剩两步：
 
     1. 按源 IP 查 devices.vendor。厂商只认 devices 表，不猜文本
     2. syslog_rule 查 (vendor, mnemonic)，没命中退 ('*', mnemonic)。
        同一 mnemonic 多行时用 body_match 消歧（PHY_UPDOWN 的 up/down
        共用一条 mnemonic）。命中后按该行的 object_regex 抽对象
 
+这两步分别查两张不同的表，所以本层接两个 db：构造时的 db 参数只管
+syslog_rule（由 get_rule_db() 注入），device_db 参数单独查
+devices.vendor（由 get_device_db() 注入）。SyslogRuleDB 不实现
+getDeviceVendor，两者不能共用一个 db 实例。
+
 只产出 event_code 和 object 两样东西。severity / state / object_type /
-窗口 / clear_code 是事件属性，按 event_code 查 syslog_event，在 L2.5 确定。
+窗口 / clear_code 是事件属性，按 event_code 查 syslog_event，在 L5 确定。
 
 一切按表来，代码里不内置任何厂商正则或关键字：
 报文不可读 -> PARSE_FAIL，查不到厂商 -> UNMANAGED_SRC，
@@ -166,22 +171,28 @@ class RuleIndex(object):
 
 class SyslogParser(object):
     """
-    L1 解析器
+    L3 解析器
 
     规则表定时刷新，devices.vendor 带 TTL 缓存（含负缓存）。
     线程安全：索引整体替换，读的时候拿一次引用，不在读路径上加锁。
     """
 
     def __init__(self, refresh_interval=DEFAULT_REFRESH, vendor_ttl=DEFAULT_VENDOR_TTL,
-                 db=None):
+                 db=None, device_db=None):
         """
         :param refresh_interval: syslog_rule 刷新间隔（秒），0 表示只加载一次
         :param vendor_ttl: devices.vendor 缓存秒数
-        :param db: 数据源，由 db.get_rule_db() 注入
+        :param db: 规则表数据源，由 db.get_rule_db() 注入，只管 syslog_rule
+        :param device_db: 设备表数据源，由 db.get_device_db() 注入，
+                          vendor_of() 用它查 devices.vendor。规则表和
+                          设备表是两张不同的库表，不能共用一个 db ——
+                          SyslogRuleDB 不实现 getDeviceVendor，那是
+                          DeviceDB 的职责
         """
         self._refresh_interval = int(refresh_interval)
         self._vendor_ttl = int(vendor_ttl)
         self._db = db
+        self._device_db = device_db
         self._index = RuleIndex([], 0)
         self._version = 0
         self._lock = threading.RLock()
@@ -206,6 +217,13 @@ class SyslogParser(object):
             from db import get_rule_db
             self._db = get_rule_db()
         return self._db
+
+    @property
+    def device_db(self):
+        if self._device_db is None:
+            from db import get_device_db
+            self._device_db = get_device_db()
+        return self._device_db
 
     def refresh(self):
         """重新加载 syslog_rule。加载失败保留旧索引，不把管线打空"""
@@ -262,7 +280,7 @@ class SyslogParser(object):
                 return cached[1]
 
         try:
-            vendor = self.db.getDeviceVendor(ip)
+            vendor = self.device_db.getDeviceVendor(ip)
         except Exception as err:
             logger.error("======SyslogParser vendor lookup error========\n%s", err)
             return ""
@@ -329,9 +347,9 @@ class SyslogParser(object):
         """
         解析一条已预处理的报文
 
-        :param prepared: L0 prepare 的输出
+        :param prepared: L1 prepare 的输出
         :param now: 采集时间，prepared 里没有 ingest_ts 时用
-        :return: L1 输出契约，见 pipeline/__init__.py
+        :return: L3 输出契约，见 pipeline/__init__.py
         """
         ip = prepared.get("ip") or "-"
         body = prepared.get("body") or ""

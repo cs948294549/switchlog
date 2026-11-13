@@ -1,30 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-L3 告警静默  [未实现]
+L8 告警静默
 
 只有 mute 一档，判据 ip_reg / event_code_reg / object_reg + 时间窗。
 
 原来设计的三档收窄成一档：
 
-    drop    确定是噪声的日志改用 syslog_black_list 在 L0.5 截掉。
+    drop    确定是噪声的日志改用 syslog_black_list 在 L2 截掉。
             越早丢越省资源，那一层按 mnemonic 走 dict，比解析完再丢便宜
     depend  拓扑抑制依赖运行时的上游可达状态，不是静态规则能表达的，
             本轮不做
     mute    留下，就是本层
 
-跑在 L5 之后，不在 L2.5 之后，三个原因：
+跑在 L7 之后，不在 L5 之后，三个原因：
 
-    1. 判据凑不齐。object 要等 L1 抽、L4 聚合，告警状态要等 L5
-    2. 冷路径。只有 L5 判定"需要告警"的聚合告警才过这一层 ——
+    1. 判据凑不齐。object 要等 L3 抽、L6 聚合，告警状态要等 L7
+    2. 冷路径。只有 L7 判定"需要告警"的聚合告警才过这一层 ——
        一次端口 down 是 3 条日志、1 个指纹、1 次 mute 判断，量级从
        日志条数掉到告警条数，差几个数量级。所以四个判据全用正则也不心疼
     3. 被静默的告警照样进聚合、进状态机、照样写 alarm_list，只是不发
        通知。割接完要能回看那段时间发生了什么
 
 所以本层不丢事件、不拦记录。muted 是记录上的一个状态，不是"要不要入库"
-的开关 —— 被静默的告警照样入库，只是 L6 不发通知。
+的开关 —— 被静默的告警照样入库，只是 L9 不发通知。
 
-这和 L2.5 的 action=ignore 是同一个模式（都不丢事件，只标记），区别是
+这和 L5 的 action=ignore 是同一个模式（都不丢事件，只标记），区别是
 ignore 是静态配置、长期生效，mute 是时间窗驱动、窗口过了自动恢复。
 
 ======================= 写入时序 =======================
@@ -44,14 +44,14 @@ muted=0 再 UPDATE 成 1 —— 中间那一瞬间看板轮询到会显示成"�
 
 第二个方向必须靠定时扫描，不能等日志驱动：窗口到期是时间到了，不是来了
 新日志。一个口在割接窗口里 down 了一直没好，窗口结束之后不会再有新日志
-进管线（L5 看到已有活跃告警只累加，也不会重新判 mute），这条告警就会
+进管线（L7 看到已有活跃告警只累加，也不会重新判 mute），这条告警就会
 永远 muted —— 割接结束了、故障还在，但没人收到通知。
 
 所以本层除了 handle() 还要有个 sweep()：
 
     AlarmDB.getMutedOpenAlarms()  取还在告警中且被静默的
     -> 逐条重新判当前时刻还命不命中规则
-    -> 不命中的 setAlarmMute(id, False)，并交给 L6 补发一次通知
+    -> 不命中的 setAlarmMute(id, False)，并交给 L9 补发一次通知
 
 补不补发通知要定：窗口结束时故障还在，值班应该被叫醒；但如果窗口里这条
 告警已经恢复过又重开，补发的内容要以当前状态为准。实现时按"扫描时
@@ -61,7 +61,7 @@ muted 和 alarm_list.status=4（人工屏蔽）分开两个字段存，到期这
 原因：窗口过了只需要把 muted 改回 0，人工屏蔽该留着。塞进同一个字段，
 这时候就得判断"这个 4 是人设的还是规则设的"，判不出来。
 
-闪断和 mute 的交互：割接期间的 raise 照样进 L5 的闪断计数（L5 不反查
+闪断和 mute 的交互：割接期间的 raise 照样进 L7 的闪断计数（L7 不反查
 mute 规则，两层之间不加反向依赖），窗口内连续 3 次会升出一条 P1 的
 IF_FLAP。那条 IF_FLAP 同样要过本层，命中同一条 mute 规则就一起被静默 ——
 前提是规则的 event_code_reg 能盖住 IF_FLAP。只写了 ^IF_DOWN$ 的规则会
@@ -71,22 +71,22 @@ IF_FLAP。那条 IF_FLAP 同样要过本层，命中同一条 mute 规则就一�
     1. syslog_mute_rule 表定稿（已建，见 sql/schema.sql）
     2. 变更工单的查询接口确定 —— 规则的数据来源是 central-server 的
        AlterationManageDB，人工配规则只是兜底
-    3. L4 / L5 先落地，本层的输入是它们产出的聚合告警
+    3. L6 / L7 先落地，本层的输入是它们产出的聚合告警
 
 ======================= 接口 =======================
 
     handle(decision, now) -> 原地往 decision 上填 muted / mute_rule_id
     sweep(now)            -> [放出的告警]，维护线程定期调
 
-入参是 L5 的决策（带 fingerprint / ip / event_code / alarm_object），
-不是原始 event —— 本层在 L5 之后，拿到的已经是告警不是日志。
+入参是 L7 的决策（带 fingerprint / ip / event_code / alarm_object），
+不是原始 event —— 本层在 L7 之后，拿到的已经是告警不是日志。
 """
 import re
 import time
 import logging
 import threading
 
-from pipeline.attrs import severity_name
+from pipeline.l5_attrs import severity_name
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +94,7 @@ ACTION_PASS = "pass"
 ACTION_MUTE = "mute"
 
 # sweep() 放出来的决策用这个动作：告警早就在 alarm_list 里了，
-# muted 这一列本层也改过了，L6 只需要补一条通知，不要再写库
+# muted 这一列本层也改过了，L9 只需要补一条通知，不要再写库
 ACTION_NOTIFY_ONLY = "notify_only"
 
 # syslog_mute_rule 刷新间隔。比其他规则表短（那几张是 300s）：
@@ -230,7 +230,7 @@ class MuteIndex(object):
 
 class MuteFilter(object):
     """
-    L3 静默
+    L8 静默
 
     handle() 判一条决策要不要静默，sweep() 把窗口过了的放出来。
     和其他规则层一样定时刷新，索引整体替换，读路径不加锁。
@@ -312,18 +312,18 @@ class MuteFilter(object):
 
     def handle(self, decision, now=None):
         """
-        判一条 L5 决策要不要静默，原地填 muted / mute_rule_id
+        判一条 L7 决策要不要静默，原地填 muted / mute_rule_id
 
         不丢决策、不拦记录：muted 是记录上的状态，不是"要不要入库"的开关。
-        被静默的告警照样入库，只是 L6 不发通知。
+        被静默的告警照样入库，只是 L9 不发通知。
 
-        L5 说不用通知的（action=none/ignore）直接跳过，不白跑正则
+        L7 说不用通知的（action=none/ignore）直接跳过，不白跑正则
 
         :return: decision
         """
         if not decision:
             return decision
-        # 两个字段一定有值，不管走哪条分支 —— L6 不用判 key 在不在
+        # 两个字段一定有值，不管走哪条分支 —— L9 不用判 key 在不在
         decision.setdefault("muted", False)
         decision.setdefault("mute_rule_id", 0)
         if not decision.get("notify"):
@@ -352,13 +352,13 @@ class MuteFilter(object):
 
         必须定时扫，不能等日志驱动。窗口到期是时间到了，不是来了新日志 ——
         一个口在割接窗口里 down 了一直没好，窗口结束之后不会再有新日志进
-        管线（L5 看到已有活跃告警只累加，也不会重新判 mute），这条告警就
+        管线（L7 看到已有活跃告警只累加，也不会重新判 mute），这条告警就
         永远 muted，割接结束了、故障还在，但没人收到通知。
 
         扫描时 state 仍是 open 就补发通知：窗口结束故障还在，值班应该被叫醒。
 
         :return: [{alarm_id, fingerprint, ip, event_code, alarm_object,
-                   severity, notify}]，交给 L6 补发通知
+                   severity, notify}]，交给 L9 补发通知
         """
         now = int(now if now is not None else time.time())
         try:
@@ -387,7 +387,7 @@ class MuteFilter(object):
 
             released.append({
                 # 只补通知，不再动 alarm_list —— muted 这一列上面
-                # 已经改过了，别让 L6 拿默认值把 last_seen/counter 冲掉
+                # 已经改过了，别让 L9 拿默认值把 last_seen/counter 冲掉
                 "action": ACTION_NOTIFY_ONLY,
                 "alarm_id": alarm_id,
                 "fingerprint": row.get("fingerprint", ""),

@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-L4 聚合
+L6 聚合
 
-这一级不做任何正则匹配。进来的是 L2.5 产出的原子告警，event_code 和
+这一级不做任何正则匹配。进来的是 L5 产出的原子告警，event_code 和
 归一化后的 object 都已算好，这里只剩拼 key：
 
     fingerprint = md5(ip | event_code | alarm_object)
 
 恢复事件（IF_UP）要落到对应故障事件（IF_DOWN）的指纹上才关得掉告警，
-所以用 L2.5 补的 clear_code 换算：IF_UP 的指纹按 IF_DOWN 算。
+所以用 L5 补的 clear_code 换算：IF_UP 的指纹按 IF_DOWN 算。
 
 窗口用真滑动，不靠分桶继承：
 
@@ -28,28 +28,28 @@ max_life 那条分支根本到不了，无限继承就没解决（设计文档 �
 ======================= 写 alarm_log =======================
 
 本层把原子告警写进 alarm_log（一条日志一行，带指纹，只留 7 天）。
-过了 L0.5 的日志条条都写，包括噪声码和没到阈值没产生告警的 ——
+过了 L2 的日志条条都写，包括噪声码和没到阈值没产生告警的 ——
 指纹在 alarm_list 里查不到说明这组日志没到告警阈值，这本身是有用的信息。
 
 写入量就是收到的日志量，日志风暴时一分钟几万行，所以必须攒批：
 攒到 batch_size 或者隔 flush_interval 秒刷一次，由维护线程兜底调 flush()。
 
-alarm_list 不在这里写。阈值判断是 L5 的事 —— MAC_FLAP 配 600/3，
+alarm_list 不在这里写。阈值判断是 L7 的事 —— MAC_FLAP 配 600/3，
 第一条日志进来时 alarm_list 里不该有行，攒到第 3 条才算告警。本层只管
-数清楚 count 交给 L5。
+数清楚 count 交给 L7。
 
-======================= 输出给 L5 =======================
+======================= 输出给 L7 =======================
 
     {"fingerprint", "group_label", "is_first", "count", "first_seen", "last_seen"}
 
 count 是**日志条数**，不是事故次数。一次端口 down 在 Cisco 上可能同时落到
 IF_DOWN、IF_DOWN_LINK_FAILURE、LINEPROTO down 三条日志，指纹相同 count 就是 3，
 但这是一次端口 down。所以任何按"次数"做的判断（闪断识别）都不能直接读
-count，必须数 L5 里"无活跃告警 -> 开告警"这一跳。
+count，必须数 L7 里"无活跃告警 -> 开告警"这一跳。
 
-is_first 只表示"本段窗口内第一条"。**L5 不要拿它决定开不开告警** ——
+is_first 只表示"本段窗口内第一条"。**L7 不要拿它决定开不开告警** ——
 max_life 切新段时它也是 True，而一个口持续 down 一小时应该是一条告警
-不是两条。L5 的判据是"有没有活跃告警"。
+不是两条。L7 的判据是"有没有活跃告警"。
 
 状态放内存，不引入 Redis：worker 按 IP hash 分区，同一设备的日志固定
 落到同一个 worker，所以同一指纹不会跨 worker。但 Runner 是各 worker
@@ -133,7 +133,7 @@ class Window(object):
 
 class Aggregator(object):
     """
-    L4 聚合器
+    L6 聚合器
 
     handle() 热路径：算指纹、滑窗口、攒 alarm_log 的批。
     flush() / purge() 由维护线程定期调。
@@ -176,7 +176,7 @@ class Aggregator(object):
         """
         聚合一条原子告警，原地往 event 上补指纹和窗口字段
 
-        :param event: L2.5 的输出
+        :param event: L5 的输出
         :param now:   采集时间，不传取 event 的 ingest_ts
         :return: event
         """
@@ -204,7 +204,7 @@ class Aggregator(object):
         这张反查表由 attrs 层维护（clear_code -> 故障码），本层只用结果。
         """
         code = event.get("event_code", "")
-        # L2.5 补的 raise_code：本事件是谁的恢复事件。没有就是它自己
+        # L5 补的 raise_code：本事件是谁的恢复事件。没有就是它自己
         code = event.get("raise_code") or code
         return fingerprint_of(event.get("ip"), code, event.get("alarm_object"))
 
@@ -350,7 +350,7 @@ class Aggregator(object):
         重启后回放未恢复告警的窗口状态，避免重启后同一故障重新开段
 
         只回放 first_seen / last_seen / counter 三样，够算窗口了。
-        告警本身的状态由 L5 自己回放。
+        告警本身的状态由 L7 自己回放。
 
         :return: 回放的窗口数
         """

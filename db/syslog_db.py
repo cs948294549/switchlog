@@ -3,10 +3,10 @@
 syslog_* 规则表读取
 
 四张表对应管线的三层，各读各的，互不依赖：
-    syslog_black_list     L0.5 解析前拦截（mnemonic / 全文子串）
-    syslog_rule           L1   匹配规则（vendor + mnemonic -> event_code）
-    syslog_event          L2.5 事件属性（state/object_type/窗口/clear_code）
-    syslog_severity_rule  L2.5 事件定级（event_code + 设备 -> severity）
+    syslog_black_list     L2 解析前拦截（mnemonic / 全文子串）
+    syslog_rule           L3   匹配规则（vendor + mnemonic -> event_code）
+    syslog_event          L5 事件属性（state/object_type/窗口/clear_code）
+    syslog_severity_rule  L5 事件定级（event_code + 设备 -> severity）
 """
 import logging
 
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class SyslogRuleDB(object):
     """syslog_black_list / syslog_rule / syslog_event / syslog_severity_rule 的读"""
 
-    # ---------------- L0.5 ----------------
+    # ---------------- L2 ----------------
 
     def getBlacklistRules(self):
         """
@@ -39,7 +39,7 @@ class SyslogRuleDB(object):
             logger.error("======SyslogRuleDB getBlacklistRules error========\n%s", err)
             return []
 
-    # ---------------- L1 ----------------
+    # ---------------- L3 ----------------
 
     def getSyslogRules(self):
         """
@@ -63,7 +63,7 @@ class SyslogRuleDB(object):
             logger.error("======SyslogRuleDB getSyslogRules error========\n%s", err)
             return []
 
-    # ---------------- L2.5 ----------------
+    # ---------------- L5 ----------------
 
     def getSyslogEvents(self):
         """

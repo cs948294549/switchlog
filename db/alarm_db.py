@@ -2,14 +2,14 @@
 """
 告警落库
 
-L4 / L5 / L3 / L6 都还没实现，这里先把写入接口定下来，各层落地时直接调。
+L6 / L7 / L8 / L9 都还没实现，这里先把写入接口定下来，各层落地时直接调。
 
 四张表：
-    alarm_log           L4 写，原子告警，一条日志一行，只留 7 天
-    alarm_list          L4 写、L5 更状态、L3 回写静默标记，看板读，
+    alarm_log           L6 写，原子告警，一条日志一行，只留 7 天
+    alarm_list          L6 写、L7 更状态、L8 回写静默标记，看板读，
                         central-server/api/api_alarm.py 也读这张
-    syslog_alarm_state  L5 状态机持久化，进程重启后接着算
-    syslog_mute_rule    L3 读，静默规则
+    syslog_alarm_state  L7 状态机持久化，进程重启后接着算
+    syslog_mute_rule    L8 读，静默规则
 
 alarm_log 和 alarm_list 靠 fingerprint 关联：一条聚合告警由 N 条原子
 记录支撑，看板点一条告警就能下钻到具体哪几条日志。
@@ -25,8 +25,9 @@ logger = logging.getLogger(__name__)
 # muted / mute_rule_id 由 muteAlarm() 单独回写，不在 addAlarm 的入参里
 ALARM_FIELDS = [
     "ip", "hostname", "alarm_type", "group_label", "msg", "group_name", "alarm_object",
-    "keyword", "status", "create_time", "fingerprint", "severity", "state", "first_seen",
-    "last_seen", "counter", "clear_time", "muted", "mute_rule_id",
+    "keyword", "status", "create_time", "fingerprint", "vendor", "hardware", "object_name",
+    "object_alias", "severity", "state", "first_seen", "last_seen", "counter", "clear_time",
+    "muted", "mute_rule_id",
 ]
 
 ALARM_LOG_FIELDS = [
@@ -50,7 +51,7 @@ class AlarmDB(object):
         muted / mute_rule_id 在入参里，一次写进去 —— 被静默的告警照样
         入库（割接完要能回看那段时间发生了什么），只是不发通知。
         先 INSERT（muted=0）再 UPDATE 的话，中间那一瞬间看板轮询到会显示成
-        "割接期间有条没静默的告警"。L3 的判定在 L6 落库之前就有结果，
+        "割接期间有条没静默的告警"。L8 的判定在 L9 落库之前就有结果，
         没必要分两次写。
 
         :return: alarm_id；失败返回 0
@@ -63,16 +64,20 @@ class AlarmDB(object):
         sql = '''
         insert into alarm_list(ip, hostname, alarm_type, group_label, msg, group_name,
                                alarm_object, keyword, status, create_time, fingerprint,
-                               severity, state, first_seen, last_seen, counter, clear_time,
-                               muted, mute_rule_id)
-        values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                               vendor, hardware, object_name, object_alias, severity, state,
+                               first_seen, last_seen, counter, clear_time, muted, mute_rule_id)
+        values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         '''
         params = (
             data["ip"], data["hostname"], data.get("alarm_type", "syslog"),
             data["group_label"], str(data["msg"])[:500], str(data["group_name"])[:100],
             str(data["alarm_object"])[:100], str(data["keyword"])[:100],
             data.get("status", "0"), str(data.get("create_time", "")),
-            data.get("fingerprint", ""), data.get("severity", 3),
+            data.get("fingerprint", ""),
+            str(data.get("vendor", "") or "")[:30], str(data.get("hardware", "") or "")[:100],
+            str(data.get("object_name", "") or "")[:100],
+            str(data.get("object_alias", "") or "")[:200],
+            data.get("severity", 3),
             data.get("state", "open"), str(data.get("first_seen", "")),
             str(data.get("last_seen", "")), int(data.get("counter", 1)),
             str(data.get("clear_time", "")),
@@ -154,14 +159,14 @@ class AlarmDB(object):
 
     def getMutedOpenAlarms(self, limit=5000):
         """
-        取还在告警中、且被静默的记录。L3 的到期扫描用
+        取还在告警中、且被静默的记录。L8 的到期扫描用
 
         为什么需要这个扫描：窗口到期是时间到了，不是来了新日志。一个口在
         割接窗口里 down 了一直没好，窗口结束之后不会再有新日志进管线
-        （L5 看到已有活跃告警只累加，也不会重新判 mute），这条告警就会
+        （L7 看到已有活跃告警只累加，也不会重新判 mute），这条告警就会
         永远 muted —— 割接结束了故障还在，但没人收到通知。
 
-        所以 L3 要定期扫这些记录，重新判一遍当前时刻还命不命中静默规则，
+        所以 L8 要定期扫这些记录，重新判一遍当前时刻还命不命中静默规则，
         不命中就 setAlarmMute(alarm_id, False) 放出来。
 
         :return: [{...}]；失败返回 []
@@ -233,7 +238,7 @@ class AlarmDB(object):
         clear_time 作上界），所以正确的用法是 getAlarmLogsByAlarm()，
         本方法是它的底层。
 
-        时间两头都是闭区间：L4 的段边界是"间隔大于窗口"切出来的，相邻两次
+        时间两头都是闭区间：L6 的段边界是"间隔大于窗口"切出来的，相邻两次
         故障之间必然有一个大于窗口的空档，闭区间不会互相串。
 
         ingest_ts 是定长 10 位的 epoch 字符串，字符串比较和数值比较等价
@@ -312,8 +317,8 @@ class AlarmDB(object):
         上界取 clear_time（已恢复）或 last_seen（还在告警中）。未恢复的
         告警 last_seen 会一直往后走，所以每次查都要重新读，不能缓存。
 
-        pad_seconds 给两头各放宽几秒：L4 写 alarm_log 是攒批的，一条日志的
-        ingest_ts 和 L5 更新 alarm_list.last_seen 的时刻之间有几秒的差，
+        pad_seconds 给两头各放宽几秒：L6 写 alarm_log 是攒批的，一条日志的
+        ingest_ts 和 L7 更新 alarm_list.last_seen 的时刻之间有几秒的差，
         卡死边界会漏掉最后一两条。放宽的代价是可能多带进相邻故障的日志，
         但相邻两次故障之间有一个大于窗口（至少 300s）的空档，几秒的余量
         不可能串到上一次去。
@@ -400,7 +405,7 @@ class AlarmDB(object):
 
     def getMuteRules(self):
         """
-        L3 的静默规则。只取在窗口内的 —— 过期规则留在表里供回溯，
+        L8 的静默规则。只取在窗口内的 —— 过期规则留在表里供回溯，
         但不参与匹配
 
         end_time 空=永久静默，start_time 空=立即生效，所以两头都要
@@ -431,7 +436,7 @@ class AlarmDB(object):
 
     def upsertAlarmState(self, data):
         """
-        写一条告警状态，按指纹覆盖。L5 每处理一条事件都会调。
+        写一条告警状态，按指纹覆盖。L7 每处理一条事件都会调。
 
         :return: "success" / "failed"
         """

@@ -24,9 +24,16 @@ class Config:
     # 单个 UDP 报文最大长度。RFC3164 限 1024，但现网设备常超，取 8K 够用
     max_packet_size = 8192
 
+    # 来源 IP 黑名单：命中就丢，不进 worker、不落库、不计未纳管。
+    # 写的是收包时识别出的设备 IP（走中转时是 JSON 里的 src_ip），
+    # 不是 UDP 包的网络层源地址。
+    # 默认丢 127.0.0.1 —— 中转站/本机的 rsyslog 会把自己的日志一起转过来，
+    # 那些不是纳管设备，进管线只会在看板上刷一堆 UNMANAGED_SRC
+    drop_source_ips = ("127.0.0.1",)
+
     # ---------------- 并发 ----------------
     # worker 线程数。同一设备的日志固定落到同一个 worker（按 IP hash），
-    # 因为 L4 聚合和 L5 状态机依赖同设备事件的先后顺序
+    # 因为 L6 聚合和 L7 状态机依赖同设备事件的先后顺序
     workers = 4
 
     # 每个 worker 的待处理队列长度。满了直接丢并计数 ——
@@ -39,10 +46,6 @@ class Config:
     stats_interval = 60             # 统计输出间隔（秒）
 
     # ---------------- 数据库 ----------------
-    # True 时走 tests/mock_db.py 的内存表，不连 MySQL。
-    # 表结构还没定稿时用它跑链路，定稿后改 False
-    use_mock_db = False
-
     mysql_config = {
         "db_host": "127.0.0.1",
         "db_port": 3306,
@@ -52,17 +55,17 @@ class Config:
     }
 
     # ---------------- 告警出口 ----------------
-    # L6 落 alarm_list。关掉的话告警只在 notify.log 里，看板上什么都没有，
+    # L9 落 alarm_list。关掉的话告警只在 notify.log 里，看板上什么都没有，
     # 所以正常运行必须是 True。
     # 置 False 的唯一场景：规则刚配完、怕误报刷库，先只看 notify.log 对一遍
     alarm_write_db = True
 
-    # L6 推通知。规则没调稳之前可以先关掉，只落库不打扰人 ——
+    # L9 推通知。规则没调稳之前可以先关掉，只落库不打扰人 ——
     # 看板上能看到告警，但不会推出去
     alarm_notify = True
 
     # 通知通道：file=一条通知一行 JSON 写 logs/notify.log
-    # http 通道还没实现，接口在 pipeline/emit.py 的 Notifier
+    # http 通道还没实现，接口在 pipeline/l9_emit.py 的 Notifier
     notify_channel = "file"
 
     # http 通道的参数，notify_channel="http" 时才用到。
@@ -73,3 +76,10 @@ class Config:
     # ---------------- 日志 ----------------
     log_level = "INFO"
     log_backup_days = 7
+
+    # 原始 UDP 报文留档，排查"设备到底发没发、发的什么样"用。不解析，
+    # 只记 addr[0] + 原文，和 switchlog.log 分开存（logs/raw_packets.log）。
+    # 写入量是收到的报文量，日志风暴时一分钟几万行，所以单独配保留天数，
+    # 不跟 log_backup_days 共用——这份文件该比应用日志留得短
+    raw_packet_log_enable = True
+    raw_packet_log_backup_days = 3

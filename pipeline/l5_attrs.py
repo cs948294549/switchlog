@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-L2.5 事件属性 + 事件定级
+L5 事件属性 + 事件定级
 
 分两步，读两张表：
 
@@ -19,7 +19,7 @@ IF_DOWN，csw 掉口是核心网段断了（P1），rsw 掉口是一个机柜的
 corp 职场的 rsw 掉口压根不用看。一个事件码一行存不下"哪个事件 + 哪台
 设备"两个维度，所以定级按规则表走，priority 小的先判、首条命中即停。
 
-定级必须跑在 L2 富化之后：那时 sysname 已经从 devices 表补好，可以按
+定级必须跑在 L4 富化之后：那时 sysname 已经从 devices 表补好，可以按
 设备名判角色（csw/pcs/rsw/asw/bbs，见 docs/network/设备命名规范.md）。
 富化失败时 sysname 退成 "-"，sysname_reg 的规则匹配不上，ip_reg 的
 照样生效，最终落到全局兜底那条，不会因为查不到设备就没级别。
@@ -31,9 +31,9 @@ severity 用 P 级整数：
 不用 syslog 自带的 emergency..debug 八级：%BGP-5-ADJCHANGE 是 level 5
 （notice），但 BGP 邻居掉了对我们是 P1，两者没有对应关系。
 
-action='ignore' 产出 state=ignore，事件照样走完 L3~L6 并落 ES，只是 L5
+action='ignore' 产出 state=ignore，事件照样走完 L8~L9 并落 ES，只是 L7
 不开告警 —— 割接或事后回看时这段日志还查得到。要彻底不解析的噪声配
-syslog_black_list，要按变更窗口静默的配 L3 的 mute。
+syslog_black_list，要按变更窗口静默的配 L8 的 mute。
 
 两张表查不到都给默认值并记 warning，都属于配置漏项。
 """
@@ -60,7 +60,7 @@ STATE_STATELESS = "stateless"
 STATES = (STATE_RAISE, STATE_CLEAR, STATE_STATELESS)
 
 # 定级规则产出的第四种 state，不在 STATES 里 —— 它只能由定级规则产生，
-# 不允许在 syslog_event.state 里直接配。L5 的 MODE_IGNORE 对应这个值
+# 不允许在 syslog_event.state 里直接配。L7 的 MODE_IGNORE 对应这个值
 STATE_IGNORE = "ignore"
 
 ANY_EVENT = "*"                # event_code='*' 表示所有事件
@@ -138,7 +138,7 @@ class EventAttrIndex(object):
         attrs       dict[event_code] -> EventAttr
         raise_codes dict[clear_code] -> 拥有这个恢复码的故障码
 
-    raise_codes 是 clear_code 的反查表，L4 算指纹要用：IF_UP 必须落到
+    raise_codes 是 clear_code 的反查表，L6 算指纹要用：IF_UP 必须落到
     IF_DOWN 的指纹上才关得掉告警，但 clear_code 配在 IF_DOWN 那一行
     （IF_DOWN -> IF_UP），所以得反过来查"谁的 clear_code 是我"。
     加载时建一次，热路径上 dict 查一次。
@@ -312,7 +312,7 @@ class SeverityIndex(object):
 
 class EventAttrs(object):
     """
-    L2.5：补事件属性 + 定级
+    L5：补事件属性 + 定级
 
     两张表共用一个刷新线程，一起刷、版本号一起递增 —— 它们在同一层
     用掉，错开刷新时间点没有意义，集中在一处好排查。
@@ -453,7 +453,7 @@ class EventAttrs(object):
         """
         本事件是谁的恢复事件。不是恢复事件就返回空串
 
-        L4 算指纹时用它换算：IF_UP 按 IF_DOWN 算指纹，否则恢复事件
+        L6 算指纹时用它换算：IF_UP 按 IF_DOWN 算指纹，否则恢复事件
         落到自己的指纹上，故障告警永远关不掉
         """
         index = self._index
@@ -496,14 +496,14 @@ class EventAttrs(object):
         补事件属性 + 定级，原地修改并返回
 
         两步：syslog_event 给 state/object_type/窗口/clear_code，
-        syslog_severity_rule 给 severity。级别按设备判，所以必须在 L2
+        syslog_severity_rule 给 severity。级别按设备判，所以必须在 L4
         富化之后跑 —— 那时 sysname 已经补好。
 
-        clear_code 单独拿出来：L5 配对恢复事件时要用，
+        clear_code 单独拿出来：L7 配对恢复事件时要用，
         但 raise 类事件才需要，clear 和 stateless 一律留空。
         """
-        # 恢复事件要落到故障事件的指纹上，L4 据此算指纹。
-        # 自己就是故障码时留空，L4 按 event_code 算
+        # 恢复事件要落到故障事件的指纹上，L6 据此算指纹。
+        # 自己就是故障码时留空，L6 按 event_code 算
         event["raise_code"] = self.raise_code_of(event.get("event_code"))
 
         # 第一步：事件属性
@@ -544,6 +544,6 @@ class EventAttrs(object):
         event["severity_rule_id"] = rule.rule_id
         event["severity_name"] = severity_name(rule.severity)
         if rule.action == ACTION_IGNORE:
-            # 事件照样往下走并落 ES，只是 L5 不开告警
+            # 事件照样往下走并落 ES，只是 L7 不开告警
             event["state"] = STATE_IGNORE
         return event

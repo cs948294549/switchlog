@@ -22,14 +22,14 @@ class Stats(object):
     计数项：
         received      收到的 UDP 报文数
         dropped       队列满丢弃（收包线程快于 worker）
-        blocked       L0.5 黑名单拦掉
-        parsed        走完 L1 的
+        blocked       L2 黑名单拦掉
+        parsed        走完 L3 的
         parse_fail    报文不可读
         unmanaged     devices 表里查不到源 IP
         unknown       规则表没命中，规则缺口
-        ignored       L2.5 定级规则判定不开告警（state=ignore）
-        alarms        L5 产生的告警动作（开/升级/恢复）
-        muted         其中被 L3 静默的，不发通知
+        ignored       L5 定级规则判定不开告警（state=ignore）
+        alarms        L7 产生的告警动作（开/升级/恢复）
+        muted         其中被 L8 静默的，不发通知
         errors        管线里抛异常的
     """
 

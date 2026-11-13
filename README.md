@@ -23,39 +23,44 @@
 ```
 设备 --UDP 514--> receiver --hash(ip)--> worker x N
                                           │
-   L0    prepare      剥信封 + 剥 mnemonic
-   L0.5  blacklist    黑名单，命中即丢
-   L1    parser       (vendor, mnemonic) -> event_code / object
-   L2    enrich       sysname / hardware / 资产号 / 接口描述
-   L2.5  attrs        state / 窗口 / clear_code，再按设备定 severity
-                      ↓ 到这里是一条原子告警
-   L4    aggregate    指纹 + 滑动窗口，写 alarm_log
-   L5    state_machine raise / clear + 闪断升级
-   L3    mute         时间窗静默，填 muted
-   L6    emit         写 alarm_list + 发通知        [未实现]
+   l1_prepare        剥信封 + 剥 mnemonic
+   l2_blacklist      黑名单，命中即丢
+   l3_parser         (vendor, mnemonic) -> event_code / object
+   l4_enrich         sysname / hardware / 资产号 / 接口描述
+   l5_attrs          state / 窗口 / clear_code，再按设备定 severity
+                     ↓ 原子告警
+   l6_aggregate      指纹 + 滑动窗口，写 alarm_log
+   l7_state_machine  raise / clear + 闪断升级
+                     ↓ 告警决策
+   l8_suppress       时间窗静默，填 muted
+   l9_emit           写 alarm_list + 发通知
 ```
 
-现在跑到 L3，告警动作和静默判定都有了，只剩 L6 落库发通知。
-`alarm_log` 已经在写，`alarm_list` 等 L6。
+**层号就是执行顺序**，文件名带前缀，`ls pipeline/` 出来就是管线的样子。
+九层都已落地，只有 L9 的 HTTP 推送通道还是占位（通知先写
+`logs/notify.log`，一行一条 JSON）。
 
 **两件事靠定时扫描，不能等日志驱动**，因为它们的触发条件就是"没有新日志"
 或"时间到了"（`Runner.sweep()`，维护线程 60s 一次）：
 
-- L5 的 `stateless` 事件静默超过窗口 → 自动恢复。没有日志来正是恢复的条件
-- L3 的静默窗口过了但故障还在 → 恢复通知。否则割接期间 down 了一直没好的口，
+- L7 的 `stateless` 事件静默超过窗口 → 自动恢复。没有日志来正是恢复的条件
+- L8 的静默窗口过了但故障还在 → 恢复通知。否则割接期间 down 了一直没好的口，
   窗口结束后不会再有新日志进管线，这条告警就永远静默
 
-**L3 排在 L5 之后**，层号和执行顺序不一致。它原来是 L2.5 之后的
-drop/mute/depend 三档，收窄成只有 mute 之后挪到了状态机后面：判据里的
-object 要等 L4、告警状态要等 L5，而且挪过去之后它从热路径（每条日志）
-变成冷路径（只有待通知的告警），判据用正则也不心疼。层号保持 L3 是为了
-不动已有文档和表名。
+**静默为什么排在状态机之后**（L8 在 L7 后面，而不是跟着解析走）：判据里的
+object 要等 L6 聚合、告警状态要等 L7 定；而且放在这里它从热路径（每条日志）
+变成冷路径（只有待通知的告警）——一次端口 down 是 3 条日志、1 个指纹、
+1 次静默判断，量级从日志条数掉到告警条数，所以四个判据全用正则也不心疼。
 
-**两张告警表靠 `fingerprint` 关联**：`alarm_log` 一条日志一行（L4 写，
-只留 7 天，排查下钻用），`alarm_list` 一个指纹一行（L5 写，带 count，看板用）。
+**两张告警表靠 `fingerprint` 关联**：`alarm_log` 一条日志一行（L6 写，
+只留 7 天，排查下钻用），`alarm_list` 一个指纹一行（L9 写，带 count，看板用）。
 指纹在 `alarm_list` 里查不到说明这组日志没到告警阈值，这本身是有用的信息。
-阈值判断在 L5 不在 L4：`MAC_FLAP` 配 `600/3`，第一条日志进来时
+阈值判断在 L7 不在 L6：`MAC_FLAP` 配 `600/3`，第一条日志进来时
 `alarm_list` 里不该有行，攒到第 3 条才算告警。
+
+**下钻查日志必须带时间范围**。指纹是 `md5(ip|event_code|object)`，不含时间，
+同一个口上周那次 down 和今天这次是同一个指纹。`AlarmDB.getAlarmLogsByAlarm(alarm_id)`
+封装了这件事，别自己拼 `where fingerprint=?`。
 
 **窗口是间隔上限，不是固定分桶的边界**。`window_sec=300` 的事件，日志持续
 10 分钟只要中间没有超过 5 分钟的空档就是一段、一条告警；要分成两段，间隔
@@ -68,15 +73,26 @@ object 要等 L4、告警状态要等 L5，而且挪过去之后它从热路径�
 ## 目录
 
 ```
-main.py          启动入口，带 --selftest / --replay
-config/          config_example.py 是模板，config.py 不进 git
-pipeline/        L0~L6，一层一个文件
-db/              数据源，get_db() 工厂决定真库还是 mock
-utils/           日志、统计、接口名归一
-sql/schema.sql   建表 + 种子数据
-docker/          构建与启动脚本
-tests/           样本数据 + 回放工具
-docs/            设计文档
+main.py            启动入口，带 --selftest / --replay
+test.py            贴一条报文看它在每一层被改成什么样
+config/            config_example.py 是模板，config.py 不进 git
+pipeline/          一层一个文件，文件名前缀就是执行顺序
+  l1_prepare.py      剥信封 + 剥 mnemonic
+  l2_blacklist.py    黑名单
+  l3_parser.py       解析归一
+  l4_enrich.py       设备富化
+  l5_attrs.py        事件属性 + 定级
+  l6_aggregate.py    指纹聚合
+  l7_state_machine.py 状态机
+  l8_suppress.py     告警静默
+  l9_emit.py         落库 + 通知
+  runner.py          串联各层，worker 只调 handle()
+db/                数据源，get_db() 工厂按 kind 建 rule/device/alarm 三个单例
+utils/             日志、统计、接口名归一
+sql/schema.sql     建表 + 种子数据
+docker/            构建与启动脚本
+docs/              设计文档
+logs/              switchlog.log 运行日志，notify.log 告警通知
 ```
 
 ## 跑起来
@@ -84,14 +100,15 @@ docs/            设计文档
 ```bash
 cp config/config_example.py config/config.py    # 填 MySQL 口令
 
-# 1. 不连库，贴一条报文看它在每一层被改成什么样
-python test.py                      # 报文写在 test.py 顶部的 a = {...}
-
-# 2. 建表
+# 1. 建表（四张规则表的种子数据已经在 schema.sql 里）
 mysql -h <host> -P <port> -u netops -p netops < sql/schema.sql
 
-# 3. 连库自检：规则表、事件表、设备表各读一次
+# 2. 连库自检：规则表、事件表、设备表各读一次
 python main.py --selftest --ip 10.16.249.5
+
+# 3. 贴一条报文看它在每一层被改成什么样（连真库，默认不落 alarm_log/
+#    alarm_list，改 test.py 顶部 WRITE_DB=True 才会真的写）
+python test.py                      # 报文写在 test.py 顶部的 a = {...}
 
 # 4. 起服务
 python main.py                      # 监听 UDP 514
@@ -123,11 +140,11 @@ python main.py --replay syslog/xxx.txt --ip 10.16.249.5
 
 | 表 | 管什么 | 谁读 |
 |---|---|---|
-| `syslog_black_list` | 解析前拦掉的噪声 | L0.5 |
-| `syslog_rule` | `(vendor, mnemonic)` → `event_code`，对象抽取正则 | L1 |
-| `syslog_event` | 事件属性：状态、窗口、阈值、恢复码 | L2.5 |
-| `syslog_severity_rule` | 事件定级：`event_code` + 设备 → 级别 | L2.5 |
-| `syslog_mute_rule` | 告警静默：设备 + 事件 + 时间窗 | L3 |
+| `syslog_black_list` | 解析前拦掉的噪声 | L2 |
+| `syslog_rule` | `(vendor, mnemonic)` → `event_code`，对象抽取正则 | L3 |
+| `syslog_event` | 事件属性：状态、窗口、阈值、恢复码 | L5 |
+| `syslog_severity_rule` | 事件定级：`event_code` + 设备 → 级别 | L5 |
+| `syslog_mute_rule` | 告警静默：设备 + 事件 + 时间窗 | L8 |
 
 **事件属性单独一张表**是有原因的：`IF_DOWN` 在三家厂商下共十几行匹配规则，
 属性挂在匹配行上就有十几份副本，改一次窗口要改十几行，漏一行就出现
@@ -144,7 +161,7 @@ IF_DOWN 的候选链   corp rsw -> csw -> rsw -> IF_DOWN 默认 -> *
 
 现网 20 个事件码里 14 个是 P3，所以种子数据用"一条全局兜底 + 只给非 P3 的码
 写行"，10 行覆盖全部。新增事件码不写行就是 P3 —— 宁可级别偏低也不要误报 P1。
-定级必须排在 L2 富化之后，要按 `sysname` 判设备角色。
+定级必须排在 L4 富化之后，要按 `sysname` 判设备角色。
 
 **三种"不告警"的区别**，配错了很难查：
 
@@ -171,13 +188,13 @@ IF_DOWN 的候选链   corp rsw -> csw -> rsw -> IF_DOWN 默认 -> *
 ## 几个刻意的设计
 
 **同一设备的日志固定落到同一个 worker**（按 IP hash 分区）。这不是优化，
-是硬要求：L4 聚合和 L5 状态机依赖同设备事件的先后顺序，随机分配会让
+是硬要求：L6 聚合和 L7 状态机依赖同设备事件的先后顺序，随机分配会让
 `IF_UP` 先于 `IF_DOWN` 被处理，告警关不掉。
 
 **队列满时丢弃而不是阻塞**。阻塞收包线程会让内核 socket buffer 溢出，
 那是无声丢包；主动丢弃能计数、能在统计里看到。
 
-**mnemonic 只剥一次**。黑名单和 parser 都要用，L0 剥好往下透传。
+**mnemonic 只剥一次**。黑名单和 parser 都要用，L1 剥好往下透传。
 实测 162 字节报文剥一次 0.44us，剥好后 dict 查一次 0.036us —— 这也是
 黑名单用 dict 而不是逐条 `str.find` 的原因（20 条规则以上就比剥 mnemonic 还贵）。
 

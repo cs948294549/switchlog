@@ -6,36 +6,43 @@
     cd projects/switchlog
     python test.py
 
-链路 L0 prepare -> L0.5 黑名单 -> L1 解析 -> L2 富化 -> L2.5 属性 + 定级，
+链路 L1 prepare -> L2 黑名单 -> L3 解析 -> L4 富化 -> L5 属性 + 定级，
 每层打一次完整记录，新增或变化的字段前面标 +。
 
-L2.5 分两步打：syslog_event 给 state/窗口/clear_code，
+L5 分两步打：syslog_event 给 state/窗口/clear_code，
 syslog_severity_rule 按 (event_code, ip, sysname) 定 severity。
 定级那段会打出命中的规则和它为什么命中。
 
-数据全部来自 tests/fixtures.py 的内存表，不连 MySQL，也不看 config.use_mock_db。
-样本报文可以从 tests/fixtures.py 的 MOCK_MESSAGES / MOCK_MESSAGES_DC05 里挑。
-回放真实日志走 main.py --replay。
+数据全部连真实 MySQL（config.py 的 mysql_config），不再有内存 mock。
+WRITE_DB=False（默认）时跑完 L1~L8 但不执行 L9 的实际落库，只打印
+"本该写进哪条记录"；改成 True 才会真的往 alarm_log/alarm_list 插入数据。
+
+回放真实日志文件走 main.py --replay。
 """
 import logging
 
-from pipeline.prepare import prepare
-from pipeline.blacklist import BlacklistFilter
-from pipeline.parser import SyslogParser
-from pipeline.enrich import DeviceEnricher
-from pipeline.attrs import EventAttrs, severity_name, STATE_IGNORE
-from pipeline.aggregate import Aggregator
-from pipeline.state_machine import StateMachine
-from pipeline.suppress import MuteFilter
-from tests.mock_db import MockSyslogDB
+from pipeline.l1_prepare import prepare
+from pipeline.l2_blacklist import BlacklistFilter
+from pipeline.l3_parser import SyslogParser
+from pipeline.l4_enrich import DeviceEnricher
+from pipeline.l5_attrs import EventAttrs, severity_name, STATE_IGNORE
+from pipeline.l6_aggregate import Aggregator
+from pipeline.l7_state_machine import StateMachine
+from pipeline.l8_suppress import MuteFilter
+from pipeline.l9_emit import AlarmEmitter, FileNotifier
+from db import get_rule_db, get_device_db, get_alarm_db
 
 logger = logging.getLogger(__name__)
 
 # 值打多宽，超了截断
 VAL_WIDTH = 110
 
-# 第一步打表时挡掉的字段：定级那三个归第二步，raise_code 是给 L4 用的
+# 第一步打表时挡掉的字段：定级那三个归第二步，raise_code 是给 L6 用的
 GRADE_FIELDS = ("severity", "severity_name", "severity_rule_id", "raise_code")
+
+# 默认不落库：跑完整条链路只是为了看每层改了什么字段，不该顺手污染
+# alarm_log/alarm_list。确认过没问题、真要测落库效果时改成 True
+WRITE_DB = False
 
 # ============================================================
 # 要跑的报文：ip 是源 IP，message 是原始报文，timestamp 是采集时间
@@ -57,42 +64,28 @@ a = {
 #      "%SSHD-6-SESSION_CONNECTED: ssh session connected from 10.1.2.3"}  # 黑名单拦掉
 # a = {"ip": "10.19.250.8", "message": "<189>Oct 11 14:03:08.109 some_dev "
 #      "%ETHPORT-5-IF_DOWN: Interface Ethernet1/1, changed state to down"}  # 未纳管
-#
-# 定级：下面三条报文除了设备名一模一样，event_code 和 object 也一样，
-# 级别分别是 P1 / P3 / 不告警。换着跑看定级那段
-# a = {"ip": "10.19.19.1", "message": "<189>Nov 11 10:00:01 csw1_dc19_m01 "
-#      "%ETHPORT-5-IF_DOWN: Interface Ethernet1/10, changed state to down"}  # csw -> P1
-# a = {"ip": "10.19.19.11", "message": "<189>Nov 11 10:00:02 rsw1_dc19_m05 "
-#      "%ETHPORT-5-IF_DOWN: Interface Ethernet1/10, changed state to down"}  # rsw -> P3
-# a = {"ip": "10.19.9.31", "message": "<189>Nov 11 10:00:03 rsw1_corp_ts_m21 "
-#      "%ETHPORT-5-IF_DOWN: Interface Ethernet1/10, changed state to down"}  # corp -> ignore
-
-
-# 静默规则。默认给一条进行中的割接，盖住 10.16.249.5 ——
-# 默认那条样本报文就是这台设备，一跑就能看到 mute 的效果。
-# 想看不静默的样子，把 MUTE_RULES 改成 []
-MUTE_RULES = [
-    {"rule_id": 1, "ip_reg": r"^10[.]16[.]249[.]5$", "event_code_reg": "",
-     "object_reg": "", "start_time": "", "end_time": "", "enabled": 1,
-     "descr": "示例：这台设备在割接窗口里，告警入库但不通知"},
-]
 
 
 def build():
-    """一条完整的 L0 ~ L3 链路，各层共用同一个 mock 库
+    """一条完整的 L1 ~ L9 链路，各层共用真实数据源
 
-    refresh_interval=0：不起刷新线程，规则只加载一次
+    refresh_interval=0：不起刷新线程，规则只加载一次（跑一条报文用不上
+    定时刷新，起了线程进程退出还要等它）
     """
-    db = MockSyslogDB(mute_rules=MUTE_RULES)
+    rule_db = get_rule_db()
+    device_db = get_device_db()
+    alarm_db = get_alarm_db()
+
+    sm = StateMachine(db=alarm_db)
     return (
-        BlacklistFilter(refresh_interval=0, db=db),
-        SyslogParser(refresh_interval=0, db=db),
-        DeviceEnricher(db=db),
-        EventAttrs(refresh_interval=0, db=db),
-        Aggregator(db=db),
-        StateMachine(db=db),
-        MuteFilter(refresh_interval=0, db=db),
-        db,
+        BlacklistFilter(refresh_interval=0, db=rule_db),
+        SyslogParser(refresh_interval=0, db=rule_db, device_db=device_db),
+        DeviceEnricher(db=device_db),
+        EventAttrs(refresh_interval=0, db=rule_db),
+        Aggregator(db=alarm_db),
+        sm,
+        MuteFilter(refresh_interval=0, db=alarm_db),
+        AlarmEmitter(notifier=FileNotifier(), state_machine=sm, db=alarm_db),
     )
 
 
@@ -105,7 +98,7 @@ def show(layer, record, before=None, skip=()):
     """
     打一层的结果，新增或变化的字段标 +
 
-    :param skip: 不打的字段。L2.5 两步都在 fill() 里做完，
+    :param skip: 不打的字段。L5 两步都在 fill() 里做完，
                  第一步要把第二步的字段挡掉，否则看不出是哪步补的
     """
     before = before if before is not None else {}
@@ -118,21 +111,21 @@ def show(layer, record, before=None, skip=()):
 
 
 def main():
-    blacklist, parser, enricher, attrs, aggregator, machine, mute, db = build()
+    blacklist, parser, enricher, attrs, aggregator, machine, mute, emitter = build()
 
     print("== 原始报文 ==")
     print("  ip      {}".format(a.get("ip", "-")))
     print("  message {}".format(shorten(a.get("message", ""))))
 
-    # L0 剥信封 + 剥 mnemonic。不可读也往下走，由 L1 落 PARSE_FAIL
+    # L1 剥信封 + 剥 mnemonic。不可读也往下走，由 L3 落 PARSE_FAIL
     prepared = prepare(a)
-    show("L0 prepare 剥信封 + 剥 mnemonic", prepared)
+    show("L1 prepare 剥信封 + 剥 mnemonic", prepared)
     if not prepared["readable"]:
-        print("\n  readable=False，报文不可读，L1 会落 PARSE_FAIL")
+        print("\n  readable=False，报文不可读，L3 会落 PARSE_FAIL")
 
-    # L0.5 黑名单，命中即终止，不进后面任何一层
+    # L2 黑名单，命中即终止，不进后面任何一层
     rule = blacklist.match(prepared)
-    print("\n--- L0.5 blacklist 命中即丢 ---")
+    print("\n--- L2 blacklist 命中即丢 ---")
     if rule is not None:
         print("   命中 rule {}  scope={}  pattern={}".format(
             rule.rule_id, rule.scope, rule.pattern))
@@ -141,39 +134,42 @@ def main():
         return 0
     print("   没命中，放行")
 
-    # L1 (vendor, mnemonic) -> event_code / alarm_object
+    # L3 (vendor, mnemonic) -> event_code / alarm_object
     event = parser.parse(prepared)
-    show("L1 parser -> event_code / alarm_object", event, prepared)
+    show("L3 parser -> event_code / alarm_object", event, prepared)
 
-    # L2 按源 IP 查 devices 补 sysname/hardware/syscontact，查 ports 补接口描述
+    # L4 按源 IP 查 devices 补 sysname/hardware/syscontact，查 ports 补接口描述
     before = dict(event)
     enricher.enrich(event)
-    show("L2 enrich devices + ports", event, before)
+    show("L4 enrich devices + ports", event, before)
 
-    # L2.5 两步走。fill() 一次做完两步，打的时候拆开 ——
+    # L5 两步走。fill() 一次做完两步，打的时候拆开 ——
     # 第一步先把定级的字段挡掉，否则看不出是哪步补的
     before = dict(event)
     attrs.fill(event)
-    show("L2.5 第一步 syslog_event 事件属性", event, before, skip=GRADE_FIELDS)
+    show("L5 第一步 syslog_event 事件属性", event, before, skip=GRADE_FIELDS)
     show_grade(attrs, event)
 
-    # L4 算指纹 + 滑动窗口，顺便把原子记录攒进 alarm_log 的批
+    # L6 算指纹 + 滑动窗口，顺便把原子记录攒进 alarm_log 的批
     before = dict(event)
     aggregator.handle(event)
-    show("L4 aggregate 指纹 + 滑动窗口", event, before)
-    show_window(aggregator, attrs, event, db)
+    show("L6 aggregate 指纹 + 滑动窗口", event, before)
+    show_window(aggregator, event)
 
-    # L5 状态机 -> 决策，L3 在决策上盖静默标记
+    # L7 状态机 -> 决策，L8 在决策上盖静默标记
     decision = machine.handle(event)
     show_decision(machine, decision)
     mute.handle(decision)
     show_mute(mute, decision)
 
+    # L9 落库 + 推通知。WRITE_DB=False 时只打印本该落的内容，不真的写
+    show_emit(emitter, decision)
+
     print("\n最终 {}  {}  {}  {}".format(
         event.get("sysname", "-"), decision.get("event_code", "-"),
         event.get("alarm_object", "-"), decision.get("severity_name", "-")))
     if decision.get("action") == "ignore":
-        print("     定级规则判定不开告警（state=ignore），不往 L3 交")
+        print("     定级规则判定不开告警（state=ignore），不往 L8 交")
     elif not decision.get("notify"):
         print("     action={} —— 不产生告警动作（累加或未到阈值）".format(
             decision.get("action")))
@@ -185,29 +181,60 @@ def main():
     return 0
 
 
+def show_emit(emitter, decision):
+    """
+    L9：落库 + 通知
+
+    WRITE_DB=False 时不调 emitter.handle()——那会真的执行
+    addAlarm/addAlarmLogs，往生产的 alarm_log/alarm_list 插数据。
+    只打印这条决策本该落成什么样，不产生副作用。
+    """
+    print("\n--- L9 emit 落库 + 通知 ---")
+    if not decision.get("notify"):
+        print("   action={} —— L7 判定不用处理，L9 没有动作".format(
+            decision.get("action")))
+        return 0
+
+    if not WRITE_DB:
+        print("   WRITE_DB=False，不执行真实落库。本该写入：")
+        print("     action={}  severity={}  muted={}".format(
+            decision.get("action"), decision.get("severity_name"),
+            decision.get("muted")))
+        print("   把文件顶部 WRITE_DB 改成 True 才会真的写 alarm_log/alarm_list")
+        return 0
+
+    result = emitter.handle(decision)
+    print(" + {:<18}{}".format("alarm_id", result.get("alarm_id")))
+    print(" + {:<18}{}".format("notified", result.get("notified")))
+    print(" + {:<18}{}".format("muted", result.get("muted")))
+    print("\n   WRITE_DB=True，已经真的写进 MySQL 的 alarm_log/alarm_list 了。")
+    print("   emitter stats:", emitter.stats())
+    return 0
+
+
 def show_decision(machine, decision):
-    """L5 的决策，以及同一条日志反复来会怎样"""
-    print("\n--- L5 state_machine 状态机 ---")
+    """L7 的决策，以及同一条日志反复来会怎样"""
+    print("\n--- L7 state_machine 状态机 ---")
     for key in ("action", "notify", "state", "counter", "severity_name",
                 "flapping", "raise_count"):
         if key in decision:
             print(" + {:<18}{}".format(key, decision[key]))
 
     if decision.get("action") == "ignore":
-        print("\n   state=ignore 在这一层就截住，不写状态、不往 L3 交")
+        print("\n   state=ignore 在这一层就截住，不写状态、不往 L8 交")
         return 0
 
-    print("\n   判据是\"有没有活跃告警\"，不是 L4 的 is_first ——")
-    print("   一个口持续 down 一小时，L4 切两段都给 is_first=True，但那是一条告警")
+    print("\n   判据是\"有没有活跃告警\"，不是 L6 的 is_first ——")
+    print("   一个口持续 down 一小时，L6 切两段都给 is_first=True，但那是一条告警")
     print("   stats:", machine.stats())
     return 0
 
 
 def show_mute(mute, decision):
-    """L3 的静默判定"""
-    print("\n--- L3 mute 告警静默 ---")
+    """L8 的静默判定"""
+    print("\n--- L8 mute 告警静默 ---")
     if not decision.get("notify"):
-        print("   L5 说不用通知，跳过（不白跑正则）")
+        print("   L7 说不用通知，跳过（不白跑正则）")
         return 0
 
     print("   判据 ip={}  event_code={}  object={}".format(
@@ -237,8 +264,8 @@ def show_mute(mute, decision):
     return 0
 
 
-def show_window(aggregator, attrs, event, db):
-    """L4 的窗口怎么算的，以及恢复事件落到了谁的指纹上"""
+def show_window(aggregator, event):
+    """L6 的窗口怎么算的，以及恢复事件落到了谁的指纹上"""
     code = event.get("event_code", "")
     raise_code = event.get("raise_code") or ""
     window_sec = event.get("window_sec", "-")
@@ -251,42 +278,27 @@ def show_window(aggregator, attrs, event, db):
     print("   窗口 {}s，比的是相邻两条日志的间隔，不是固定分桶的边界".format(window_sec))
     print("   同一段内再来一条就 count+1；间隔超过 {}s 开新段；"
           "一段最长活 1800s".format(window_sec))
+    print("   （不再演示\"隔多久切新段\"——那需要一个干净的内存聚合器，"
+          "现在这份 aggregator 连的是真库，不拿它做探测性调用）")
 
-    # 再来一条同样的日志，看隔多久会切新段。
-    # 每个间隔用一个干净的聚合器，否则前一次探测会把 last_seen 往后推，
-    # 后面的间隔就不是从原始那条日志算的了
-    base = int(event.get("ingest_ts") or 0)
-    gap_window = window_sec if isinstance(window_sec, int) else 300
-    print("\n   第二条日志隔多久会切新段（每次都从这条日志算）：")
-    for gap in (60, gap_window - 1, gap_window + 1, 2000):
-        probe_agg = Aggregator(db=MockSyslogDB())
-        probe_agg.handle(dict(event), now=base)
-        probe = dict(event)
-        probe_agg.handle(probe, now=base + gap)
-        print("   隔 {:<6}s  count={:<4}{}".format(
-            gap, probe["count"], "同一段" if probe["count"] > 1 else "切了新段"))
-    print("   所以 5 分钟窗口 + 日志持续 10 分钟是一段，不是两段 ——"
-          " 只要中间没有超过窗口的空档")
-
-    aggregator.flush()
-    print("\n   alarm_log 攒了 {} 条（一条日志一行，只留 7 天）".format(len(db.alarm_logs)))
-    print("   alarm_list 本层不写 —— 阈值 {} 的判断是 L5 的事".format(
+    print("\n   alarm_log 的攒批还在内存里，没调 flush()/persist() 不会真的落库")
+    print("   alarm_list 本层不写 —— 阈值 {} 的判断是 L7 的事".format(
         event.get("threshold", "-")))
     return 0
 
 
 def show_grade(attrs, event):
     """
-    L2.5 第二步：定级。打出命中的规则和它凭什么命中
+    L5 第二步：定级。打出命中的规则和它凭什么命中
 
-    级别按 (event_code, ip, sysname) 判，所以必须排在 L2 富化之后 ——
+    级别按 (event_code, ip, sysname) 判，所以必须排在 L4 富化之后 ——
     sysname 是富化补的
     """
     event_code = event.get("event_code", "")
     ip = event.get("ip", "-")
     sysname = event.get("sysname", "-")
 
-    print("\n--- L2.5 第二步 syslog_severity_rule 定级 ---")
+    print("\n--- L5 第二步 syslog_severity_rule 定级 ---")
     print("   判据 event_code={}  ip={}  sysname={}".format(event_code, ip, sysname))
 
     rule = attrs.grade_of(event_code, ip, sysname)
@@ -310,23 +322,7 @@ def show_grade(attrs, event):
     print(" + {:<18}{}".format("severity_rule_id", event.get("severity_rule_id", 0)))
     if event.get("state") == STATE_IGNORE:
         print(" + {:<18}{}".format(
-            "state", "ignore —— 走完管线并落 ES，但 L5 不开告警"))
-
-    # 同一条日志换台设备会是什么级别。定级规则改完之后最容易错的就是
-    # priority 顺序，这几行能直接看出 corp 那条有没有排在通用 rsw 前面
-    others = [("csw1_dc19_m01", "10.19.19.1"), ("rsw1_dc19_m05", "10.19.19.11"),
-              ("rsw1_corp_ts_m21", "10.19.9.31"), ("pcs1_dc07_m01", "10.19.7.1")]
-    print("\n   同一个 {} 换设备的级别：".format(event_code or "-"))
-    for other_name, other_ip in others:
-        other = attrs.grade_of(event_code, other_ip, other_name)
-        if other is None:
-            text = "P3  兜底"
-        else:
-            text = "{}  rule {}".format(severity_name(other.severity), other.rule_id)
-            if other.action == "ignore":
-                text += "  不告警"
-        mark = "<-" if other_name == sysname else "  "
-        print("   {} {:<20}{}".format(mark, other_name, text))
+            "state", "ignore —— 走完管线并落 ES，但 L7 不开告警"))
     return 0
 
 

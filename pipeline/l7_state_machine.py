@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-L5 状态机
+L7 状态机
 
 现有链路完全缺失的一级，也是日志告警能不能用起来的关键。
 
-本层决定"要不要产生一条告警动作"，不决定"要不要通知"（那是 L3）、
-也不落 alarm_list（那是 L6 一次写）。产出一个决策 dict，L3 往上盖 mute
-标记，L6 据此落库发通知。
+本层决定"要不要产生一条告警动作"，不决定"要不要通知"（那是 L8）、
+也不落 alarm_list（那是 L9 一次写）。产出一个决策 dict，L8 往上盖 mute
+标记，L9 据此落库发通知。
 
 状态的唯一来源是 syslog_alarm_state（内存 + 启动回放），不读 alarm_list ——
 重启那一瞬间两者可能不一致（状态表回放了，alarm_list 的行是上次进程写的），
@@ -21,10 +21,10 @@ state 取 raise / clear：
     clear                -> 按同一指纹关掉活跃告警
 
 指纹含 object，所以 BGP_UP peer=A 只会关 A 的告警，不会误关同台设备上
-B 邻居的告警。恢复事件的指纹由 L4 按 raise_code 算好，这里拿到的已经是
+B 邻居的告警。恢复事件的指纹由 L6 按 raise_code 算好，这里拿到的已经是
 故障事件的指纹。
 
-不要读 L4 的 is_first 来决定开不开告警。max_life 切新段时它是 True，
+不要读 L6 的 is_first 来决定开不开告警。max_life 切新段时它是 True，
 但一个口持续 down 一小时应该是一条告警不是两条 —— 判据是"有没有活跃告警"。
 
 ======================= 无状态事件 =======================
@@ -44,7 +44,7 @@ MAC 漂移、配置变更、登录失败没有恢复日志，用窗口计数触�
 同指纹 flap_window（默认 1800s）内 >= flap_threshold（默认 3）次
 「新开告警」-> 升级，severity 提一档，event_code 换成 IF_FLAP。
 
-计数点在"无活跃告警 -> 开告警"这一跳，不在 L4 的日志条数上。一次端口
+计数点在"无活跃告警 -> 开告警"这一跳，不在 L6 的日志条数上。一次端口
 down 会产生 2~3 条同指纹日志，按日志条数计的话一次 down 就能凑满 3 次，
 当场误报成闪断。
 
@@ -56,25 +56,25 @@ down 会产生 2~3 条同指纹日志，按日志条数计的话一次 down 就�
 只记一次 clear_count）。
 
 **闪断计数不看 mute。** 割接期间的 raise 照样进计数，窗口内连续 3 次
-照样升出 IF_FLAP —— 本层不反查 L3 的静默规则，两层之间不加反向依赖
-（L3 在本层之后，反查就成了循环）。割接自己造成的闪断由 L3 兜住：
-那条升级动作同样要过 L3，命中同一条 mute 规则就一起被静默。
+照样升出 IF_FLAP —— 本层不反查 L8 的静默规则，两层之间不加反向依赖
+（L8 在本层之后，反查就成了循环）。割接自己造成的闪断由 L8 兜住：
+那条升级动作同样要过 L8，命中同一条 mute 规则就一起被静默。
 
 ======================= ignore =======================
 
-L2.5 的定级规则配 action=ignore 产生 state=ignore，表示这台设备的这个
-事件不开告警。本层直接返回 ACTION_IGNORE，不写状态、不往 L3 交。
-事件已经在 L4 写进 alarm_log，事后回看查得到。
+L5 的定级规则配 action=ignore 产生 state=ignore，表示这台设备的这个
+事件不开告警。本层直接返回 ACTION_IGNORE，不写状态、不往 L8 交。
+事件已经在 L6 写进 alarm_log，事后回看查得到。
 
 ignore 和 mute 都是"不告警"，区别在生效方式：ignore 是静态配置（哪类
 设备的哪个事件码永久不看），mute 是时间窗（割接期间临时不看，窗口过了
-自动恢复）。前者在本层截住，后者要等本层维护完状态再交给 L3 判。
+自动恢复）。前者在本层截住，后者要等本层维护完状态再交给 L8 判。
 """
 import time
 import logging
 import threading
 
-from pipeline.attrs import escalate, severity_name
+from pipeline.l5_attrs import escalate, severity_name
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +90,9 @@ ACTION_RAISE = "raise"          # 开告警
 ACTION_UPDATE = "update"        # 已开着的告警有新进展（级别变了）
 ACTION_ESCALATE = "escalate"    # 闪断升级
 ACTION_CLEAR = "clear"          # 关告警
-ACTION_IGNORE = "ignore"        # L2.5 判定不告警，不往 L3 交
+ACTION_IGNORE = "ignore"        # L5 判定不告警，不往 L8 交
 
-# 要通知的动作。ACTION_NONE / ACTION_IGNORE 不往 L3 交
+# 要通知的动作。ACTION_NONE / ACTION_IGNORE 不往 L8 交
 NOTIFY_ACTIONS = (ACTION_RAISE, ACTION_UPDATE, ACTION_ESCALATE, ACTION_CLEAR)
 
 STATE_OPEN = "open"
@@ -123,8 +123,7 @@ class AlarmState(object):
 
     __slots__ = ("fingerprint", "ip", "event_code", "alarm_object", "mode", "state",
                  "severity", "base_severity", "first_seen", "last_seen", "counter",
-                 "raise_count", "clear_count", "flapping", "alarm_id", "raise_times",
-                 "count_base")
+                 "raise_count", "clear_count", "flapping", "alarm_id", "raise_times")
 
     def __init__(self, fingerprint, ip="", event_code="", alarm_object="",
                  mode=MODE_RAISE, severity=3):
@@ -144,10 +143,6 @@ class AlarmState(object):
         self.flapping = 0
         self.alarm_id = 0
         self.raise_times = []
-        # 开告警那一刻 L4 的 count。counter 按差值算，不直接用 L4 的值 ——
-        # 一个口 down/up/down，L4 的窗口没过期所以 count 一直在涨，
-        # 但第二条告警是新的，它的 counter 该从 1 开始
-        self.count_base = 0
 
     def is_open(self):
         return self.state == STATE_OPEN
@@ -201,7 +196,7 @@ class AlarmState(object):
 
 class StateMachine(object):
     """
-    L5 状态机
+    L7 状态机
 
     handle() 热路径，sweep() / persist() / purge() 由维护线程调。
     worker 共享同一个实例，状态字典加锁。
@@ -240,20 +235,20 @@ class StateMachine(object):
         """
         处理一条聚合后的事件，返回决策
 
-        :param event: L4 的输出（带 fingerprint / count / state / severity）
-        :return: 决策 dict。action=none/ignore 时 L3 和 L6 都不用管它
+        :param event: L6 的输出（带 fingerprint / count / state / severity）
+        :return: 决策 dict。action=none/ignore 时 L8 和 L9 都不用管它
         """
         clock = int(now if now is not None else (event.get("ingest_ts") or time.time()))
         mode = str(event.get("state") or MODE_STATELESS).lower()
 
-        # L2.5 判定不告警。不写状态 —— 写了反而会让后面真要告警时
+        # L5 判定不告警。不写状态 —— 写了反而会让后面真要告警时
         # 误以为"已有活跃告警"
         if mode == MODE_IGNORE:
             return self._decide(event, ACTION_IGNORE, None, clock)
 
         fingerprint = event.get("fingerprint") or ""
         if not fingerprint:
-            # L4 没算出指纹，状态机没法做事。L4 那边已经打过 error
+            # L6 没算出指纹，状态机没法做事。L6 那边已经打过 error
             return self._decide(event, ACTION_NONE, None, clock)
 
         with self._lock:
@@ -287,39 +282,41 @@ class StateMachine(object):
         """
         raise：无活跃告警就攒到阈值开告警，已有活跃告警只累加
 
-        判据是"有没有活跃告警"，不是 L4 的 is_first —— 一个口持续 down
-        一小时，L4 按 max_life 切两段、两次给 is_first=True，但那是一条告警
+        判据是"有没有活跃告警"，不是 L6 的 is_first —— 一个口持续 down
+        一小时，L6 按 max_life 切两段、两次给 is_first=True，但那是一条告警
+
+        counter 自己数，不借用 L6 的 count：那个值会在 L6 的窗口过期或
+        max_life 到期时重置为 1，这和本层"告警开着没有"是两套完全独立
+        的生命周期 —— L6 的窗口可能在告警还没恢复时就先断了（比如
+        down 了 17 分钟，窗口 300s 早过期，但故障没好、告警还开着），
+        借它的值反推 counter 会算出负数或错误的差值
         """
         state.mode = MODE_RAISE
         state.last_seen = now
-        window_count = self._window_count(event, state)
         base = int(event.get("severity", state.base_severity))
         state.base_severity = base
 
+        state.counter += 1
         if state.is_open():
-            state.counter = window_count - state.count_base
-            # 已经开着。级别变了（定级规则改过）要让 L6 更新一下，
+            # 已经开着。级别变了（定级规则改过）要让 L9 更新一下，
             # 但闪断提过级的不往回降 —— 那是 flapping 的结果不是定级的
             if not state.flapping and state.severity != base:
                 state.severity = base
                 return ACTION_UPDATE
             return ACTION_NONE
 
-        # 没开着。阈值由 syslog_event.threshold 定，IF_DOWN 是 1 当场开，
-        # PARSE_FAIL 是 5 要攒
-        state.counter = window_count - state.count_base
+        # 没开着：阈值由 syslog_event.threshold 定，IF_DOWN 是 1 当场开，
+        # PARSE_FAIL 是 5 要攒 —— 没开的时候 counter 就是"攒了几条"，
+        # 每条都加一，攒够才开告警
         threshold = self._threshold(event)
         if state.counter < threshold:
             return ACTION_NONE
 
-        return self._open(state, now, base, window_count)
+        return self._open(state, now, base)
 
     def _on_clear(self, state, event, now):
         """clear：关掉同指纹的活跃告警。闪断中的不自动关"""
         state.last_seen = now
-        # 恢复日志自己也进了 L4 的窗口计数，所以刻度要对齐到 L4 的当前值，
-        # 不是加上 counter —— 差那一条的话下次开告警 counter 会从 2 开始
-        window_count = self._window_count(event, state)
         if not state.is_open():
             # 没有活跃告警，这条恢复事件没东西可关。设备重启后会补发一批
             # up 日志，属正常现象，不记 error
@@ -335,11 +332,9 @@ class StateMachine(object):
             return ACTION_NONE
 
         state.state = STATE_IDLE
-        # 刻度对齐到 L4 当前值：它的窗口没过期，count 会接着往上涨，
-        # 下一次开告警的 counter 得从 1 开始，不能把这一段的条数算进去。
-        # counter 不清零 —— 它是这条告警最终的"几条日志支撑"，要落进
-        # alarm_list 留着，清零的话历史告警那一行就成了 0
-        state.count_base = max(window_count, state.count_base + state.counter)
+        # counter 不清零、不改动 —— 它是这条告警最终的"几条日志支撑"，
+        # 要落进 alarm_list 留着。下一次 raise 会在 _on_raise 里判到
+        # state 不是 open，重新从 1 开始数，不用在这里预先处理
         state.severity = state.base_severity
         return ACTION_CLEAR
 
@@ -349,14 +344,20 @@ class StateMachine(object):
 
         没有恢复日志的事件走这里（MAC 漂移、配置变更、登录失败）。
         自动恢复由 sweep() 负责 —— 没有日志来正是恢复的条件，等不到事件驱动
+
+        这里的"窗口"是本层自己的概念（threshold 条日志内算一轮），
+        不是 L6 的滑动窗口，两者无关也不该混用
         """
         state.mode = MODE_STATELESS
         state.last_seen = now
-        window_count = self._window_count(event, state)
-        state.counter = window_count - state.count_base
         base = int(event.get("severity", state.base_severity))
         state.base_severity = base
 
+        # counter 和 _on_raise 一样无条件先加：alarm_list.counter 的字段
+        # 语义是"窗口内日志条数"，开了告警之后同指纹日志照样要计入，
+        # 否则 sync_counters 同步过去的永远是 threshold 那个老值，看板上
+        # 看不出这条告警后面还在持续发生
+        state.counter += 1
         if state.is_open():
             return ACTION_NONE
 
@@ -365,40 +366,29 @@ class StateMachine(object):
             # 阈值兼做降噪：MAC_FLAP 配 3，虚机迁移造成的偶发单次不报
             return ACTION_NONE
 
-        return self._open(state, now, base, window_count)
+        return self._open(state, now, base)
 
     # ---------------- 开告警与闪断 ----------------
 
-    @staticmethod
-    def _window_count(event, state):
-        """
-        L4 这一刻的窗口计数。取不到就按状态自己往上数
-
-        L4 的 count 在窗口内单调增，所以它可以当"累计刻度"用，
-        counter 按差值算
-        """
-        try:
-            value = int(event.get("count") or 0)
-        except (TypeError, ValueError):
-            value = 0
-        if value > 0:
-            return value
-        return state.count_base + state.counter + 1
-
-    def _open(self, state, now, base_severity, window_count=None):
+    def _open(self, state, now, base_severity):
         """
         开告警，并数一次闪断
 
-        计数点就在这里 —— "无活跃告警 -> 开告警"这一跳。不在 L4 的日志
+        计数点就在这里 —— "无活跃告警 -> 开告警"这一跳。不在 L6 的日志
         条数上：一次端口 down 产生 2~3 条同指纹日志，按日志条数计的话
         一次 down 就能凑满 3 次，当场误报成闪断
         """
-        del window_count          # 刻度在 clear 的时候推，不在这里
         state.state = STATE_OPEN
         state.first_seen = now
         state.raise_count += 1
         state.severity = base_severity
         state.base_severity = base_severity
+        # 开告警这一刻把 counter 定为 1：_on_raise/_on_stateless 在没开着
+        # 的时候会一直累加（攒阈值用），到这里之前它存的是"攒了几条"，
+        # 不是"这次故障几条"——上一轮恢复后 counter 没清零（要留给
+        # alarm_list 当历史值），这里必须显式归位，否则第二次开告警会把
+        # 上一轮的条数也算进来
+        state.counter = 1
 
         # 闪断窗口内的开告警次数
         state.raise_times.append(now)
@@ -442,9 +432,9 @@ class StateMachine(object):
 
     def _decide(self, event, action, state, now):
         """
-        拼决策 dict 交给 L3
+        拼决策 dict 交给 L8
 
-        muted / mute_rule_id 留空位，L3 填。L6 据此一次写 alarm_list，
+        muted / mute_rule_id 留空位，L8 填。L9 据此一次写 alarm_list，
         不是先写再改 —— 先写 muted=0 再 UPDATE 成 1 的话，中间那一瞬间
         看板轮询到会显示成"割接期间有条没静默的告警"
         """
@@ -454,10 +444,17 @@ class StateMachine(object):
             "fingerprint": event.get("fingerprint", ""),
             "ip": event.get("ip", ""),
             "hostname": event.get("hostname", ""),
+            # L4 富化的结果，L9 落 alarm_list 要用，排查时能直接看出
+            # 设备厂商/型号，不用现查 devices 表
+            "vendor": event.get("vendor", ""),
+            "hardware": event.get("hardware", ""),
             "alarm_object": event.get("alarm_object", ""),
+            # 同样是 L4 富化结果：接口对象才会有值，其它对象类型是空串
+            "object_name": event.get("object_name", ""),
+            "object_alias": event.get("object_alias", ""),
             "message": event.get("message", ""),
             "ingest_ts": now,
-            # L3 填
+            # L8 填
             "muted": False,
             "mute_rule_id": 0,
         }
@@ -495,7 +492,7 @@ class StateMachine(object):
 
     def bind_alarm(self, fingerprint, alarm_id):
         """
-        L6 落库之后把 alarm_id 回填进状态，下次更新同一条告警要用
+        L9 落库之后把 alarm_id 回填进状态，下次更新同一条告警要用
 
         :return: True=绑上了
         """
@@ -536,7 +533,7 @@ class StateMachine(object):
         必须定时扫，不能等日志驱动 —— 没有日志来正是恢复的条件。
         raise/clear 类不在这里关，它们等显式的恢复事件。
 
-        :return: [决策]，L3/L6 照常处理
+        :return: [决策]，L8/L9 照常处理
         """
         now = int(now if now is not None else time.time())
         decisions = []
@@ -550,9 +547,8 @@ class StateMachine(object):
                     # 闪断中的不自动关，等人工确认
                     continue
                 state.state = STATE_IDLE
-                # 和 _on_clear 一样推刻度。这里没有事件可参考（是静默
-                # 超时自己关的，L4 那边也早就不涨了），按 counter 推
-                state.count_base += state.counter
+                # 和 _on_clear 一样：counter 不清零、不改动，留着给
+                # alarm_list 展示"这条告警最终有几条日志支撑"
                 state.clear_count += 1
                 state.severity = state.base_severity
                 self._dirty.add(state.fingerprint)
@@ -663,7 +659,7 @@ class StateMachine(object):
         """
         还开着的告警的 (fingerprint, counter, last_seen, severity, alarm_id)
 
-        给 L6 同步 alarm_list.counter 用。累加（ACTION_NONE）不触发 L6，
+        给 L9 同步 alarm_list.counter 用。累加（ACTION_NONE）不触发 L9，
         所以 alarm_list 的 counter 会停在开告警那一刻的值 —— 一次端口 down
         三条日志，看板上显示 1。靠维护线程定期把这里的值刷过去补齐。
 
