@@ -25,8 +25,10 @@ MSG_LIMIT = 1024
 # 厂商只用来查规则表，报文长什么样由报文自己说。
 # 顺序按现网量排：cisco 最多的放第一条，少试一次正则就省一次 search
 MNEMONIC_REGS = (
-    # Cisco   %ETHPORT-5-IF_DOWN:  %ETH_PORT_CHANNEL-5-FOP_CHANGED:
-    re.compile(r"%{1,2}([A-Za-z][A-Za-z0-9_]*-\d+-[A-Za-z0-9_\-]+)\s*:"),
+    # Cisco 两段式 %ETHPORT-5-IF_DOWN:  %ETH_PORT_CHANNEL-5-FOP_CHANGED:
+    # 三段式 %TAHUSD-SLOT1-4-BUFFER_THRESHOLD_EXCEEDED:（多一个槛位/模块段）。
+    # 中间槛位段可选，SEV 段锁死纯数字不变，两段式格式不受影响
+    re.compile(r"%{1,2}([A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z][A-Za-z0-9_]*)?-\d+-[A-Za-z0-9_\-]+)\s*:"),
     # Comware %%10IFNET/3/PHY_UPDOWN:   华为 %%01IFNET/4/LINK_STATE:
     # 前导数字是日志版本号，剥掉，否则同一事件 V5/V7 算成两个 mnemonic
     re.compile(r"%{1,2}\d{0,2}([A-Za-z][A-Za-z0-9_]*(?:/\d+)?/[A-Za-z0-9_\-]+)"),
@@ -34,16 +36,25 @@ MNEMONIC_REGS = (
     re.compile(r"\blogid=\"?(\d+)\"?"),
 )
 
+# 前导杂质：观察到个别链路在报文最前面多一个孤立的 "冒号+空格"
+# （来源不确定，疑似某段转发/采集环节加的），不剥掉的话后面的 PRI/
+# 时间戳正则全部锚定在 ^，一个字符都会把三条正则一起挡死，直接判
+# PARSE_FAIL。只匹配"行首紧跟的单个冒号"，不触碰正文内部的冒号
+# （Cisco 的 %MODULE-SEV-NAME: 那个冒号在 mnemonic 后面，不在行首）
+LEADING_JUNK_REG = re.compile(r"^:\s+")
+
 # 信封：和厂商无关，RFC3164 / RFC5424 都在这段消化。
 # 只为了拿到 hostname 和 body，设备自报时间一律不用
 PRI_REG = re.compile(r"^<(\d{1,3})>")
 TS_REGS = (
-    # 2026 Oct  9 05:18:56.565   带年份，日期空格补位
-    re.compile(r"^\d{4}\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s*"),
+    # 2026 Oct  9 05:18:56.483 CST   带年份，日期空格补位，时区缩写可选
+    re.compile(r"^\d{4}\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}"
+               r"(?:\.\d+)?(?:\s+[A-Z]{2,5})?\s*"),
     # Nov 12 18:39:05.412 2026   年份在时间之后（H3C 部分版本、rsyslog
     # timereported 渲染）。年份可选，不加的话 2026 会被 HOSTNAME_REG
-    # 当成设备名取走
-    re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:\s+\d{4})?\s*"),
+    # 当成设备名取走；时区缩写同样可选，跟在年份后面或直接跟在时间后面
+    re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}"
+               r"(?:\.\d+)?(?:\s+\d{4})?(?:\s+[A-Z]{2,5})?\s*"),
     # 2026-11-11T14:03:22.412+08:00   RFC5424 ISO8601
     re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+\-]\d{2}:?\d{2})?\s*"),
 )
@@ -70,6 +81,12 @@ def split_envelope(message):
     text = str(message or "").strip()
     if not text:
         return "-", "", False
+
+    # 剥掉行首孤立的冒号杂质，不算作"seen"——它不是 PRI 也不是时间戳，
+    # 剥到它不代表信封可读，可读与否仍然看后面 PRI/时间戳有没有命中
+    match = LEADING_JUNK_REG.match(text)
+    if match:
+        text = text[match.end():]
 
     seen = False
     match = PRI_REG.match(text)

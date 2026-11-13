@@ -54,7 +54,7 @@ class BlacklistRule(object):
     """
 
     __slots__ = ("rule_id", "pattern", "needle", "scope", "ip", "ignore_case",
-                 "descr", "hits")
+                 "descr", "hits", "persisted_hits")
 
     def __init__(self, row):
         self.rule_id = row.get("rule_id", 0)
@@ -68,6 +68,9 @@ class BlacklistRule(object):
         # 预先算好用于比较的那一份，热路径上不再做 lower()
         self.needle = self.pattern.lower() if self.ignore_case else self.pattern
         self.hits = 0
+        # persist() 上次刷进数据库时的 hits 值，算增量用——hit_count
+        # 是数据库里的累计值，不能把 hits 整个当增量传，会越刷越多
+        self.persisted_hits = 0
 
     def valid(self):
         """pattern 为空的规则会命中一切，必须挡掉"""
@@ -257,11 +260,13 @@ class BlacklistFilter(object):
             return self._index.total
 
         index = BlacklistIndex(rows)
-        # 命中计数跨刷新保留，否则页面上的量每 5 分钟清零
+        # 命中计数跨刷新保留，否则页面上的量每 5 分钟清零。persisted_hits
+        # 也要一起带过去，不然下次 persist() 会把 hits 全量当增量重新刷一遍
         with self._lock:
-            previous = {rule.rule_id: rule.hits for rule in self._index.rules}
+            previous = {rule.rule_id: (rule.hits, rule.persisted_hits)
+                       for rule in self._index.rules}
             for rule in index.rules:
-                rule.hits = previous.get(rule.rule_id, 0)
+                rule.hits, rule.persisted_hits = previous.get(rule.rule_id, (0, 0))
             self._index = index
         logger.info("BlacklistFilter loaded %s rules（mnemonic %s / message %s）",
                     index.total,
@@ -281,6 +286,41 @@ class BlacklistFilter(object):
 
     def stop(self):
         self._stop_event.set()
+
+    def persist(self, now=None):
+        """
+        把内存里累加的 hits 刷进 syslog_black_list.hit_count
+
+        维护线程按自己的间隔调（比规则刷新频繁），不在热路径上做——
+        一条规则一秒命中几千次，每次都 UPDATE 会把写入量跟着日志量放大。
+
+        增量 = 当前 hits - 上次刷过的值，不是整个 hits：数据库那一列
+        存的是累计值，重复传 hits 会越刷越多。
+
+        :return: 更新的行数
+        """
+        with self._lock:
+            deltas = {}
+            rules = []
+            for rule in self._index.rules:
+                delta = rule.hits - rule.persisted_hits
+                if delta > 0:
+                    deltas[rule.rule_id] = delta
+                    rules.append(rule)
+            # 先拿到增量再更新 persisted_hits：db 调用在锁外做（避免数据库
+            # 卡住时拖着这把锁），但 persisted_hits 的推进必须在锁内，
+            # 不然并发的 blocked() 调用可能把这段时间的新命中也算进当前增量，
+            # 下一轮 persist() 再把这部分重复计入
+            for rule in rules:
+                rule.persisted_hits = rule.hits
+
+        if not deltas:
+            return 0
+        try:
+            return self.db.updateBlacklistHits(deltas, now=now)
+        except Exception as err:
+            logger.error("======BlacklistFilter persist error========\n%s", err)
+            return 0
 
     # ---------------- 热路径 ----------------
 

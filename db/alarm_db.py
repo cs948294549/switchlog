@@ -128,6 +128,61 @@ class AlarmDB(object):
             logger.error("======AlarmDB updateAlarmByFingerprint error========\n%s", err)
             return "failed"
 
+    def updateIgnoreByFingerprint(self, fingerprint, data, alarm_id=0):
+        """
+        更新非 open 行，只刷 last_seen/counter
+
+        两类场景复用这个方法，名字沿用 ignore 但不止它一种：
+            ignore        L5 定级规则判定不告警，state='idle'
+            clear_orphan  视野外恢复，窗口内重复命中时按同一行累加，
+                          state='clear'
+        共同点是都不是 state='open' 的活跃告警，不能走
+        updateAlarmByFingerprint（那个按 open 定位）。
+
+        **优先按 alarm_id 定位，拿不到才退回指纹。** 恢复事件的指纹是按
+        raise_code 换算的（IF_UP 落到 IF_DOWN 的指纹上），所以同一个指纹
+        下可能同时躺着一条 ignore 行和一条 clear_orphan 行。只按
+        "指纹 + alarm_id 最大" 定位会串到隔壁那行上去：把 ignore 的
+        counter 写到 clear_orphan 行上，看板上就是"条数 2 但下钻只有
+        1 条日志"。alarm_id 由 L9 insert 之后 bind_alarm 回填，
+        L7 的状态里一直带着。
+
+        :param alarm_id: 精确定位用，0 表示没拿到（退回按指纹）
+        :return: 影响行数；失败返回 "failed"
+        """
+        update_keys = ["last_seen", "counter"]
+        conditions = []
+        params = []
+        for key in update_keys:
+            if key in data:
+                conditions.append(key + " = %s")
+                params.append(data[key])
+        if not conditions:
+            return "failed"
+
+        try:
+            alarm_id = int(alarm_id or 0)
+        except (TypeError, ValueError):
+            alarm_id = 0
+
+        if alarm_id > 0:
+            sql = ("update alarm_list set " + ", ".join(conditions) +
+                   " where alarm_id=%s")
+            params.append(alarm_id)
+        else:
+            sql = ("update alarm_list set " + ", ".join(conditions) +
+                   " where fingerprint=%s order by alarm_id desc limit 1")
+            params.append(fingerprint)
+        try:
+            with MySQLConnection() as conn:
+                cursor = conn.cursor
+                cursor.execute(sql, tuple(params))
+                conn.conn.commit()
+                return cursor.rowcount
+        except Exception as err:
+            logger.error("======AlarmDB updateIgnoreByFingerprint error========\n%s", err)
+            return "failed"
+
     def setAlarmMute(self, alarm_id, muted, rule_id=0):
         """
         改一条已存在告警的静默标记
@@ -432,6 +487,35 @@ class AlarmDB(object):
             logger.error("======AlarmDB getMuteRules error========\n%s", err)
             return []
 
+    def updateMuteHits(self, hits, now=None):
+        """
+        批量把内存计数器累加的命中数刷进 hit_count
+
+        同 SyslogRuleDB.updateBlacklistHits 的理由：不在热路径上写库，
+        维护线程按固定间隔刷一次。这里的命中数是"告警被压住的次数"，
+        不是日志条数——L8 在冷路径（只过聚合后的告警），量级本来就小，
+        但同样不该在 handle() 里直接 UPDATE，攒到一轮一起写。
+
+        :param hits: {rule_id: 本轮新增的命中数}，只传有变化的 rule_id
+        :return: 更新的行数；失败返回 0
+        """
+        if not hits:
+            return 0
+        now = str(int(now if now is not None else time.time()))
+        sql = ("update syslog_mute_rule set hit_count = hit_count + %s, "
+               "last_hit_time = %s where rule_id = %s")
+        params = [(int(count), now, int(rule_id)) for rule_id, count in hits.items() if count]
+        if not params:
+            return 0
+        try:
+            with MySQLConnection() as conn:
+                conn.cursor.executemany(sql, params)
+                conn.conn.commit()
+                return conn.cursor.rowcount
+        except Exception as err:
+            logger.error("======AlarmDB updateMuteHits error========\n%s", err)
+            return 0
+
     # ---------------- syslog_alarm_state ----------------
 
     def upsertAlarmState(self, data):
@@ -444,8 +528,9 @@ class AlarmDB(object):
         insert into syslog_alarm_state(fingerprint, ip, event_code, alarm_object, mode,
                                        state, severity, base_severity, first_seen,
                                        last_seen, counter, raise_count, clear_count,
-                                       flapping, alarm_id, updated_time)
-        values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                       flapping, alarm_id, ignore_counter,
+                                       ignore_first_seen, ignore_alarm_id, updated_time)
+        values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         on duplicate key update
             ip=values(ip), event_code=values(event_code), alarm_object=values(alarm_object),
             mode=values(mode), state=values(state), severity=values(severity),
@@ -453,6 +538,9 @@ class AlarmDB(object):
             last_seen=values(last_seen), counter=values(counter),
             raise_count=values(raise_count), clear_count=values(clear_count),
             flapping=values(flapping), alarm_id=values(alarm_id),
+            ignore_counter=values(ignore_counter),
+            ignore_first_seen=values(ignore_first_seen),
+            ignore_alarm_id=values(ignore_alarm_id),
             updated_time=values(updated_time)
         '''
         params = (
@@ -463,6 +551,9 @@ class AlarmDB(object):
             str(data.get("last_seen", "")), int(data.get("counter", 0)),
             int(data.get("raise_count", 0)), int(data.get("clear_count", 0)),
             1 if data.get("flapping") else 0, int(data.get("alarm_id", 0)),
+            int(data.get("ignore_counter", 0)),
+            str(data.get("ignore_first_seen", "")),
+            int(data.get("ignore_alarm_id", 0)),
             str(data.get("updated_time", "")),
         )
         try:
@@ -478,12 +569,14 @@ class AlarmDB(object):
         sql = '''
         select fingerprint, ip, event_code, alarm_object, mode, state, severity,
                base_severity, first_seen, last_seen, counter, raise_count,
-               clear_count, flapping, alarm_id
+               clear_count, flapping, alarm_id, ignore_counter,
+               ignore_first_seen, ignore_alarm_id
         from syslog_alarm_state where state='open' order by last_seen desc limit %s
         '''
         proper = ["fingerprint", "ip", "event_code", "alarm_object", "mode", "state",
                   "severity", "base_severity", "first_seen", "last_seen", "counter",
-                  "raise_count", "clear_count", "flapping", "alarm_id"]
+                  "raise_count", "clear_count", "flapping", "alarm_id",
+                  "ignore_counter", "ignore_first_seen", "ignore_alarm_id"]
         try:
             with MySQLConnection() as conn:
                 return conn.query(sql, (int(limit),), proper=proper)

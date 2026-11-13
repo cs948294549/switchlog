@@ -116,7 +116,7 @@ class MuteRule(object):
 
     __slots__ = ("rule_id", "ip_reg", "event_code_reg", "object_reg",
                  "ip_pattern", "event_pattern", "object_pattern",
-                 "start_time", "end_time", "descr")
+                 "start_time", "end_time", "descr", "hits", "persisted_hits")
 
     def __init__(self, row):
         self.rule_id = row.get("rule_id", 0)
@@ -127,6 +127,11 @@ class MuteRule(object):
         # 空 end_time = 永久静默
         self.end_time = self._to_int(row.get("end_time"), 0)
         self.descr = str(row.get("descr", "") or "")
+        # 命中数：告警被这条规则压住的次数，不是日志条数（L8 只过聚合后
+        # 的告警）。persisted_hits 是 persist() 上次刷进数据库时的值，
+        # 算增量用，跨刷新保留见 MuteFilter.refresh()
+        self.hits = 0
+        self.persisted_hits = 0
 
         self.ip_reg = self._compile(self.ip_pattern, self.rule_id, "ip_reg")
         self.event_code_reg = self._compile(self.event_pattern, self.rule_id,
@@ -281,9 +286,18 @@ class MuteFilter(object):
             logger.error("======MuteFilter refresh error========\n%s", err)
             return self._index.total
 
+        index = MuteIndex(rows, version=self._version + 1)
         with self._lock:
             self._version += 1
-            self._index = MuteIndex(rows, version=self._version)
+            # 命中计数跨刷新保留（规则还在窗口内、还在列表里的情况）。
+            # persisted_hits 也要带过去，否则下次 persist() 把 hits 全量
+            # 当增量重刷一遍。窗口过期后规则从列表消失，hits 跟着丢没
+            # 关系——数据库那边 hit_count 在过期前已经持久化过了
+            previous = {rule.rule_id: (rule.hits, rule.persisted_hits)
+                       for rule in self._index.rules}
+            for rule in index.rules:
+                rule.hits, rule.persisted_hits = previous.get(rule.rule_id, (0, 0))
+            self._index = index
         return self._index.total
 
     def _refresh_loop(self):
@@ -301,6 +315,34 @@ class MuteFilter(object):
     def size(self):
         """当前生效的静默规则数"""
         return self._index.total
+
+    def persist(self, now=None):
+        """
+        把内存里累加的 hits 刷进 syslog_mute_rule.hit_count
+
+        和 BlacklistFilter.persist() 同一个模式：维护线程按固定间隔调，
+        不在热路径上写库；增量 = 当前 hits - 上次刷过的值。
+
+        :return: 更新的行数
+        """
+        with self._lock:
+            deltas = {}
+            rules = []
+            for rule in self._index.rules:
+                delta = rule.hits - rule.persisted_hits
+                if delta > 0:
+                    deltas[rule.rule_id] = delta
+                    rules.append(rule)
+            for rule in rules:
+                rule.persisted_hits = rule.hits
+
+        if not deltas:
+            return 0
+        try:
+            return self.db.updateMuteHits(deltas, now=now)
+        except Exception as err:
+            logger.error("======MuteFilter persist error========\n%s", err)
+            return 0
 
     def rule_of(self, ip, event_code, alarm_object, now=None):
         """查命中的规则，没有返回 None。不带缓存 —— 判据含时间，缓存会过期"""
@@ -339,6 +381,9 @@ class MuteFilter(object):
 
         decision["muted"] = True
         decision["mute_rule_id"] = rule.rule_id
+        # rule 是 self._index 里的同一个实例，直接累加；只在这里加
+        # （真正判定要静默的这一刻），sweep() 复判还命不命中时不计数
+        rule.hits += 1
         with self._lock:
             self._muted_count += 1
         logger.info("静默 %s %s %s：命中 rule %s（%s）",

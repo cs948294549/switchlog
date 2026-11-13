@@ -67,12 +67,36 @@ ACTION_TEXT = {
     "update": "告警更新",
     "escalate": "升级",
     "clear": "恢复",
+    "clear_orphan": "恢复（故障发生在监控视野之外）",
     "notify_only": "告警",
 }
 
 # L8 静默到期放出来的动作：告警早就在库里，muted 那一列 L8 也改过了，
 # 本层只补通知，一个字段都别再写
 ACTION_NOTIFY_ONLY = "notify_only"
+
+# L5 判定 ignore 不告警时 L7 产出的两个动作：按指纹聚合，首次插一行、
+# 之后只累加 counter。需要落库（否则 alarm_log 写了但 alarm_list 查不到，
+# 变成孤儿数据），但永远不发通知
+ACTION_IGNORE_NEW = "ignore_new"
+ACTION_IGNORE_UPDATE = "ignore_update"
+IGNORE_ACTIONS = (ACTION_IGNORE_NEW, ACTION_IGNORE_UPDATE)
+
+# L7 的恢复事件到了但没有活跃告警可关：故障发生在监控视野之外
+# （初次上线 / 重建库 / 进程停机期间）。走 insert 落一行 state=clear，
+# 照常通知 —— 不能走 _update()，那个按 state='open' 定位，
+# alarm_list 里压根没有这条告警的行
+ACTION_CLEAR_ORPHAN = "clear_orphan"
+# 窗口内重复命中 orphan：同一个口反复发孤立的 up，L7 按指纹聚合到
+# 同一行，这里只刷 counter/last_seen，不重复 insert、不重复通知
+ACTION_CLEAR_ORPHAN_UPDATE = "clear_orphan_update"
+
+# handle() 要处理的动作全集，和 ACTION_NONE 相对——这些动作都要做点
+# 事（写库、或者单纯补通知），none 是"什么都没变"，直接跳过。
+# 名字叫 WRITE_ACTIONS 但 notify_only 其实不落库，它落库那一步已经在
+# L8 静默到期之前做过了，这里只补通知，具体分发看 _write() 的说明
+WRITE_ACTIONS = ("raise", "update", "escalate", "clear", ACTION_CLEAR_ORPHAN,
+                 ACTION_CLEAR_ORPHAN_UPDATE, ACTION_NOTIFY_ONLY) + IGNORE_ACTIONS
 
 
 class Notifier(object):
@@ -222,7 +246,7 @@ class AlarmEmitter(object):
         self._notify_on = self._switch(notify, "alarm_notify")
         self._lock = threading.Lock()
         self._counts = {"inserted": 0, "updated": 0, "notified": 0,
-                        "muted": 0, "failed": 0, "skipped": 0}
+                        "muted": 0, "failed": 0, "skipped": 0, "ignored": 0}
         # fingerprint -> 上次同步出去的 counter。没变就不写，
         # 否则一个 down 了一天的口每 10 秒白写一次 UPDATE
         self._synced = {}
@@ -257,12 +281,16 @@ class AlarmEmitter(object):
 
         :param decision: L7 产出、L8 填过 muted 的决策
         :return: {"alarm_id", "notified", "muted"}；不用处理的返回 None
+
+        "要不要落库"和"要不要通知"是两个独立判断：ignore_new/ignore_update
+        要落库（否则 alarm_log 写了但 alarm_list 查不到，变成孤儿数据），
+        但不通知；none 既不落库也不通知——它就是"什么都没变"
         """
-        if not decision or not decision.get("notify"):
+        action = decision.get("action", "") if decision else ""
+        if not decision or action not in WRITE_ACTIONS:
             return None
 
         clock = int(now if now is not None else (decision.get("ingest_ts") or time.time()))
-        action = decision.get("action", "")
 
         # 落库。alarm_list 是看板的唯一数据源，这一步不做看板上就什么都没有
         alarm_id = 0
@@ -271,6 +299,20 @@ class AlarmEmitter(object):
         else:
             with self._lock:
                 self._counts["skipped"] += 1
+
+        if action in IGNORE_ACTIONS:
+            # L5 判定不告警，落库留痕即可，不走通知判断（不是被 mute 压住，
+            # 是这类事件本来就不该发通知）
+            with self._lock:
+                self._counts["ignored"] += 1
+            return {"alarm_id": alarm_id, "notified": False, "muted": False}
+
+        if action == ACTION_CLEAR_ORPHAN_UPDATE:
+            # 窗口内重复的孤立恢复，已经在第一次 orphan 通知过了，
+            # 这次只是刷新同一行的 counter，不重复打扰
+            with self._lock:
+                self._counts["updated"] += 1
+            return {"alarm_id": alarm_id, "notified": False, "muted": False}
 
         # 被静默的只落库不推送，这是 mute 的全部意义
         if decision.get("muted"):
@@ -300,16 +342,47 @@ class AlarmEmitter(object):
         alarm_list 里，muted 那一列 L8 也改过了。再 update 一次会拿
         决策里的默认值把 last_seen 和 counter 冲掉
 
+        ignore_new/ignore_update 单独分发：这类行 state 永远是 idle，
+        不能走 _update()（按 state='open' 定位，找不到行）
+
         :return: alarm_id。update 的时候返回决策里带的那个（L7 回填过）
         """
         if action == ACTION_NOTIFY_ONLY:
             return decision.get("alarm_id", 0)
         if action in ("raise", "escalate"):
             return self._insert(decision, now)
+        if action == ACTION_CLEAR_ORPHAN:
+            # 走 insert：alarm_list 里没有这条告警的行，_update() 的
+            # where state='open' 找不到东西，只会打一条 warning 然后什么
+            # 都不写。decision 里 state 是 idle、clear_time 已填好
+            return self._insert(decision, now)
+        if action == ACTION_CLEAR_ORPHAN_UPDATE:
+            # 同样不能走 _update()：这一行 state='clear'，不是 'open'，
+            # 按 state='open' 定位会找不到。走专用方法，同 ignore_update
+            return self._update_clear_orphan(decision, now)
+        if action == ACTION_IGNORE_NEW:
+            return self._insert(decision, now)
+        if action == ACTION_IGNORE_UPDATE:
+            return self._update_ignore(decision, now)
         return self._update(decision, action, now)
 
     def _insert(self, decision, now):
-        """新开一条告警"""
+        """
+        新开一条告警
+
+        state 从 decision 取，不硬编码 "open" —— ignore_new 的
+        decision["state"] 是 "idle"（L7 的 _decide 里 state.state 就是
+        idle，它不开"活跃告警"）。status 跟着 action 分支：ignore 系列
+        标 "5"（系统规则判定忽略），其余新开的都是 "0" 待处理
+
+        clear_orphan 是唯一一条"插进来就已经恢复了"的路径：故障发生在
+        监控视野之外，只看到恢复日志。它的 state 要写 clear 而不是
+        decision 里的 idle，并且带上 clear_time —— 两个字段都和另外
+        几种 insert 不一样，所以单独判一个标志位
+        """
+        action_now = decision.get("action")
+        is_ignore = action_now in IGNORE_ACTIONS
+        is_clear_orphan = action_now == ACTION_CLEAR_ORPHAN
         row = {
             "ip": decision.get("ip", ""),
             "hostname": decision.get("hostname") or decision.get("ip", ""),
@@ -328,16 +401,22 @@ class AlarmEmitter(object):
             "object_name": decision.get("object_name", ""),
             "object_alias": decision.get("object_alias", ""),
             "severity": decision.get("severity", 3),
-            "state": "open",
-            "status": "0",
+            # clear_orphan 落的是一行"已恢复"，不能用 decision 里的 state ——
+            # 那是 syslog_alarm_state 的约定值 idle（它不是活跃告警），
+            # 而 alarm_list.state 只认 open/clear，写 idle 进去看板认不出来
+            "state": "clear" if is_clear_orphan else (decision.get("state") or "open"),
+            "status": "5" if is_ignore else "0",
             "counter": decision.get("counter", 1),
             "first_seen": str(decision.get("first_seen") or now),
             "last_seen": str(decision.get("last_seen") or now),
-            "clear_time": "",
+            # 只有 clear_orphan 这条 insert 路径会带恢复时间（和恢复时刻同值，
+            # 看板上持续时长显示 0）。raise/escalate/ignore 都还没恢复，留空
+            "clear_time": str(decision.get("clear_time") or now) if is_clear_orphan else "",
             "create_time": str(now),
-            # L8 判完了，一次写进去
-            "muted": decision.get("muted", False),
-            "mute_rule_id": decision.get("mute_rule_id", 0),
+            # L8 判完了，一次写进去。ignore 系列没过 L8（L9 的 handle()
+            # 在落库之后就直接返回了，不读 muted），固定不静默
+            "muted": False if is_ignore else decision.get("muted", False),
+            "mute_rule_id": 0 if is_ignore else decision.get("mute_rule_id", 0),
         }
         try:
             alarm_id = self.db.addAlarm(row)
@@ -348,6 +427,13 @@ class AlarmEmitter(object):
         if not alarm_id:
             with self._lock:
                 self._counts["failed"] += 1
+            if is_ignore:
+                # ignore 本来就不发通知，落库失败只记一条 error，不用像
+                # raise/update 那样"仍会推送通知"
+                logger.error("======ignore 告警落库失败========\n%s %s %s",
+                             decision.get("ip"), decision.get("event_code"),
+                             decision.get("alarm_object"))
+                return 0
             # 落库失败也要通知 —— 告警丢了比看板少一行严重得多
             logger.error("======告警落库失败，仍会推送通知========\n%s %s %s",
                          decision.get("ip"), decision.get("event_code"),
@@ -356,10 +442,13 @@ class AlarmEmitter(object):
 
         with self._lock:
             self._counts["inserted"] += 1
-        # alarm_id 回填进 L7 的状态，下次更新同一条告警要用
+        # alarm_id 回填进 L7 的状态，下次更新同一条告警要用。
+        # for_ignore 决定绑到哪个槽位：同一指纹下 ignore 行和告警行是两条
+        # 独立记录，id 混在一个槽位里会互相覆盖
         if self._state_machine is not None:
             try:
-                self._state_machine.bind_alarm(decision.get("fingerprint"), alarm_id)
+                self._state_machine.bind_alarm(decision.get("fingerprint"), alarm_id,
+                                               for_ignore=is_ignore)
             except Exception as err:
                 logger.error("======AlarmEmitter bind_alarm error========\n%s", err)
         return alarm_id
@@ -398,6 +487,77 @@ class AlarmEmitter(object):
             logger.warning("alarm_list 里没有 %s 的未恢复告警，%s 动作没落库 —— "
                            "状态表和 alarm_list 不一致",
                            decision.get("fingerprint", "")[:12], action)
+        else:
+            with self._lock:
+                self._counts["updated"] += 1
+        return decision.get("alarm_id", 0)
+
+    def _update_ignore(self, decision, now):
+        """
+        更新已有 ignore 行的 counter/last_seen
+
+        不走 _update()：那个方法按 state='open' 定位行，但 ignore 行
+        永远是 state='idle'。只更新这两个字段——ignore 没有级别变化、
+        没有 event_code 变化（不会升级成 IF_FLAP），不需要 _update()
+        里 escalate/clear 那两段特殊逻辑
+        """
+        data = {
+            "last_seen": str(decision.get("last_seen") or now),
+            "counter": decision.get("counter", 1),
+        }
+        try:
+            # 带上 alarm_id 精确定位：同一指纹下可能还有一条 clear_orphan
+            # 行（IF_UP 的指纹按 raise_code 换算成 IF_DOWN 的），只按指纹
+            # 取最新一行会串写到那条上去
+            result = self.db.updateIgnoreByFingerprint(
+                decision.get("fingerprint"), data,
+                alarm_id=decision.get("alarm_id", 0))
+        except Exception as err:
+            logger.error("======AlarmEmitter update_ignore error========\n%s", err)
+            result = "failed"
+
+        if result == "failed":
+            with self._lock:
+                self._counts["failed"] += 1
+        elif result == 0:
+            # 没有行可更新。多半是 ignore_new 那次落库失败了，状态表和
+            # alarm_list 不一致，得能看出来
+            logger.warning("alarm_list 里没有 %s 的 ignore 行，更新没落库 —— "
+                           "状态表和 alarm_list 不一致",
+                           decision.get("fingerprint", "")[:12])
+        else:
+            with self._lock:
+                self._counts["updated"] += 1
+        return decision.get("alarm_id", 0)
+
+    def _update_clear_orphan(self, decision, now):
+        """
+        更新已有 clear_orphan 行的 counter/last_seen
+
+        同一个口在聚合窗口内反复发孤立的 up（没有对应 down，纯粹链路抖动
+        或设备侧重复上报），L7 只在第一次 insert，之后都走这里刷新同一行，
+        不再新插、也不重复通知。复用 updateIgnoreByFingerprint ——
+        两边都是"按 fingerprint 定位、不限制 state"的更新，没必要另写一份
+        """
+        data = {
+            "last_seen": str(decision.get("last_seen") or now),
+            "counter": decision.get("counter", 1),
+        }
+        try:
+            result = self.db.updateIgnoreByFingerprint(
+                decision.get("fingerprint"), data,
+                alarm_id=decision.get("alarm_id", 0))
+        except Exception as err:
+            logger.error("======AlarmEmitter update_clear_orphan error========\n%s", err)
+            result = "failed"
+
+        if result == "failed":
+            with self._lock:
+                self._counts["failed"] += 1
+        elif result == 0:
+            logger.warning("alarm_list 里没有 %s 的 clear_orphan 行，更新没落库 —— "
+                           "状态表和 alarm_list 不一致",
+                           decision.get("fingerprint", "")[:12])
         else:
             with self._lock:
                 self._counts["updated"] += 1

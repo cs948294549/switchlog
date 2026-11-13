@@ -90,10 +90,32 @@ ACTION_RAISE = "raise"          # 开告警
 ACTION_UPDATE = "update"        # 已开着的告警有新进展（级别变了）
 ACTION_ESCALATE = "escalate"    # 闪断升级
 ACTION_CLEAR = "clear"          # 关告警
-ACTION_IGNORE = "ignore"        # L5 判定不告警，不往 L8 交
+# 恢复事件到了，但没有活跃告警可关 —— 故障发生在监控视野之外。
+# 典型是初次上线/重建库/进程停机期间：syslog 只在状态变化时发，设备不会
+# 为了我们重发一遍 down，所以监控看到的第一条就是它的 up。
+# 这类事件以前直接丢（返回 ACTION_NONE），结果初次上线什么都收不到。
+# 现在按正常告警流程处理：落一行 state=clear 并发通知。
+# 走 insert 不走 update —— alarm_list 里压根没有这条告警的行可更新
+ACTION_CLEAR_ORPHAN = "clear_orphan"
+# 窗口内重复命中 orphan：同一个口反复发孤立的 up（没有对应 down，纯粹是
+# 链路本身在抖、或者设备侧某种原因连续重发 up），不能每次都插一行，否则
+# 历史列表里会堆出一堆看起来一样的记录。按 DEFAULT_SILENCE 窗口聚合，
+# 只在第一次插入、之后都走 update 只刷 counter/last_seen，不重复通知
+ACTION_CLEAR_ORPHAN_UPDATE = "clear_orphan_update"
+# L5 判定不告警。仍要落 alarm_list（否则 alarm_log 写了但界面查不到这条，
+# 变成孤儿数据），只是不发通知、不进闪断/恢复的生命周期。按指纹聚合，
+# 首次命中 _IGNORE_NEW（插一行），之后命中 _IGNORE_UPDATE（累加 counter）
+ACTION_IGNORE_NEW = "ignore_new"
+ACTION_IGNORE_UPDATE = "ignore_update"
+IGNORE_ACTIONS = (ACTION_IGNORE_NEW, ACTION_IGNORE_UPDATE)
 
-# 要通知的动作。ACTION_NONE / ACTION_IGNORE 不往 L8 交
-NOTIFY_ACTIONS = (ACTION_RAISE, ACTION_UPDATE, ACTION_ESCALATE, ACTION_CLEAR)
+# 要通知的动作。ignore 系列和 ACTION_NONE 不发通知，但 ignore 系列仍要
+# 落库——是否落库、是否通知这次拆成了两个判断，不能再共用 notify 一个字段
+NOTIFY_ACTIONS = (ACTION_RAISE, ACTION_UPDATE, ACTION_ESCALATE, ACTION_CLEAR,
+                  ACTION_CLEAR_ORPHAN)
+# 要落库（写/更新 alarm_list）的动作。ACTION_NONE 不落库——它就是
+# "什么都没变"，L6 已经写了 alarm_log，L9 没有新信息要写
+WRITE_ACTIONS = NOTIFY_ACTIONS + (ACTION_IGNORE_NEW, ACTION_IGNORE_UPDATE)
 
 STATE_OPEN = "open"
 STATE_IDLE = "idle"
@@ -123,7 +145,8 @@ class AlarmState(object):
 
     __slots__ = ("fingerprint", "ip", "event_code", "alarm_object", "mode", "state",
                  "severity", "base_severity", "first_seen", "last_seen", "counter",
-                 "raise_count", "clear_count", "flapping", "alarm_id", "raise_times")
+                 "raise_count", "clear_count", "flapping", "alarm_id", "raise_times",
+                 "ignore_counter", "ignore_first_seen", "ignore_alarm_id")
 
     def __init__(self, fingerprint, ip="", event_code="", alarm_object="",
                  mode=MODE_RAISE, severity=3):
@@ -143,6 +166,19 @@ class AlarmState(object):
         self.flapping = 0
         self.alarm_id = 0
         self.raise_times = []
+        # ignore 单独一套计数/时间/alarm_id，不和上面那套混用。
+        #
+        # 为什么必须分开：恢复事件的指纹按 raise_code 换算（IF_UP 落到
+        # IF_DOWN 的指纹上），所以同一个指纹下可能同时躺着两条独立的
+        # alarm_list 行 —— 一条 ignore（state=idle, status=5）、一条
+        # clear_orphan（state=clear）。共用 counter 的话，clear_orphan
+        # 插完行把 counter 置成 1，紧接着来的 ignore 事件会把这个 1 当成
+        # "我自己已经插过行了"，于是走 update 把 counter 写到 clear_orphan
+        # 那一行上 —— 看板上就是"条数 2 但下钻只有 1 条日志"。
+        # alarm_id 同理：共用一个槽位，两条行互相覆盖对方的 id。
+        self.ignore_counter = 0
+        self.ignore_first_seen = 0
+        self.ignore_alarm_id = 0
 
     def is_open(self):
         return self.state == STATE_OPEN
@@ -165,6 +201,9 @@ class AlarmState(object):
             "clear_count": self.clear_count,
             "flapping": self.flapping,
             "alarm_id": self.alarm_id,
+            "ignore_counter": self.ignore_counter,
+            "ignore_first_seen": str(self.ignore_first_seen or ""),
+            "ignore_alarm_id": self.ignore_alarm_id,
             "updated_time": str(int(now)),
         }
 
@@ -191,6 +230,9 @@ class AlarmState(object):
         state.clear_count = to_int(row.get("clear_count"))
         state.flapping = to_int(row.get("flapping"))
         state.alarm_id = to_int(row.get("alarm_id"))
+        state.ignore_counter = to_int(row.get("ignore_counter"))
+        state.ignore_first_seen = to_int(row.get("ignore_first_seen"))
+        state.ignore_alarm_id = to_int(row.get("ignore_alarm_id"))
         return state
 
 
@@ -236,15 +278,10 @@ class StateMachine(object):
         处理一条聚合后的事件，返回决策
 
         :param event: L6 的输出（带 fingerprint / count / state / severity）
-        :return: 决策 dict。action=none/ignore 时 L8 和 L9 都不用管它
+        :return: 决策 dict。action=none 时 L8 和 L9 都不用管它
         """
         clock = int(now if now is not None else (event.get("ingest_ts") or time.time()))
         mode = str(event.get("state") or MODE_STATELESS).lower()
-
-        # L5 判定不告警。不写状态 —— 写了反而会让后面真要告警时
-        # 误以为"已有活跃告警"
-        if mode == MODE_IGNORE:
-            return self._decide(event, ACTION_IGNORE, None, clock)
 
         fingerprint = event.get("fingerprint") or ""
         if not fingerprint:
@@ -254,14 +291,22 @@ class StateMachine(object):
         with self._lock:
             state = self._states.get(fingerprint)
             if state is None:
+                # event_code 优先取 raise_code：恢复事件的指纹是 L6 按
+                # raise_code 换算的（IF_UP 落到 IF_DOWN 的指纹上），这里要是
+                # 存 IF_UP，就出现"指纹是 IF_DOWN 的、event_code 却是 IF_UP"
+                # 的自相矛盾行，看板上也会显示成恢复码告警。
+                # 只影响新建这条路径 —— 正常的 IF_DOWN -> IF_UP，state 在
+                # IF_DOWN 那一刻就建好了，走不到这里
                 state = AlarmState(
                     fingerprint, ip=event.get("ip", ""),
-                    event_code=event.get("event_code", ""),
+                    event_code=event.get("raise_code") or event.get("event_code", ""),
                     alarm_object=event.get("alarm_object", ""),
                     mode=mode, severity=event.get("severity", 3))
                 self._states[fingerprint] = state
 
-            if mode == MODE_CLEAR:
+            if mode == MODE_IGNORE:
+                action = self._on_ignore(state, event, clock)
+            elif mode == MODE_CLEAR:
                 action = self._on_clear(state, event, clock)
             elif mode == MODE_RAISE:
                 action = self._on_raise(state, event, clock)
@@ -315,12 +360,46 @@ class StateMachine(object):
         return self._open(state, now, base)
 
     def _on_clear(self, state, event, now):
-        """clear：关掉同指纹的活跃告警。闪断中的不自动关"""
-        state.last_seen = now
+        """
+        clear：关掉同指纹的活跃告警。闪断中的不自动关
+
+        没有活跃告警可关时不再丢弃（原来返回 ACTION_NONE）：那意味着故障
+        发生在监控视野之外 —— 初次上线、重建库、进程停机期间都会这样。
+        syslog 只在状态变化时发，设备不会为了我们重发一遍 down，所以这条
+        up 就是唯一的线索，丢了就等于初次上线什么告警都收不到。
+        按正常流程走 ACTION_CLEAR_ORPHAN，落一行 state=clear 并通知。
+
+        state.state 保持 STATE_IDLE 不动：这不是一条活跃告警，没有要恢复
+        的那一刻。sweep() 只扫 MODE_STATELESS 且 is_open() 的，不会碰它。
+        raise_count 也不动 —— 没有真正"开过告警"，动它会污染闪断计数，
+        连着三次视野外恢复会误升成 IF_FLAP。
+        """
         if not state.is_open():
-            # 没有活跃告警，这条恢复事件没东西可关。设备重启后会补发一批
-            # up 日志，属正常现象，不记 error
-            return ACTION_NONE
+            # 上一次也是孤立恢复（mode 只有这条路径会设成 MODE_CLEAR，
+            # 真正的 raise->clear 走的是下面 375 行，不会设这个值），且还在
+            # 聚合窗口内：同一行累加，不再新插一条、也不重复发通知。
+            # 这里用改动前的 last_seen 判窗口，不能等它被下面覆盖了再判
+            # last_seen 必须真有值：新建的 state 它是 0，而 handle() 建 state
+            # 时 mode 直接取事件的 state 字段，恢复事件进来时新 state 的 mode
+            # 本来就是 MODE_CLEAR —— 只判 mode 的话第一条孤立恢复会被当成
+            # "窗口内的重复"，不插行也不通知
+            was_orphan_in_window = (state.last_seen > 0
+                                    and state.mode == MODE_CLEAR
+                                    and now - state.last_seen <= self._silence)
+            state.last_seen = now
+            state.mode = MODE_CLEAR
+            state.clear_count += 1
+            if was_orphan_in_window:
+                # 只刷 counter，不碰 first_seen —— 这一行从第一次孤立恢复
+                # 算起，first_seen 要保持不变才能看出这批抖动持续了多久
+                state.counter += 1
+                return ACTION_CLEAR_ORPHAN_UPDATE
+            # 窗口已经过了（或者这是第一次孤立恢复）：另起一行
+            # counter 和 first_seen 显式归位：这一行是一条独立的记录，
+            # 不能带着上一轮留下的计数和时间去落库
+            state.counter = 1
+            state.first_seen = now
+            return ACTION_CLEAR_ORPHAN
 
         state.clear_count += 1
 
@@ -367,6 +446,36 @@ class StateMachine(object):
             return ACTION_NONE
 
         return self._open(state, now, base)
+
+    def _on_ignore(self, state, event, now):
+        """
+        ignore：L5 定级规则判定不告警，但要留痕——按指纹聚合写 alarm_list，
+        不走开/关告警的生命周期，不进闪断计数，不发通知。
+
+        没有阈值判断：ignore 不是"攒够了才算事"，命中一次就该记一次。
+        state.state 一直留 STATE_IDLE，不调 self._open()——ignore 永远
+        不是"活跃告警"，没有要恢复的那一刻，L7 的 sweep() 也不会碰它
+        （sweep 只找 STATE_OPEN 的状态）。
+
+        用 ignore_counter / ignore_first_seen / ignore_alarm_id，不碰
+        state.counter 那一套：同一指纹下 ignore 行和 clear_orphan 行是两条
+        独立的 alarm_list 记录（恢复事件的指纹按 raise_code 换算过来），
+        共用计数会让 ignore 把自己的 counter 写到 clear_orphan 那行上去。
+        也不改 state.mode —— 那个字段 sweep() 和 _on_clear() 都在读，
+        ignore 一旦把它改成 MODE_IGNORE，这个指纹后面真来了孤立恢复，
+        _on_clear() 里"上次是不是 orphan"就判错了
+        """
+        state.last_seen = now
+        state.base_severity = int(event.get("severity", state.base_severity))
+        state.severity = state.base_severity
+
+        if state.ignore_counter:
+            state.ignore_counter += 1
+            return ACTION_IGNORE_UPDATE
+
+        state.ignore_counter = 1
+        state.ignore_first_seen = now
+        return ACTION_IGNORE_NEW
 
     # ---------------- 开告警与闪断 ----------------
 
@@ -483,24 +592,44 @@ class StateMachine(object):
             "counter": state.counter,
             "first_seen": state.first_seen or now,
             "last_seen": state.last_seen or now,
-            "clear_time": now if action == ACTION_CLEAR else 0,
+            # clear_orphan 也要填：它落的那一行 state 就是 clear，
+            # 不填的话看板上是一条"已恢复但没有恢复时间"的记录
+            "clear_time": now if action in (ACTION_CLEAR, ACTION_CLEAR_ORPHAN) else 0,
             "flapping": state.flapping,
             "raise_count": state.raise_count,
             "alarm_id": state.alarm_id,
         })
+
+        if action in IGNORE_ACTIONS:
+            # ignore 行是同一指纹下另一条独立记录，counter/first_seen/
+            # alarm_id 全都走自己那一套，不能用上面那三个共用字段的值
+            decision.update({
+                "counter": state.ignore_counter,
+                "first_seen": state.ignore_first_seen or now,
+                "alarm_id": state.ignore_alarm_id,
+                # ignore 不是"已恢复"，没有恢复时间
+                "clear_time": 0,
+            })
         return decision
 
-    def bind_alarm(self, fingerprint, alarm_id):
+    def bind_alarm(self, fingerprint, alarm_id, for_ignore=False):
         """
         L9 落库之后把 alarm_id 回填进状态，下次更新同一条告警要用
 
+        :param for_ignore: True=绑到 ignore_alarm_id。同一指纹下 ignore 行和
+                           告警行（raise/clear_orphan）是两条独立的 alarm_list
+                           记录，各自的 id 分开存，否则后插的那条会把前一条的
+                           id 覆盖掉，更新时就改到别人那一行上去了
         :return: True=绑上了
         """
         with self._lock:
             state = self._states.get(fingerprint)
             if state is None:
                 return False
-            state.alarm_id = int(alarm_id)
+            if for_ignore:
+                state.ignore_alarm_id = int(alarm_id)
+            else:
+                state.alarm_id = int(alarm_id)
             self._dirty.add(fingerprint)
         return True
 

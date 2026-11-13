@@ -283,27 +283,42 @@ class Runner(object):
         """
         落库。维护线程按自己的间隔调，比 tick() 频繁得多
 
-        三件事：
+        五件事：
+            L2  persist        黑名单规则的命中数刷进 syslog_black_list
             L6  flush          攒着的原子记录写 alarm_log
             L7  persist        变动过的告警状态写 syslog_alarm_state
+            L8  persist        静默规则的命中数刷进 syslog_mute_rule
             L9  sync_counters  累加出来的 counter 刷进 alarm_list
 
-        为什么不跟 tick() 一起：规则刷新 300s 一次合理，但这三件 300s
-        才做一次的后果是看板 counter 滞后 5 分钟、进程崩了丢 5 分钟状态。
+        为什么不跟 tick() 一起：规则刷新 300s 一次合理，但这几件 300s
+        才做一次的后果是看板上的数滞后 5 分钟、进程崩了丢 5 分钟状态。
 
-        为什么不在热路径上做：日志风暴时一个指纹刷一万条日志，热路径上
-        每条都 UPDATE 就是一万次写。这里一轮一个指纹最多一次。
+        为什么不在热路径上做：日志风暴时一条规则一秒能命中几千次，
+        热路径上每次都 UPDATE 就是几千次写。这里一轮一条规则最多一次。
 
-        :return: {"logs", "states", "counters"} 各写了多少
+        :return: {"logs", "states", "counters", "blacklist_hits", "mute_hits"} 各写了多少
         """
         now = int(now if now is not None else time.time())
-        result = {"logs": 0, "states": 0, "counters": 0}
+        result = {"logs": 0, "states": 0, "counters": 0,
+                  "blacklist_hits": 0, "mute_hits": 0}
+
+        if self._blacklist is not None:
+            try:
+                result["blacklist_hits"] = self._blacklist.persist(now=now)
+            except Exception as err:
+                logger.error("======Runner blacklist persist error========\n%s", err)
 
         if self._aggregator is not None:
             try:
                 result["logs"] = self._aggregator.flush(now=now)
             except Exception as err:
                 logger.error("======Runner persist flush error========\n%s", err)
+
+        if self._mute is not None:
+            try:
+                result["mute_hits"] = self._mute.persist(now=now)
+            except Exception as err:
+                logger.error("======Runner mute persist error========\n%s", err)
 
         if self._state_machine is None:
             return result
@@ -384,8 +399,10 @@ class Runner(object):
         try:
             result = self.persist()
             if any(result.values()):
-                logger.info("退出前落库：alarm_log %s 条，状态 %s 条，counter %s 条",
-                            result["logs"], result["states"], result["counters"])
+                logger.info("退出前落库：alarm_log %s 条，状态 %s 条，counter %s 条，"
+                            "黑名单命中 %s 条，静默命中 %s 条",
+                            result["logs"], result["states"], result["counters"],
+                            result["blacklist_hits"], result["mute_hits"])
         except Exception as err:
             logger.error("======Runner stop persist error========\n%s", err)
 

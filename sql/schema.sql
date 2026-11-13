@@ -73,6 +73,8 @@ CREATE TABLE syslog_black_list(
     ignore_case TINYINT NOT NULL DEFAULT 0 COMMENT '1=大小写不敏感，只对scope=message生效',
     enabled TINYINT NOT NULL DEFAULT 1 COMMENT '1=启用 0=停用',
     descr VARCHAR(300) NOT NULL DEFAULT '' COMMENT '为什么拦这条，便于日后判断能不能放开',
+    hit_count BIGINT NOT NULL DEFAULT 0 COMMENT '累计命中次数，维护线程定期从内存计数器刷过来，不是热路径实时写',
+    last_hit_time VARCHAR(10) NOT NULL DEFAULT '' COMMENT '最近一次命中时间(epoch秒)，空=从未命中',
     update_time VARCHAR(10) NOT NULL DEFAULT '' COMMENT '最近更新时间(epoch秒)',
     PRIMARY KEY(rule_id),
     UNIQUE KEY uniq_scope_ip_pattern (scope, ip, pattern),
@@ -256,6 +258,8 @@ CREATE TABLE syslog_mute_rule(
     end_time VARCHAR(10) NOT NULL DEFAULT '' COMMENT '窗口结束(epoch秒)，空=永久静默',
     enabled TINYINT NOT NULL DEFAULT 1 COMMENT '1=启用 0=停用',
     descr VARCHAR(300) NOT NULL DEFAULT '' COMMENT '为什么静默，建议写上变更工单号',
+    hit_count BIGINT NOT NULL DEFAULT 0 COMMENT '累计命中次数（告警被压住的次数，不是日志条数），维护线程定期从内存计数器刷过来',
+    last_hit_time VARCHAR(10) NOT NULL DEFAULT '' COMMENT '最近一次命中时间(epoch秒)，空=从未命中',
     update_time VARCHAR(10) NOT NULL DEFAULT '' COMMENT '最近更新时间(epoch秒)',
     PRIMARY KEY(rule_id),
     INDEX idx_enabled (enabled),
@@ -290,6 +294,9 @@ CREATE TABLE syslog_alarm_state(
     clear_count INT NOT NULL DEFAULT 0 COMMENT '累计恢复次数',
     flapping TINYINT NOT NULL DEFAULT 0 COMMENT '1=闪断中，禁止自动恢复',
     alarm_id BIGINT NOT NULL DEFAULT 0 COMMENT '对应的 alarm_list 记录',
+    ignore_counter INT NOT NULL DEFAULT 0 COMMENT 'ignore行的日志条数，和counter分开：同一指纹下ignore行和clear_orphan行是两条独立记录',
+    ignore_first_seen VARCHAR(10) NOT NULL DEFAULT '' COMMENT 'ignore行的首次出现(epoch秒)',
+    ignore_alarm_id BIGINT NOT NULL DEFAULT 0 COMMENT 'ignore行对应的alarm_list记录，和alarm_id分开存',
     updated_time VARCHAR(10) NOT NULL DEFAULT '' COMMENT '最近写入时间(epoch秒)',
     PRIMARY KEY(fingerprint),
     INDEX idx_state (state),
@@ -314,9 +321,14 @@ CREATE TABLE syslog_alarm_state(
 --
 -- 三组状态字段互相独立，不要混用：
 --   state   告警自身还成不成立（open/clear），由 L7 状态机维护
---   status  人工处理到哪一步（0待处理/1已确认/2已处理/3忽略/4屏蔽），
---           只有人点才会变
+--   status  处理状态（0待处理/1已确认/2已处理/3忽略/4屏蔽/5系统判定忽略），
+--           0~4 只有人点才会变，5 是 L9 写入的，人工操作不会选到这个值
 --   muted   有没有被 L8 的静默规则压住，窗口一过自动恢复通知
+--
+-- status=5 和 status=3（人工忽略）、muted（L8静默）看起来都是"不告警"，
+-- 但触发源不一样：3 是人点出来的，5 是 L5 定级规则 action=ignore 判定的
+-- （哪类设备的哪个事件码永久不告警），muted 是 L8 时间窗临时压住。
+-- 分开存是为了不把"系统自动判定"和"人工操作"混进同一份统计里。
 --
 -- muted 和 status=4（人工屏蔽）看起来像，但生命周期完全不同，所以分开存：
 -- 人工屏蔽要一直屏蔽到有人去改；muted 是割接窗口结束就该自动恢复告警。
@@ -344,8 +356,8 @@ CREATE TABLE alarm_list(
     object_name VARCHAR(100) NOT NULL DEFAULT '' COMMENT '对象归一化识别名，目前只有接口会填（ports.if_name全名），其它对象类型留空',
     object_alias VARCHAR(200) NOT NULL DEFAULT '' COMMENT '对象人类可读描述，目前只有接口会填（ports.alias接口描述），其它对象类型留空',
     severity TINYINT NOT NULL DEFAULT 3 COMMENT '1=P1 2=P2 3=P3',
-    state VARCHAR(10) NOT NULL DEFAULT 'open' COMMENT 'open=告警中 clear=已恢复',
-    status VARCHAR(1) NOT NULL DEFAULT '0' COMMENT '人工处理状态 0待处理1已确认2已处理3忽略4屏蔽，只有人点才变',
+    state VARCHAR(10) NOT NULL DEFAULT 'open' COMMENT 'open=告警中 clear=已恢复 idle=ignore判定不告警，没有活跃状态',
+    status VARCHAR(1) NOT NULL DEFAULT '0' COMMENT '处理状态 0待处理1已确认2已处理3忽略4屏蔽5系统判定忽略，5由L9写入非人工操作',
     muted TINYINT NOT NULL DEFAULT 0 COMMENT '1=被L3静默规则压住，不发通知。窗口过了自动恢复',
     mute_rule_id BIGINT NOT NULL DEFAULT 0 COMMENT '命中的syslog_mute_rule行，0=没被静默',
     counter INT NOT NULL DEFAULT 1 COMMENT '窗口内日志条数，不是事故次数',
@@ -543,7 +555,24 @@ VALUES
 ('CLOCK_CHG',         'stateless', 'none',      3600,  1, '',
  '系统时钟变更。NTP对时的正常结果，定级配ignore'),
 ('NTP_DROP',          'stateless', 'none',      3600,  1, '',
- 'NTP丢弃私有模式报文，公网扫描打上来的。安全侧信息，不是网络故障');
+ 'NTP丢弃私有模式报文，公网扫描打上来的。安全侧信息，不是网络故障'),
+-- 温度异常。三家厂商 15 条 mnemonic 收敛成一对 raise/clear。
+--
+-- 为什么不按 minor/major 拆成两个事件码：华三和华为各自只有一条恢复
+-- mnemonic（DEV/5/TEMPERATURE_NORMAL、ENTITYTRAP/4/ENTITYBRDTEMPRESUME），
+-- 不区分是从哪个级别恢复的。拆开之后 clear_code 只能挂给其中一个
+-- （syslog_event 的 clear_code 反查表不允许一个恢复码对应两个故障码，
+-- 加载时会打 error），另一个就永远关不掉。
+--
+-- object_type=none：不抽对象，一台设备一条温度告警。
+-- 同一块板多个传感器同时超限收敛成一条，不会一个传感器一条。
+--
+-- window 3600：现网 rsw1_mdu15_prod_dc07_m01 的 Back 传感器常年贴着
+-- 45 度线上下晃（46 报、44 恢复），一天一对。给长窗口避免碎窗口。
+('TEMP_ALARM', 'raise', 'none', 3600, 1, 'TEMP_OK',
+ '温度异常，需要IDC介入。三家厂商的温度告警/高温/严重告警都归这里'),
+('TEMP_OK',    'clear', 'none', 3600, 1, '',
+ '温度恢复，按TEMP_ALARM的指纹回关告警');
 
 -- ============================================================
 -- 种子数据：事件定级
@@ -576,6 +605,12 @@ VALUES
 ('BGP_DOWN', '', '',           1, '',       100, 'BGP邻居down'),
 ('OSPF_DOWN','', '',           1, '',       100, 'OSPF邻居down'),
 -- 按网段定级：测试网段的漂移不用按生产环境的级别看
+-- 职场设备的 MAC 漂移不告警。priority=10 必须小于下面测试网段那条（50），
+-- 否则 corp 职场里恰好落在 10.19.9.x 的设备会先命中那条被降成 P3 正常告警。
+-- sysname_reg 用不带锚的 'corp' 走 re.search，子串命中即可 ——
+-- 职场里不只有 rsw，asw/csw 也要盖住，'^rsw.*corp' 会把它们漏掉
+('MAC_FLAP', '', 'corp',                   3, 'ignore', 10,
+ '职场设备MAC漂移不告警。无线漫游/终端换口天天发生，不是故障'),
 ('MAC_FLAP', '^10[.]19[.]9[.]', '',         3, '',       50,  '测试网段的MAC漂移降P3'),
 ('MAC_FLAP', '', '',           2, '',       100, 'MAC漂移'),
 ('PSU_FAIL', '', '',           2, '',       100, '电源/风扇/板卡故障'),
@@ -615,6 +650,28 @@ VALUES
  '设备自身管理地址拿不到。真失联轮询监控会先报，这条只用于定位原因'),
 ('CERT_EXPIRED',      '', '', 3, '',       100,
  '证书已过期，影响HTTPS管理/802.1X。按天提醒，不是紧急故障'),
+-- 温度异常。老系统等级是"提示"，对应 P3；action 留空=正常告警，不是 ignore。
+-- 全网生效（老系统设备组是"所有设备"），职场和机房都报 —— 温度是硬件问题，
+-- 不像端口/MAC 那样分职场机房。
+-- 恢复事件 TEMP_OK 不写专门行，落全局兜底的 '*'（P3 正常告警）
+('TEMP_ALARM',        '', '', 3, '',       100,
+ '温度异常，需要IDC介入。老系统等级"提示"，全网生效'),
+-- 职场设备的速率/双工/流控变化不告警。
+-- sysname_reg 用不带锚的 'corp' 而不是 '^rsw.*corp'：职场里不只有 rsw，
+-- asw1_corp_ts_m20 / csw1_corp_hz_m09 这些都要盖住，而 ^rsw 开头的写法
+-- 把它们漏在外面。sysname_reg 走 re.search，子串命中即可。
+--
+-- IF_ATTR_CHG 本来就是端口 up 的伴生日志（一次 up 刷速率/双工/收发流控
+-- 四条），职场终端每天插拔，这四条跟着刷。没写专门规则之前它落全局兜底
+-- 的 '*'（P3、正常告警），现网样本里是量最大的事件码。
+--
+-- 没配黑名单的理由同其他 ignore 项：日志留着能回答"这个口是不是协商到了
+-- 100M"。真要彻底不解析，配 syslog_black_list 的 ETHPORT-5-SPEED 那几条。
+--
+-- priority 给 50 不给 100：留出 100 这一档，以后要给非职场的 IF_ATTR_CHG
+-- 配默认级别时直接加一行 sysname_reg 为空的，不用再动这一行
+('IF_ATTR_CHG',       '', 'corp', 3, 'ignore', 50,
+ '职场设备的速率/双工/流控变化不告警。终端每天插拔，是端口up的伴生日志'),
 -- 全局兜底。唯一允许匹配全网所有事件的规则，删了会打 error
 ('*',        '', '',           3, '',       999,
  '全局兜底。没写专门规则的事件码都是P3，加载时查不到这行会打error');
@@ -683,6 +740,21 @@ VALUES
 ('h3c', 'IFNET/3/PHY_UPDOWN', 'exact', '', 'changed to up',
  'IF_UP', 'interface (\\S+?) changed', 100,
  'H3C 物理口 up'),
+-- Comware 的链路协议层，和上面 PHY_UPDOWN 是同一次翻动的两条日志：
+-- 现网 172.25.1.122 的 GigabitEthernet1/0/23 在 09:19:34 同一秒打了
+-- IFNET/3/PHY_UPDOWN（物理层）和 IFNET/5/LINK_UPDOWN（链路协议层）。
+-- 归同一个事件码、用同一个 object_regex，两条落同一指纹 -> 一次翻动
+-- 只出一条告警。和 cisco_nx 那边 ETHPORT-5-IF_DOWN + LINEPROTO-5-UPDOWN
+-- 都归 IF_DOWN 是同一个套路。
+--
+-- 正文只差一个词（Physical state / Line protocol state），所以
+-- object_regex 和 body_match 都能直接沿用 PHY_UPDOWN 那两行
+('h3c', 'IFNET/5/LINK_UPDOWN', 'exact', '', 'changed to down',
+ 'IF_DOWN', 'interface (\\S+?) changed', 100,
+ 'Line protocol state on the interface GigabitEthernet1/0/23 changed to down.'),
+('h3c', 'IFNET/5/LINK_UPDOWN', 'exact', '', 'changed to up',
+ 'IF_UP', 'interface (\\S+?) changed', 100,
+ 'Line protocol state on the interface GigabitEthernet1/0/23 changed to up.（现网样本，S5130S/Comware 7.1.070）'),
 ('huawei', 'IFNET/3/PHY_UPDOWN', 'exact', '', 'turned into DOWN',
  'IF_DOWN', 'interface (\\S+?) has', 100,
  'The interface XGigabitEthernet0/0/1 has turned into DOWN state.'),
@@ -710,6 +782,19 @@ VALUES
 ('*', 'BFD-5-SESSION_MOVED', 'exact', '', '',
  'BFD_SESSION_CHG', '', 100,
  'BFD 会话在板卡间迁移，正文里没有邻居IP'),
+-- 另两条 BFD 会话事件，和上面两条一起归 BFD_SESSION_CHG。
+-- 四条连起来能还原一次邻居震荡的全过程：
+--   STATE_DOWN -> BGP_DOWN（真告警，P1）
+--   REMOVED / MOVED / CREATED / STATE_UP -> BFD_SESSION_CHG（过程记录）
+-- STATE_UP 没归到 BGP_UP：BGP 邻居恢复由 BGP-5-ADJCHANGE 的 Up 那条负责，
+-- BFD 会话 up 只是底层探测通了，两件事。归过去会让 BGP_DOWN 的告警
+-- 被一条 BFD 事件关掉，而 BGP 邻居可能还没起来
+('*', 'BFD-5-SESSION_CREATED', 'exact', '', '',
+ 'BFD_SESSION_CHG', 'neighbor\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)', 100,
+ 'BFD 会话建立。正文格式未对现网核实，正则沿用 SESSION_REMOVED 那条'),
+('*', 'BFD-5-SESSION_STATE_UP', 'exact', '', '',
+ 'BFD_SESSION_CHG', 'neighbor\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)', 100,
+ 'BFD 会话UP。正则沿用 SESSION_STATE_DOWN 那条（同一对事件，正文格式一致）'),
 ('*', 'ETHPORT-5-SPEED', 'exact', '', '',
  'IF_ATTR_CHG', 'Interface\\s+([^\\s,(]+)', 100,
  '协商速率变化，端口up的伴生日志'),
@@ -843,6 +928,76 @@ VALUES
  'MAC_FLAP_RECOVER', '', 300,
  '%%01FWM-ETH/4/hwMflpVlanLoopAlarm_clear(l):...;Mac flapping detection recovered in vlan 136.（模块段含中划线，mnemonic剥不出）');
 
+-- ============================================================
+-- 种子数据：温度异常（三家厂商 15 条）
+--
+-- 来源：上一套系统的"温度异常"告警规则（sql/log_config.json，
+-- 规则名"温度异常"、描述"需要IDC介入"、等级提示、设备组所有设备）。
+-- 那边 15 条 keyword 全是 matchMode=3（包含），我们这边按 mnemonic
+-- 全名进 dict，所以逐条照搬 mnemonic。
+--
+-- object_regex 全部留空：不抽对象，一台设备一条温度告警。
+-- 同一块板多个传感器同时超限收敛成一条。
+--
+-- 归一到 TEMP_ALARM / TEMP_OK 一对：告警侧 10 条、恢复侧 5 条。
+-- 不按 minor/major 拆，理由见 syslog_event 那一节的注释。
+-- ============================================================
+INSERT IGNORE INTO syslog_rule
+    (vendor, mnemonic, match_type, pattern, body_match,
+     event_code, object_regex, priority, descr)
+VALUES
+-- Cisco NX-OS。现网 rsw1_mdu15_prod_dc07_m01（N3K-C3048TP）在刷
+-- MOD_TEMPMINALRM / MOD_TEMPOK 这一对，正文已核对：
+--   Module-1 reported minor temperature alarm. Sensor=1 Temperature=46 MinThreshold=45
+--   Module-1 recovered from minor temperature alarm. Sensor=1 Temperature=44 MinThreshold=45
+-- 注意 MOD_TEMPMAJALRM 的严重度数字是 0 不是 2，照搬老系统的写法
+('cisco_nx', 'PLATFORM-0-MOD_TEMPMAJALRM', 'exact', '', '',
+ 'TEMP_ALARM', '', 100, '思科温度告警（严重）'),
+('cisco_nx', 'PLATFORM-2-MOD_TEMPMINALRM', 'exact', '', '',
+ 'TEMP_ALARM', '', 100,
+ 'Module-1 reported minor temperature alarm. Sensor=1 Temperature=46 MinThreshold=45'),
+('cisco_nx', 'PLATFORM-2-MOD_TEMPMAJOR2WARM', 'exact', '', '',
+ 'TEMP_ALARM', '', 100, '思科温度告警，major 降到 warm'),
+('cisco_nx', 'PLATFORM-2-MOD_TEMPMINOR2WARM', 'exact', '', '',
+ 'TEMP_ALARM', '', 100, '思科温度告警，minor 降到 warm'),
+('cisco_nx', 'PLATFORM-2-MOD_TEMPOK', 'exact', '', '',
+ 'TEMP_OK', '', 100,
+ 'Module-1 recovered from minor temperature alarm. Sensor=1 Temperature=44 MinThreshold=45'),
+('cisco_nx', 'PLATFORM-2-MOD_TEMPMAJOR_OK', 'exact', '', '',
+ 'TEMP_OK', '', 100, '思科温度告警恢复（major）'),
+('cisco_nx', 'PLATFORM-2-MOD_TEMPWARM_OK', 'exact', '', '',
+ 'TEMP_OK', '', 100, '思科温度告警恢复（warm）'),
+-- 华为
+('huawei', 'ENTITYTRAP/1/ENTITYBRDTEMPALARM', 'exact', '', '',
+ 'TEMP_ALARM', '', 100, '华为温度异常'),
+('huawei', 'BASETRAP/3/TEMRISING', 'exact', '', '',
+ 'TEMP_ALARM', '', 100, '华为单板温度高'),
+('huawei', 'ENTITYTRAP/4/ENTITYBRDTEMPRESUME', 'exact', '', '',
+ 'TEMP_OK', '', 100, '华为温度恢复'),
+-- 华三。恢复那条老系统给了完整写法 DEV/5/TEMPERATURE_NORMAL，照搬。
+--
+-- 告警那三条老系统只写了裸名（TEMPERATURE_ALARM / _SHUTDOWN / _WARNING），
+-- 它那边是全文"包含"所以裸名能命中，我们按 mnemonic 全名查 dict 不行 ——
+-- 实际日志里应该是 DEV/<数字>/TEMPERATURE_xxx，但严重度数字我没有现网
+-- 样例核实，不照手册臆造（DEV/1/FAN 那次就是照手册写法配的，剥出来对不上，
+-- 白配一轮）。
+--
+-- 所以这三条按 DEV/ 前缀 + 常见严重度数字各配一行，宁可多配几行废规则
+-- 也不漏：数字不对的那几行永远不命中，不影响别的；对的那行会命中。
+-- 拿到现网样例后把没命中的删掉即可（看 alarm_log 的 rule_id 分布）。
+-- 数字取值依据 Comware 的惯例：1=alert 2=critical 3=error 4=warning
+('h3c', 'DEV/1/TEMPERATURE_ALARM', 'exact', '', '',
+ 'TEMP_ALARM', '', 100, '华三温度告警。严重度数字待现网样例核实'),
+('h3c', 'DEV/2/TEMPERATURE_SHUTDOWN', 'exact', '', '',
+ 'TEMP_ALARM', '', 100, '华三温度严重告警（会关板卡）。严重度数字待核实'),
+('h3c', 'DEV/4/TEMPERATURE_WARNING', 'exact', '', '',
+ 'TEMP_ALARM', '', 100, '华三温度告警（预警）。严重度数字待现网样例核实'),
+('h3c', 'DEV/5/TEMPERATURE_NORMAL', 'exact', '', '',
+ 'TEMP_OK', '', 100, '华三温度恢复'),
+-- SIC 模块温度控制电路异常。老系统归在同一条规则里，照搬
+('h3c', 'HSC/4/SICTMPEXC', 'exact', '', '',
+ 'TEMP_ALARM', '', 100, 'SIC模块温度控制电路异常');
+
 -- 不写 rule_id，交给 AUTO_INCREMENT。去重靠 uniq_match
 -- (vendor, mnemonic, match_type, pattern, body_match)，重复执行不会插出第二份
 
@@ -867,10 +1022,11 @@ VALUES
 -- 只拦某台设备：进 (ip, mnemonic) 那张 dict，不参与全量流量
 ('ETHPORT-5-IF_DOWN_CHANNEL_ADMIN_DOWN', 'mnemonic', '10.16.249.5', 0, 1,
  '该设备成员口人工 shutdown 后持续刷，确认过无影响'),
--- 停用示例：加载时被 enabled 过滤掉，验证开关。已改为走
--- L3 的 BFD_SESSION_CHG 事件码 + L8 drop 规则处理
-('BFD-5-SESSION_MOVED', 'mnemonic', '', 0, 0,
- '停用示例：这条已改为走 L3 的 BFD_SESSION_CHG + L8 drop'),
+-- BFD 那几条曾经在这里（SESSION_MOVED / SESSION_REMOVED），现在移出去了：
+-- 四条 BFD 会话事件统一走 L3 的 BFD_SESSION_CHG 事件码，见 syslog_rule。
+-- 理由是 BFD 会话的创建/迁移/删除/UP 连起来能还原一次邻居震荡的过程，
+-- 在 L2 丢掉就什么都不剩了。不想看告警的话去 syslog_severity_rule
+-- 配 action=ignore —— 那样日志照样落 alarm_log 可回溯，只是不开告警。
 ('LICENSE-6-VIOLATION', 'mnemonic', '', 0, 1,
  'License特性用量超授权数的周期性提示，非故障，每分钟刷一次。容量问题走license审计，不进告警管线'),
 -- PoE 端口功率周期回显：几秒一条、每次数值都不一样（Power=2400/1100/3100），
@@ -882,7 +1038,97 @@ VALUES
 ('POE/6/PORTPWR', 'mnemonic', '', 0, 1,
  'PoE端口功率周期回显(V600R023)，几秒一条且数值每次都变，无告警与回溯价值'),
 ('POE/6/PORTPW', 'mnemonic', '', 0, 1,
- 'PoE端口功率周期回显(V200R011老VRP写法，少个R)，同上');
+ 'PoE端口功率周期回显(V200R011老VRP写法，少个R)，同上'),
+-- 日志文件老化删除。设备自己的日志轮转，和网络状态无关，连回溯价值都没有
+-- （要查设备上还剩哪些日志文件直接登上去 dir flash:/logfile/ 看）。
+-- 同一件事打两条：(t) 结尾的是 trap、(l) 结尾的是 log，两个 mnemonic 都要拦，
+-- 少配一个另一条继续落 UNKNOWN_MNEMONIC。
+-- INFO 模块下现网只有这两条，按 mnemonic 精确拦不会牵连别的
+('INFO/4/hwICLogFileAging', 'mnemonic', '', 0, 1,
+ '日志文件老化删除的trap。设备自身日志轮转，与网络状态无关'),
+('INFO/4/IM_LOGFILE_AGING_DELETE', 'mnemonic', '', 0, 1,
+ '日志文件老化删除的log，上面那条trap的伴生日志，同一件事打两条'),
+-- ---------- 以下 6 条来自历史屏蔽词清单（sql/log_ignore.txt）----------
+--
+-- 那份清单是上一套系统攒的，判据只有"全文包含"一种，和现在的
+-- (scope=mnemonic 走 dict) + (scope=message 线性扫) 两档对不上，所以整份
+-- 不导入，只当参考 —— 遇到现网日志时查一下它里面有没有，有就说明之前
+-- 已经判过是噪声，省一次判断。
+--
+-- 这 6 条的特殊之处：它们在清单里，但我们之前给它们配了 syslog_rule
+-- 要识别。黑名单在 L2、比 L3 规则早，所以加在这里之后那些规则就永不命中，
+-- 对应的事件码变成死码（见文件末尾"死码清单"那一节，列了是哪几个、
+-- 以及想恢复时怎么做）。
+--
+-- 没有删掉那些 syslog_rule：黑名单这一行就是开关 —— 哪天想重新看某一类，
+-- 把这里对应的行 enabled=0，L3 的规则和定级原样还在，立刻恢复识别。
+-- 规则删了反而要重新配一遍正则。
+-- BFD-5-SESSION_REMOVED 曾经在这里，已移出 —— 四条 BFD 会话事件统一走
+-- L3 的 BFD_SESSION_CHG，见 syslog_rule 那一节
+('DAEMON-3-SYSTEM_MSG', 'mnemonic', '', 0, 1,
+ 'Nexus守底进程杂项消息，现网见到的是NTP丢弃公网扫描报文。非网络故障'),
+('DHCP/5/WAITOFFER_TIMEOUT', 'mnemonic', '', 0, 1,
+ '设备自身DHCP客户端超时。真失联轮询监控会先报，这条自己不构成故障'),
+('SYSMIB/4/CLKCHANGE', 'mnemonic', '', 0, 1,
+ '系统时钟变更，NTP对时的正常结果'),
+-- 下面四条是同一件事：一次端口 up 这四条一起刷（速率/双工/收向流控/发向流控）。
+-- 四条必须一起拦 —— 只拦其中两条，另两条照样进管线，降噪只做一半。
+-- 端口本身的 up/down 由 ETHPORT-5-IF_UP 和 IF_DOWN 那几条规则负责，不受影响
+('ETHPORT-5-SPEED', 'mnemonic', '', 0, 1,
+ '协商速率变化，端口up的伴生日志。一次up刷四条，四条一起拦'),
+('ETHPORT-5-IF_DUPLEX', 'mnemonic', '', 0, 1,
+ '双工模式变化，端口up的伴生日志'),
+('ETHPORT-5-IF_RX_FLOW_CONTROL', 'mnemonic', '', 0, 1,
+ '收向流控变化，端口up的伴生日志'),
+('ETHPORT-5-IF_TX_FLOW_CONTROL', 'mnemonic', '', 0, 1,
+ '发向流控变化，端口up的伴生日志'),
+-- Nexus 缓存池水线。只能用 scope=message —— mnemonic 剥出来是空串：
+-- strip_mnemonic 的 FAC 段正则是 [A-Za-z][A-Za-z0-9_]*，不收中划线，
+-- "TAHUSD-SLOT1" 中间那个中划线过不去（和 FWM-ETH 同一个坑）。
+--
+-- pattern 选 BUFFER_THRESHOLD_EXCEEDED 而不是 TAHUSD 或 "Pool-group buffer"：
+-- 四个候选子串在现网 2591 条样本里都精确命中同一批 160 条、无误伤，
+-- 选这个是因为它自带语义，日后查表的人不用去猜 TAHUSD 是什么。
+--
+-- 依据：上一套系统 2021-01-22 就拦了这条（sql/log_ignore.json id=1337，
+-- 江源远配的，理由"突发流量，不影响业务"）。现网 160/2591 = 6.2%，量不小。
+--
+-- 注意这条会让 syslog_rule 里那条 fuzzy 规则（映射 BUFFER_THRESHOLD）变成
+-- 死码 —— 规则留着当开关，见文件末尾"死码清单"
+('BUFFER_THRESHOLD_EXCEEDED', 'message', '', 0, 1,
+ 'Nexus缓存池超90%水线。突发流量不影响业务（沿用2021年的判断），mnemonic剥不出只能按全文拦'),
+-- 接口丢包告警。txt 第 339 行 '01QOS/4/hwXQoSPacketsDropInterfaceAlarm'
+-- 是前缀写法，我们的 dict 要 mnemonic 全名，所以 _active / _clear 各一行。
+-- 现网 172.26.1.74 的 GE1/0/10 在刷这个：口协商成了 100M、CRC 15580，
+-- 突发打满队列就丢。丢包率 0.0099%，对一台办公PC无影响 ——
+-- 真要治是换线/换网卡，不是盯告警
+('QOS/4/hwXQoSPacketsDropInterfaceAlarm_active', 'mnemonic', '', 0, 1,
+ '接口丢包告警。突发打满队列所致，要治是查物理层不是看告警'),
+('QOS/4/hwXQoSPacketsDropInterfaceAlarm_clear', 'mnemonic', '', 0, 1,
+ '接口丢包恢复，上面那条的伴生日志'),
+-- PoE 剩下 3 条，txt 第 40/41/114 行都有。
+-- 上面已经配了 PORTPWR/PORTPW（功率回显），PD 插拔走 POE_PD_CHG 规则，
+-- 这三条补齐 PoE 这一类：非标PD、PD下电、PSE端口上下电
+('POE/4/NONSTANDARDPD', 'mnemonic', '', 0, 1,
+ '接到非标PD。办公网终端五花八门，是终端的事不是网络故障'),
+('POE/6/PDPOWEROFF', 'mnemonic', '', 0, 1,
+ 'PD下电。拔设备/PD自己断电都会打，和PDDISCONNECT同类'),
+('POE/1/PSE_PORT_ON_OFF_CHANGE', 'mnemonic', '', 0, 1,
+ 'PSE端口供电开关变化，PoE口日常通断的伴生日志'),
+-- 证书类。LOCAL_EXPIRED 原来走 CERT_EXPIRED 事件码按 P3 告警，现在拉黑
+-- （事件码和规则留着当开关，见文件末尾"死码清单"）。
+-- CA_VALID 来自 txt 第 33 行，一起配上，免得以后又冒出来
+('PKI/4/LOCAL_EXPIRED', 'mnemonic', '', 0, 1,
+ '设备本地证书过期。影响HTTPS管理/802.1X，但不是网络故障，走证书轮换流程'),
+('PKI/4/CA_VALID', 'mnemonic', '', 0, 1,
+ 'CA证书有效期提示，txt第33行已判为噪声'),
+-- License 类。上面已有 LICENSE-6-VIOLATION（用量超授权的周期提示），
+-- 这两条是 license 缺失/文件丢失的告警，txt 第 282/522 行都判过。
+-- 和 VIOLATION 一样：容量与授权的事走 license 审计，不进告警管线
+('LICMGR-2-LOG_LIC_MISSING_WARNING', 'mnemonic', '', 0, 1,
+ 'License缺失告警。授权问题走license审计，不是网络故障'),
+('LICMGR-3-LOG_LIC_FILE_MISSING', 'mnemonic', '', 0, 1,
+ 'License文件丢失，txt第522行已判为噪声，同族一起配');
 
 -- ============================================================
 -- 种子数据：L8 静默规则模板（三条，全部 enabled=0）
@@ -1026,6 +1272,47 @@ SELECT '^10[.]19[.]19[.]', '', '', '', '', 0,
 -- ============================================================
 
 -- ============================================================
+-- 死码清单：有规则有定级，但被 L2 黑名单挡在前面，永不命中
+--
+-- 这几个事件码的 syslog_rule / syslog_severity_rule 都还在表里，但它们的
+-- mnemonic 全部进了 syslog_black_list，日志在 L2 就被丢了，到不了 L3。
+-- 所以它们现在是死码 —— 查 alarm_log 永远查不到。
+--
+--   NTP_DROP          DAEMON-3-SYSTEM_MSG
+--   DHCP_TIMEOUT      DHCP/5/WAITOFFER_TIMEOUT
+--   CLOCK_CHG         SYSMIB/4/CLKCHANGE
+--   IF_ATTR_CHG       ETHPORT-5-SPEED / IF_DUPLEX /
+--                     IF_RX_FLOW_CONTROL / IF_TX_FLOW_CONTROL
+--   CERT_EXPIRED      PKI/4/LOCAL_EXPIRED
+--   BUFFER_THRESHOLD  被 scope=message 的 BUFFER_THRESHOLD_EXCEEDED 拦下。
+--                     它那条 syslog_rule 是 fuzzy（mnemonic 为空），
+--                     所以下面那条按 pattern 关联的自查 SQL 查不到它，
+--                     要单独看：
+--                     SELECT * FROM syslog_black_list
+--                      WHERE scope='message'
+--                        AND pattern='BUFFER_THRESHOLD_EXCEEDED';
+--
+-- 为什么留着不删：黑名单那一行就是开关。想重新看某一类，把
+-- syslog_black_list 里对应的 pattern 改 enabled=0，L3 的规则和定级原样
+-- 生效，立刻恢复识别 —— 不用重新配正则、重新核对现网正文。
+-- 反过来，删掉规则就得从头配一遍，而配错正则是这套表最容易踩的坑
+-- （DEV/1/FAN 那次就是 mnemonic 写错，白配一轮）。
+--
+-- 代价是查表的人会看到"有规则却没有数据"的事件码，所以写在这里。
+-- 想确认某个事件码是不是死码：
+--
+-- SELECT r.event_code, r.mnemonic,
+--        (SELECT b.enabled FROM syslog_black_list b
+--          WHERE b.scope='mnemonic' AND b.pattern = r.mnemonic
+--          LIMIT 1) AS 黑名单状态
+--   FROM syslog_rule r
+--  WHERE r.event_code = 'DHCP_TIMEOUT';
+--
+-- 黑名单状态=1 说明这条 mnemonic 被拦；一个事件码下所有 mnemonic 都是 1
+-- 才是死码（IF_ATTR_CHG 要四条都看）。
+-- ============================================================
+
+-- ============================================================
 -- 执行后自查：8 张表都在、种子数据条数对得上
 --
 -- SELECT table_name, table_rows FROM information_schema.tables
@@ -1035,18 +1322,29 @@ SELECT '^10[.]19[.]19[.]', '', '', '', '', 0,
 --                       'syslog_alarm_state','alarm_list','alarm_log');
 --
 -- 种子数据应为：
---   syslog_black_list     9  （其中 1 条 enabled=0 停用示例）
---   syslog_rule          47
+--   syslog_black_list    20  （全部 enabled=1，没有停用示例了）
+--   syslog_rule          49
 --   syslog_event         31  （含 3 个兜底码 + IF_FLAP）
---   syslog_severity_rule 23  （其中 1 条 enabled=0 停用示例）
+--   syslog_severity_rule 24  （其中 1 条 enabled=0 停用示例：BGP_UP）
 --   syslog_mute_rule      3  （全部 enabled=0，不静默任何告警）
 --   其余三张表是数据表，重建后为空
 --
--- SELECT count(*) FROM syslog_black_list;      -- 9
--- SELECT count(*) FROM syslog_rule;            -- 47
+-- SELECT count(*) FROM syslog_black_list;      -- 20
+-- SELECT count(*) FROM syslog_rule;            -- 49
 -- SELECT count(*) FROM syslog_event;           -- 31
--- SELECT count(*) FROM syslog_severity_rule;   -- 23
+-- SELECT count(*) FROM syslog_severity_rule;   -- 24
 -- SELECT count(*) FROM syslog_mute_rule;       -- 3
+--
+-- 黑名单里 17 条是 scope=mnemonic、3 条是 scope=message。
+-- 其中 9 条 mnemonic + 1 条 message 对应的 syslog_rule 仍在表里但永不命中
+-- （见上面"死码清单"）。这不是配置错误，是故意留的开关
+-- SELECT count(*) FROM syslog_black_list WHERE enabled=1;   -- 20
+--
+-- scope=message 这 3 条每条日志都要线性扫，实测 3 条约 0.1us、
+-- 剥一次 mnemonic 是 0.41us，所以现在这个量级可以忽略。
+-- 这一串要保持小：100 条就是 3.4us（8 倍剥 mnemonic），
+-- 能按 mnemonic 配的一律别放这里
+-- SELECT pattern FROM syslog_black_list WHERE scope='message';
 --
 -- 全局兜底定级规则必须存在，少了它加载时会打 error：
 -- SELECT * FROM syslog_severity_rule
@@ -1054,4 +1352,34 @@ SELECT '^10[.]19[.]19[.]', '', '', '', '', 0,
 --
 -- 确认没有启用中的静默规则，应返回 0：
 -- SELECT count(*) FROM syslog_mute_rule WHERE enabled=1;
+-- ============================================================
+
+-- ============================================================
+-- 升级：ignore 命中的事件改为写 alarm_list（status=5）
+--
+-- 之前的行为：L5 定级规则 action=ignore 判定不告警时，L7 直接返回、
+-- 不进状态机，L9 因为 notify=False 整个跳过——事件照常走 L6 写了
+-- alarm_log，但 alarm_list 没有对应行，变成查不到的孤儿数据
+-- （alarm_log 只留 7 天，7 天内想回看"这条口的 ignore 规则到底
+-- 命中了几次"都没有入口）。
+--
+-- 改成和 mute 一样的思路：ignore 命中也按指纹聚合写 alarm_list，
+-- 只是 state 固定是 idle（不开告警，没有"活跃"这回事）、status 固定
+-- 是 5（系统规则判定忽略，和人工操作的 0~4 分开），L9 不推通知。
+--
+-- 不是表结构变更，是列注释和合法取值范围的变化，不需要 ALTER 加列。
+-- 已经建过 alarm_list 的环境，想同步列注释（纯描述性，不影响功能）
+-- 可以手工执行：
+--
+-- ALTER TABLE alarm_list
+--     MODIFY COLUMN state VARCHAR(10) NOT NULL DEFAULT 'open'
+--         COMMENT 'open=告警中 clear=已恢复 idle=ignore判定不告警，没有活跃状态',
+--     MODIFY COLUMN status VARCHAR(1) NOT NULL DEFAULT '0'
+--         COMMENT '处理状态 0待处理1已确认2已处理3忽略4屏蔽5系统判定忽略，5由L9写入非人工操作';
+--
+-- 不改注释也能跑——代码不读列注释，只是看着容易把 status=5 和
+-- status=3（人工忽略）搞混。前端的处理状态下拉（current_alarm.vue
+-- 的 statusOptions/typeOptions）要分开看：typeOptions 是人工处理表单
+-- 可选值，不应该出现 5（人不该手动把一条告警标成"系统判定忽略"）；
+-- statusOptions 是筛选条件，应该加上 5 才能按它筛出这类事件。
 -- ============================================================

@@ -82,9 +82,11 @@ corp 职场的 rsw 掉口压根不用看（action=ignore）。定级必须排在
 
 命中 action=ignore 的规则时 state 变成第四个值：
 
-    ignore        不开告警。事件照样走完后面各层并写 alarm_log，
-                  只是 L7 不开告警，事后回看时这条日志还查得到。
-                  L7 的 MODE_IGNORE 对应这个值
+    ignore        不发通知。事件照样走完后面各层，L6 写 alarm_log，
+                  L7 按指纹聚合也写 alarm_list（status=5，不是人工操作
+                  能选的值），只是不进开/关告警的生命周期、不进闪断计数、
+                  L9 不推通知。写 alarm_list 是为了避免"alarm_log 有记录
+                  但看板查不到"的孤儿数据——L7 的 MODE_IGNORE 对应这个值
 
 到这里一条原子告警就齐了。后面各层的产出：
 
@@ -123,9 +125,22 @@ corp 职场的 rsw 掉口压根不用看（action=ignore）。定级必须排在
     L7 不往 event 上加字段，它产出一个独立的决策 dict，挂在
     event["decision"] 上：
 
-    action        str     none / raise / update / escalate / clear / ignore
-    notify        bool    要不要往下交。none 和 ignore 都是 False
-    state         str     open / idle，告警自身还成不成立
+    action        str     none / raise / update / escalate / clear /
+                          clear_orphan / clear_orphan_update /
+                          ignore_new / ignore_update
+                              none                开/关都不用做（累加、未到阈值、重复恢复）
+                              raise/update/escalate/clear  正常开关告警
+                              clear_orphan        恢复事件到了但没有活跃
+                                                  告警可关——故障发生在监控
+                                                  视野之外，仍落一行并通知
+                              clear_orphan_update 窗口内重复的孤立恢复，
+                                                  同一行累加 counter，不通知
+                              ignore_new/ignore_update  L5 判定不告警，
+                                                  按指纹聚合写 alarm_list，
+                                                  不通知
+    notify        bool    要不要发通知。none/ignore_new/ignore_update/
+                          clear_orphan_update 都是 False
+    state         str     open / idle / clear，告警自身还成不成立
     severity      int     闪断升级后是提过档的
     event_code    str     闪断升级后是 IF_FLAP，不是原来的 IF_DOWN
     counter       int     窗口内日志条数

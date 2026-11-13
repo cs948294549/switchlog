@@ -538,6 +538,7 @@ class EventAttrs(object):
             event["severity"] = DEFAULT_SEVERITY
             event["severity_rule_id"] = 0
             event["severity_name"] = severity_name(DEFAULT_SEVERITY)
+            self._inherit_ignore(event)
             return event
 
         event["severity"] = rule.severity
@@ -546,4 +547,33 @@ class EventAttrs(object):
         if rule.action == ACTION_IGNORE:
             # 事件照样往下走并落 ES，只是 L7 不开告警
             event["state"] = STATE_IGNORE
+            return event
+
+        self._inherit_ignore(event)
         return event
+
+    def _inherit_ignore(self, event):
+        """
+        恢复事件跟着故障事件一起 ignore
+
+        定级规则是按 event_code 配的，一条 ('IF_DOWN', '^rsw.*corp',
+        ignore) 只盖住 IF_DOWN。但"corp 职场接入口 down 不告警"说的是
+        整个 down/up 周期都不用看 —— 配对的 IF_UP 匹配不到那条规则，
+        会落全局兜底（正常告警），然后在 L7 发现没有活跃告警可关，
+        漏出一条 clear_orphan。规则的意图没实现，噪声还是全量进来。
+
+        所以恢复事件额外按它的故障码（raise_code，L6 算指纹也用它）
+        再查一次规则：故障码被 ignore，恢复事件跟着 ignore。
+
+        只继承 ignore，不继承 severity —— 级别本来就该各自判，
+        IF_UP 自己有行就用自己的。
+        """
+        raise_code = event.get("raise_code") or ""
+        if not raise_code:
+            # 自己就是故障码，没有要继承的
+            return
+        rule = self.grade_of(raise_code, event.get("ip"), event.get("sysname"))
+        if rule is not None and rule.action == ACTION_IGNORE:
+            event["state"] = STATE_IGNORE
+            # rule_id 记故障码那条 —— 排查时要能看出是哪条规则让它不告警
+            event["severity_rule_id"] = rule.rule_id

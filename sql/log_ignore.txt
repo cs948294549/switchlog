@@ -1,0 +1,675 @@
+==========log ignore==================
+日志关键字 包含 VFS/6/FILE_USR_CONFIRM_DEL
+日志关键字 包含 SHELL/5/SETPASS_FAIL_FIRSTLOGIN
+日志关键字 包含 PIM/6/ASSERT_CHANGE
+日志关键字 包含 SSH/4/SFTP_REQ_RECORD
+日志详情 包含 TRUSTED ROOT CA updates signature failed
+日志关键字 包含 UPDATE/4/FAILURE
+日志关键字 包含 MQC/6/POLICY_ACL_LOG
+日志关键字 包含 CFM/4/B2S_BACKUP_FAILED
+日志关键字 包含 MSTP/4/SET_PORT_LEARNING
+日志关键字 包含 MSTP/4/SET_PORT_FORWARDING
+日志关键字 包含 DHCP/5/WAITOFFER_TIMEOUT
+日志关键字 包含 CONFIGURATION/5/SAVE_FILE_RECORD
+日志关键字 包含 CONFIGURATION/4/CFM_TRANS_FILE
+日志关键字 包含 ACLE/4/ACLLOG
+日志关键字 包含 DHCP/5/RENEW
+日志关键字 包含 USB_CONSOLE-6-MEDIA_RJ45
+日志详情 包含 prod_rel_team
+日志详情 包含 Cisco IOS Software
+日志详情 包含 Copyright (c) 1986-2020 by Cisco Systems, Inc.
+日志关键字 包含 SSH-5-ENABLED
+日志详情 包含 Technical Support: http://www.cisco.com/techsuppor
+日志关键字 包含 CFM/4/CFM_TRANS_FILE
+日志关键字 包含 SHELL/6/CMDCONFIRM_RECORD
+日志关键字 包含 QOS/4/CONGESTIONRISK
+日志关键字 包含 IFPDT/4/PKT_OUTQUEDROP_NL
+日志关键字 包含 IFPDT/4/PKT_OUTQUEDROP_ABNL
+日志关键字 包含 AAA/6/LOCALACCOUNT_MODIFY
+日志关键字 包含 USERS/5/HIDADD
+日志关键字 包含 SSH/5/SSH_SERVER_REKEY
+日志关键字 包含 CFM/4/CFM_CLEARINTERFACECFG
+日志关键字 包含 CLEAR-5-COUNTERS
+日志关键字 包含 PKI/4/CA_VALID
+日志关键字 包含 CFM/5/SAVE_FILE_RECORD
+日志关键字 包含 SEC_LOGIN-5-LOGIN_SUCCESS
+日志关键字 包含 SYS-6-TTY_EXPIRE_TIMER
+日志关键字 包含 SYS-6-LOGOUT
+日志关键字 包含 MANAGER/6/CURRENT_USER_MODIFY_PASSWORD
+日志关键字 包含 DHCP_SNOOPING-4-NTP_NOT_RUNNING
+日志关键字 包含 POE/4/NONSTANDARDPD
+日志关键字 包含 POE/6/PDPOWEROFF
+日志关键字 包含 IFPDT/4/INT_OUTBRDR
+日志关键字 包含 SSP_ADP/6/FILEDEL
+日志关键字 包含 HTTPD/6/PASS
+日志关键字 包含 IFPDT/4/INT_INBRDR
+日志详情 包含 OID
+日志关键字 包含 ACM/4/LOGIN_SUCCEED
+日志关键字 包含 HTTPD/4/FAIL
+日志关键字 包含 SNMP/6/TRAPCMDRECORD_YES
+日志关键字 包含 POLICY/6/POLICYPERMIT
+日志详情 包含 LLDP/4/NBRCHGTRAP
+日志关键字 包含 LLDP/4/NBRCHGTRAP
+日志关键字 包含 01SSH/5/SSHC_INSECURE_LOGIN(s)
+日志关键字 包含 POE/6/PORTPW
+日志详情 包含 Registered attributes for
+日志关键字 包含 DAEMON-6: pvidb_add_attribute
+日志关键字 包含 DAEMON-6: ch_config_get_dynamic_pwr_mgmt_state
+日志关键字 包含 NTP/4/PEER_LOCALADDR_USED
+日志关键字 包含 NTP/4/PEER_LOCALADDR_USEING
+日志关键字 包含 LOAD/5/LOAD_LOGID_BACKUP_SUCCESS
+日志详情 包含 : Add row:
+日志关键字 包含 SNMP/5/SNMP_LOG_IP_UNLOCK
+日志关键字 包含 SNMP/5/SNMP_IP_LOCK
+日志详情 包含 SSMPADP/4/AUTHENTICAL_FAIL
+日志详情 包含 HWCM/4/CFGCHANGE
+日志关键字 包含 DEFD/4/CPCAR_DROP_MPU
+日志关键字 包含 LINE/4/LOCK_IP
+日志关键字 包含 LINE/4/UNLOCK_IP
+日志关键字 包含 NTP/4/PACKET_LENGTH_WRONG
+日志关键字 包含 SHELL/5/USERCONFIRM
+日志详情 包含 IFPDT/4/OutputRateChangeOverThresholdNotice
+日志关键字 包含 FLOWCONTROL-4-PAUSE_FRAME_RECEIVED
+日志详情 包含 Operation@MGMT: Operation log
+日志详情 包含 Event@NET: step NTP server
+日志详情 包含 IFPDT/4/InputRateChangeOverThresholdNotice:
+日志关键字 包含 LOCATION/3/ONLINEUPDATEFAIL
+日志关键字 包含 SNMPADAPT/4/UPDATE_FAIL
+日志详情 包含 Plugin installed for stout_
+日志关键字 包含 SNMP/4/hwSNMPReset
+日志关键字 包含 USERS/4/HIDINVALID
+日志关键字 包含 USERS/4/HIDCHECKFAIL
+日志关键字 包含 ADMIN/5/HIDAPP
+日志关键字 包含 ADMIN/5/VGSIPSPLYADD
+日志关键字 包含 AAA/4/AUTH_TAC_FAILED
+日志关键字 包含 USERS/4/USRPWDERR
+日志详情 包含 The system clock successfully updated
+日志关键字 包含 ADMIN/5/HSMAXSVPNU
+日志关键字 包含 DAEMON-6: sighup_event
+日志关键字 包含 sampled_read_config
+日志关键字 包含 HTTPD/4/DOWNLOAD
+日志关键字 包含 ADMIN/5/GL2TPAES
+日志关键字 包含 ADMIN/5/UGROUPRESOURCEGROUPBIND
+日志关键字 包含 ADMIN/5/GSVNAES
+日志关键字 包含 HTTPD/4/OUT
+日志关键字 包含 HTTPD/4/PASS
+日志关键字 包含 ADMIN/5/USERBINDACL
+日志关键字 包含 USERS/5/EXPIREUSER
+日志关键字 包含 USERS/5/NESRV
+日志关键字 包含 USERS/5/LOGOUT
+日志关键字 包含 USERS/5/LOGINSUC
+日志关键字 包含 USERS/4/VGPLYDENY
+日志关键字 包含 HWCM/4/EXIT
+日志关键字 包含 SHELL/5/AUTHCMDNONEED
+日志关键字 包含 SEC/5/STREAM
+日志关键字 包含 SSH/6/ACCEPT
+日志关键字 包含 SYSLOG-6-DEBUG_PRINT
+日志详情 包含 <Broadcast Multicast> address
+日志详情 包含 SSH-6-SSH_OPERATION
+日志详情 包含 Event@SECURITY: The user
+日志关键字 包含 DPI/4/DAC_STORE_STATE_FULL
+日志关键字 包含 DPI/4/DAC_STORE_DELETE_FILE
+日志关键字 包含 SSH/4/IP_LOCKED
+日志关键字 包含 OPTMOD/4/OPTMOD_COUNTERFEIT_MODULE
+日志关键字 包含 POE/1/PSE_PORT_ON_OFF_CHANGE
+日志关键字 包含 KERN-6-KERN_ARP_ADDR_CHANGE
+日志关键字 包含 IPV6/2/IF_IPV6CHANGE
+日志关键字 包含 LACP/3/LAG_DOWN_REASON_EVENT
+日志关键字 包含 RM/4/IPV4_DEFT_RT_CHG
+日志关键字 包含 IFNET/6/IF_INFO_CHANGE
+日志关键字 包含 SSHS/6/SSHS_SCP_OPER
+日志详情 包含 Event@NET: ARP entry
+日志详情 包含 Event@NET: Failed to execute configuration command
+日志详情 包含 Event@NET: configuration command
+日志详情 包含 Event@SECURITY: The user "NETOA"
+日志关键字 包含 USER-2-PAM_TACPLUS_SEND_AUTHEN_FAIL
+日志关键字 包含 ROUTING-ISIS-6-INFO_ISPF_DEPRECATED
+日志关键字 包含 HA-HA_WD_LIB-6-REG_PROC_SUCCESS
+日志关键字 包含 ROUTING-BGP-5-ASYNC_IPC_STATUS
+日志关键字 包含 DIAG-DIAG-6-RUN_MINIMUM
+日志关键字 包含 MGBL-CONFIG-6-OIR_RESTORE
+日志详情 包含 Login attempt for user
+日志详情 包含 LOGIN FAILURE ON
+日志关键字 包含 AUTH-5-LOGIN_ATTEMPTS_THRESHOLD
+日志关键字 包含 AUTH-5-LOGIN_FAILED
+日志详情 包含 Reroute-start due to Selector change selector token
+日志详情 包含 Reroute-done Selector token
+日志关键字 包含 DAEMON-6-RPD_IFD_NOTIFICATION
+日志详情 包含 cmic_phy_dfe_tuning_state
+日志详情 包含 cmic_plat_dfe_coarse_tuning_start
+日志详情 包含 cmic_plat_dfe_coarse_tuning_stop
+日志关键字 包含 KERN-4: tcp_auth_ok
+日志详情 包含 ARP UNICAST MODE
+日志关键字 包含 DAEMON-6-RPD_RT_NAMEINDEX_INFO
+日志关键字 包含 DAEMON-6-JTASK_SIGNAL_INFO
+日志关键字 包含 DAEMON-6-RPD_COMMIT_SYNC_INFO
+日志详情 包含 jam_pic_plugin_initd
+日志关键字 包含 DAEMON-6: mpc7_coef_setup
+日志详情 包含 JAM Entry
+日志详情 包含 Entry libgld_register_pic_attribs
+日志详情 包含 PLUGIN: mpc8_fabric_setup
+日志详情 包含 Exit libgld_register_pic_attribs ret 0
+日志详情 包含 acquiring mastership for primary
+日志详情 包含 ch_config_get_dynamic_pwr_mgmt_state
+日志详情 包含 Skipped marking address
+日志关键字 包含 DAEMON-6-LLDP_NEIGHBOR_DOWN
+日志详情 包含 LOGGING-3
+日志详情 包含 Event@SECURITY: Start scan session
+日志详情 包含 Event@MGMT
+日志详情 包含 link_speed 6.220800
+日志详情 包含 user.info aftd-trio: [Info] RSMON
+日志详情 包含 LOG-4: user=
+日志详情 包含 Traffic@FLOW: SESSION
+日志详情 包含 Traffic@FLOW: NAT
+日志详情 包含 Configuration@MGMT
+日志详情 包含 Event@AAA
+日志详情 包含 Event@SYS: IPGEO updates signature failed
+日志详情 包含 Event@SYS: APP updates signature failed
+日志详情 包含 All PIC/MIC plugins are installed for jam-mpc
+日志详情 包含 INIT: jam_mpc
+日志关键字 包含 DAEMON-6-SAMPLED_TRACE: sighup_event
+日志详情 包含 CMT: fpc
+日志详情 包含 set hold-pic-online
+日志详情 包含 EVENT <Bandwidth>
+日志详情 包含 Received IPv6 address
+日志详情 包含 In config_mode returning for
+日志详情 包含 user.notice aftd-trio: [Notice]
+日志详情 包含 Received Sampling Change IPC message
+日志详情 包含 There is no change in params. so ignoring change
+日志关键字 包含 OPS/5/OPS_RESTCONF_REQ
+日志关键字 包含 DAEMON-6-SAMPLED_READ_CONFIG
+日志关键字 包含 DAEMON-3-UI_CONFIGURATION_ERROR
+日志关键字 包含 USER-6-DH_SVC_CHECKING_RUN_MODE_TO_SLEE
+日志关键字 包含 DAEMON-5-RPD_COMMIT_JOBS_STATUS
+日志关键字 包含 DAEMON-6-LLDP_NEIGHBOR_UP
+日志关键字 包含 DAEMON-6-RPD_IFA_NOTIFICATION
+日志关键字 包含 SYS-5-CLI_SCHEDULER_ENABLED
+日志关键字 包含 DAEMON-5-RPD_COMMIT_SYNC_STATUS
+日志详情 包含 jam_fasic_scbe3_coef_init registering
+日志详情 包含 received configuation
+日志关键字 包含 DAEMON-5-RPD_RT_TIME_AVRGD_WM_NOTICE
+日志关键字 包含 CHANGE-6-UI_CFG_AUDIT_OTHER
+日志详情 包含 jam_plugin_init
+日志关键字 包含 DAEMON-6: ppmlite_var_init
+日志关键字 包含 DAEMON-6: fasic_create_overwrite
+日志详情 包含 ted_client reset
+日志关键字 包含 DAEMON-6: fasic_i2c_read_get_chip_type
+日志关键字 包含 DAEMON-6: jam_plugin_init
+日志关键字 包含 USER-6-IFINFO_IFD_NAME: IFD
+日志关键字 包含 DAEMON-5-RPD_RT_HWM_NOTICE
+日志关键字 包含 INTERACT-6-UI_AUTH_EVENT
+日志关键字 包含 INTERACT-6-UI_CHILD_STATUS
+日志关键字 包含 AUTH-6
+日志详情 包含 Plugin installed for stout_mic_
+日志关键字 包含 DAEMON-6: jam_core_fabric_attrib_set
+日志关键字 包含 DAEMON-6: JAM:PL
+日志关键字 包含 DAEMON-6: jam_ops_overwrite
+日志关键字 包含 CHANGE-6-UI_CFG_AUDIT_SET
+日志关键字 包含 INTERACT-6-UI_CHILD_START
+日志关键字 包含 DAEMON-6-UI_COMMIT_NO_MASTER_PASSWORD
+日志关键字 包含 INTERACT-6-UI_COMMIT_PROGRESS
+日志关键字 包含 INTERACT-6-UI_LOGIN_EVENT
+日志关键字 包含 USER-6-UI_CLI_IDLE_TIMEOUT
+日志关键字 包含 INTERACT-6-UI_LOGOUT_EVENT
+日志关键字 包含 CRON-6
+日志关键字 包含 INTERACT-6-UI_CMDLINE_READ_LINE
+日志关键字 包含 OPS/5/OPS_RESTCONF_RSP
+日志详情 包含 Cannot scan phys_mem_size.out
+日志关键字 包含 LLDP/4/hwLldpInterfaceNeighborChange
+日志关键字 包含 AUTH-5-SSHD_LOGIN_ATTEMPTS_THRESHOLD
+日志关键字 包含 DAEMON-6-CHASSISD_PARSE_COMPLETE
+日志详情 包含 Unable to get ifd speed from pic hwdb
+日志详情 包含 no configured link-speed
+日志关键字 包含 DAEMON-6: jam_plugin_set_fabric_params
+日志详情 包含 Software caused connection abort
+日志详情 包含 DAEMON-6-LLDP_NEIGHBOR_DOWN
+日志关键字 包含 UM/4/LOGONFAIL
+日志关键字 包含 AUTH-2: fatal
+日志关键字 包含 FTP-5
+日志详情 包含 No change to profiles
+日志详情 包含 SNMP Filter Interface configuration success
+日志详情 包含 load-update done
+日志详情 包含 load-update start
+日志关键字 包含 NTERACT-5-UI_LOAD_EVENT
+日志关键字 包含 DAEMON-6: ttloop
+日志关键字 包含 AUTH-5-SSHD_LOGIN_FAILED
+日志关键字 包含 AUTH-5-SNMPD_AUTH_FAILURE
+日志详情 包含 NTP_TRAP_SYNCHRONIZE_STATUS
+日志关键字 包含 AUTH-5: (pam_sm_authenticate)
+日志详情 包含 hw.chassis.startup_time update to
+日志详情 包含 kernel time sync enabled
+日志关键字 包含 INTERACT-5-UI_DBASE_LOGIN_EVENT
+日志关键字 包含 AUTH-5: (pam_sm_acct_mgmt)
+日志关键字 包含 INTERACT-5-UI_COMMIT
+日志关键字 包含 DAEMON-6-PING_TEST_COMPLETED
+日志关键字 包含 INTERACT-5-UI_DBASE_LOGOUT_EVENT
+日志详情 包含 logged out through
+日志详情 包含 logined through
+日志关键字 包含 AAA-4-AUTHN_FALLBACK
+日志关键字 包含 AAA-4-AUTHZ_FALLBACK
+日志详情 包含 logged out through SSH
+日志详情 包含 logined through SSH
+日志详情 包含 save system configuration via SSH.
+日志关键字 包含 CONFIGURATION/6/hwCfgConfigChangeLog
+日志关键字 包含 SSHS/6/SSHS_AUTHOR_FAIL
+日志关键字 包含 NULL/6/SSHS_SCP_OPER
+日志详情 包含 VIRTUAL SERVICE guestshell+ LOG
+日志关键字 包含 DAEMON-3-MIB2D_FILE_OPEN_FAILURE
+日志关键字 包含 CFGLOG/6/CFGLOG_CFGOPERATE
+日志关键字 包含 LS/5/LS_AUTHOR_FAILURE(l)
+日志关键字 包含 BGP-3-NOTIFICATION
+日志关键字 包含 TACACS/6/TACACS_AUTHOR_SERVER_UP
+日志关键字 包含 BFD-5-SESSION_MOVED
+日志关键字 包含 BFD-5-SESSION_CREATED
+日志关键字 包含 BFD-5-SESSION_REMOVED
+日志关键字 包含 BGP/6/NOTIFY_RECV
+日志关键字 包含 CFM/5/BACKUPCONFIG_CANCEL
+日志关键字 包含 RM/4/RM_DELETE_DEFAULTRT
+日志关键字 包含 RM/4/RM_ADD_DEFAULTRT
+日志关键字 包含 ROUTING-FIB-4-RETRYDB_NONEMPTY
+日志关键字 包含 USER-3-EVENTD_CONFIG_CHANGE_SUCCESS
+日志关键字 包含 01FTPS/3/FTPS_USER_LOGIN_FAIL
+日志详情 包含 SRM_BASE/6/CPUUTILIZATIONRESUME: OID 1.3.6.1.4.1.2011.5.25.129.2.4.2
+日志关键字 包含 10SSHS/6/SSHS_AUTH_KBDINT_FAIL
+日志关键字 包含 10TACACS/6/TACACS_ACCT_SERVER
+日志关键字 包含 SSHS/6/SSHS_MAC_ERROR
+日志关键字 包含 SECURITY-SSHD-6-INFO_CLIENT_LOGOUT
+日志关键字 包含 SECURITY-SSHD-6-INFO_CLIENT_LOGIN
+日志详情 包含 Configuration propagation successful for config type 0
+日志详情 包含 Copy of running configuration to backup
+日志详情 包含 Copy file running-config to startup-config
+日志详情 包含 message repeated
+日志关键字 包含 LICMGR-2-LOG_LIC_MISSING_WARNING
+日志关键字 包含 LOGIN/5/LOGIN_AUTHENTICATION_FAILED
+日志关键字 包含 AAA-6-USER_AUTH_PASSED
+日志详情 包含 message repeated 4 times
+日志关键字 包含 LLDP-4-CREATEREM
+日志关键字 包含 LLDP-4-AGEOUTREM
+日志详情 包含 lcnd: size 10 is less than expected - kernel
+日志关键字 包含 DAEMON-3: task_set_option_internal
+日志关键字 包含 DRIVER/4/FREQCLOCKSTATUSFAULTRESUME
+日志关键字 包含 DRIVER/4/FREQCLOCKSTATUSFAULT
+日志详情 包含 message repeated 3 times
+日志关键字 包含 DAEMON-3-SYSTEM_MSG
+日志关键字 包含 HWCM/4/CFGCHANGE
+日志关键字 包含 LINE/5/VTYUSERLOGOUT
+日志详情 包含 Vxlan-InnerIp size
+日志关键字 包含 MGBL-NVGEN-3-SYSDBOPERATION
+日志关键字 包含 01NTP/4/hwNtpSysPeerChangeTrap(t)
+日志关键字 包含 01VTY/3/hwVtyExceed_clear
+日志关键字 包含 LOCALSVR/6/LOCALSVR_PROMPTED_CHANGE_PWD
+日志关键字 包含 10FTP/3/AUTH
+日志关键字 包含 01VTY/3/hwVtyExceed_active
+日志关键字 包含 01LINE/4/LOGIN_FAIL(s)
+日志关键字 包含 VSHD-5-VSHD_SYSLOG_CMD_EXEC
+日志关键字 包含 01DEBUG/6/DBG_HEALTH(l)
+日志关键字 包含 ASCII-CFG-2-CONFIG_REPLAY_STATUS
+日志关键字 包含 ASCII-CFG-2-CONF_CONTROL
+日志关键字 包含 VMAN-5-PACKAGE_SIGNING_LEVEL_ON_INSTALL
+日志关键字 包含 VMAN-2-ACTIVATION_STATE
+日志关键字 包含 VMAN-2-GUESTSHELL_ENABLED
+日志关键字 包含 KERN-3: mld6_input
+日志关键字 包含 PKG/5/PKG_INSTALL_ACTIVATE_SUCCESS
+日志关键字 包含 IFNET/4/IF_BUFFER_CONGESTION_OCCURRENCE
+日志关键字 包含 SPANTREE-6-STABLE_CHANGE
+日志关键字 包含 LLDP-5-NEIGHBOR_GONE
+日志关键字 包含 SYS-5-CONFIG_E
+日志关键字 包含 QOS/4/hwXQoSIfCarDiscardAlarm_active
+日志关键字 包含 CONFIGURATION/4/CONFIGMIB_FILE_OPERATE_FINISH
+日志关键字 包含 SSH/5/SSHC_LOGIN_FAIL
+日志关键字 包含 SSH/5/SSHC_DISCONNECT
+日志关键字 包含 SECURITY-6-SESSION_IDLE_TIMEOUT
+日志关键字 包含 SYS-5-CONFIG_STARTUP
+日志关键字 包含 NETCONF/5/hwNetconfServerSessionEnd
+日志关键字 包含 NETCONF/5/hwNetconfServerSessionStart
+日志关键字 包含 LLDP-5-NEIGHBOR_TIMEOUT
+日志关键字 包含 01FTP/6/FTPC_FILE_TRANSFER
+日志关键字 包含 10SSHS/6/SSHS_AUTH_FAIL
+日志关键字 包含 MGBL-exec-3-LOGIN_AUTHEN
+日志关键字 包含 01BGP/6/BNM_PEER_SWITCHIN_SENDING_LIST
+日志关键字 包含 01BGP/6/EOR_SENT
+日志关键字 包含 01IFNET/4/BWRATE_
+日志关键字 包含 PHY/6/PACKETDROP
+日志关键字 包含 01SHELL/6/CMDCONFIRM_NOPROMPT
+日志关键字 包含 01INFO/6/SUPPRESS_LOGINFO
+日志关键字 包含 01HTTPD/5/PASS
+日志关键字 包含 01HTTPD/5/OUT
+日志关键字 包含 10PING/6/PING_LOG
+日志关键字 包含 LLDP-5-NEIGHBOR_NEW
+日志关键字 包含 01QOS/4/hwXQoSPacketsDropInterfaceAlarm
+日志关键字 包含 MGBL-RS232-3-FRAMING_ERRO
+日志关键字 包含 01QOS/6/QOS_PACKET_DROP
+日志关键字 包含 ACCOUNTING-6-CMD
+日志关键字 包含 SYS-5-CLI_SCHEDULER_SKIP
+日志关键字 包含 BUFFER_THRESHOLD_EXCEEDED
+日志关键字 包含 SECURITY-6-SESSION-IDLE-TIMEOUT
+日志关键字 包含 TACACS+
+日志关键字 包含 AUTHPRIV-4-SYSTEM_MSG
+日志关键字 包含 PLATFORM-OPTICS_MODULE-2-DEV_OPTICS_PID_NOT_SUPPORTED
+日志关键字 包含 PLATFORM-OPTICS_MODULE-2-DEV_OPTICS_COMPLIANCE_ERROR
+日志关键字 包含 SECURITY-SSHD-3-ERR_DETAILS
+日志详情 包含 UI_CHILD_START
+日志详情 包含 UI_CHILD_STATUS
+日志详情 包含 UI_CMDLINE_READ_LINE
+日志详情 包含 UI_COMMIT_PROGRESS
+日志详情 包含 UI_LOGIN_EVENT
+日志详情 包含 UI_DBASE_LOGIN_EVENT
+日志详情 包含 daemon.info smartd
+日志详情 包含 UI_CFG_AUDIT_SET
+日志详情 包含 UI_CFG_AUDIT_OTHER
+日志详情 包含 UI_DBASE_LOGOUT_EVENT
+日志详情 包含 UI_COMMIT
+日志详情 包含 UI_AUTH_EVENT
+日志详情 包含 UI_LOGOUT_EVENT
+日志详情 包含 UI_COMMIT_COMPLETED
+日志详情 包含 user.debug jsntp
+日志详情 包含 kex algo not supported
+日志详情 包含 last message repeated
+日志详情 包含 exceeding threshold value 6144
+日志详情 包含 The current running configuration cannot be backup
+日志关键字 包含 SSHS/5/SSHS_ACL_DENY
+日志关键字 包含 LLDP/5/LLDP_PVID_INCONSISTENT
+日志关键字 包含 TELNETD/5/TELNETD_ACL_DENY
+日志关键字 包含 SHELL/6/SHELL_CMD
+日志关键字 包含 OPTMOD/4/PHONY_MODULE
+日志关键字 包含 SSHS/6/SSHS_LOG
+日志关键字 包含 SHELL/6/DISPLAY_CMDRECORD
+日志关键字 包含 CLI/5/CMDRECORD
+日志关键字 包含 SHELL/5/SHELL_LOGOUT
+日志关键字 包含 SSHS/6/SSHS_DISCONNECT
+日志关键字 包含 LOGIN/5/LOGIN_FAILED
+日志关键字 包含 SSHS/6/SSHS_CONNECT
+日志关键字 包含 LLDP/4/hwLldpInterfaceRemTablesChange
+日志关键字 包含 SHELL/4/SHELL_CMD_MATCHFAIL
+日志关键字 包含 DRVPLAT/2/DrvDebug
+日志关键字 包含 LLDP/4/lldpRemTablesChange
+日志关键字 包含 CLI/5/LOGOUT
+日志关键字 包含 CLI/5/LOGIN
+日志关键字 包含 SSH/5/SSH_USER_LOGOUT
+日志关键字 包含 SSH/5/SSH_USER_LOGIN
+日志关键字 包含 SSH/5/SSH_INSECURE_LOGIN
+日志关键字 包含 NTP-6-STRATUM
+日志关键字 包含 SC/6/SC_AAA_LAUNCH
+日志关键字 包含 SC/6/SC_AAA_SUCCESS
+日志关键字 包含 LLDP/6/LLDP_CREATE_NEIGHBOR
+日志关键字 包含 LOGIN/5/LOGIN_INVALID_USERNAME_PWD
+日志关键字 包含 SOCKET/6/TCP_SYNFLOOD
+日志关键字 包含 SSHS/6/SSHS_AUTH_EXCEED_RETRY_TIMES
+日志关键字 包含 SECIF/6/STREAM
+日志关键字 包含 CFGMAN/5/CFGMAN_CFGCHANGED
+日志关键字 包含 LACP/2/hwLacpTotalLinkLoss_clear
+日志关键字 包含 INFO/4/hwICLogFileAging
+日志关键字 包含 LLDP/5/LLDP_NEIGHBOR_AGE_OUT
+日志关键字 包含 SHELL/5/SHELL_LOGIN
+日志关键字 包含 SHELL/4/LOGIN
+日志关键字 包含 SHELL/4/LOGOUT
+日志关键字 包含 NTP/4/NTP_STRATUM_CHANGE
+日志关键字 包含 NTP/4/NTP_PEER_SELE
+日志关键字 包含 NTP/4/NTP_LEAP_CHANGE
+日志关键字 包含 NTP/2/NTP_SYNCHRONIZE_STATUS
+日志关键字 包含 OPTMOD/4/MODULE_IN
+日志关键字 包含 SHELL/4/SHELL_CMD_EXECUTEFAIL
+日志关键字 包含 OPTMOD/4/MODULE_OUT
+日志关键字 包含 SHELL/6/SHELL_SECLOG
+日志关键字 包含 SHELL/6/SHELL_CMD_INPUT
+日志关键字 包含 NTP/4/STRATUM_CHANGE
+日志关键字 包含 NTP/4/PEER_SELE
+日志关键字 包含 NTP/4/LEAP_CHANGE
+日志关键字 包含 NTP/4/SOURCE_LOST
+日志关键字 包含 SSH/6/SSH_LOGIN
+日志关键字 包含 SSH/4/TrapLogin
+日志关键字 包含 SSH/4/TrapLogoff
+日志关键字 包含 PING/6/PING_STATIS_INFO
+日志关键字 包含 PING/6/PING_STATISTICS
+日志关键字 包含 NTP/5/NTP_CHANGE_STRATUM
+日志关键字 包含 SSH/6/SSH_CONNECTION_CLOSE
+日志关键字 包含 FTP/6/AUTH
+日志关键字 包含 CFGMAN/4/TRAP
+日志关键字 包含 SSHS/6/SSHS_REACH_SESSION_LIMIT
+日志关键字 包含 LOGIN/6/LOGIN_FAILED
+日志关键字 包含 SSHS/6/SSHS_AUTH_TIMEOUT
+日志关键字 包含 SSH/5/SSH_USER_LOGIN_FAIL
+日志关键字 包含 FTP/4/AUTH
+日志关键字 包含 DEVM/1/hwIfMonitorCrcErrorRising_clear
+日志关键字 包含 DEVM/1/hwIfMonitorCrcErrorRising_active
+日志关键字 包含 NTP/5/NTP_STRATUM_CHANGE
+日志关键字 包含 SSH/6/SSH_LOGOUT
+日志关键字 包含 SSHS/6/SSHS_VERSION_MISMATCH
+日志关键字 包含 NTP/5/NTP_CHANGE_LEAP
+日志关键字 包含 CLI/5/INTER_CMDRECORD
+日志关键字 包含 SHELL/6/SHELL_CMD_CONFIRM
+日志关键字 包含 SHELL/5/SHELL_CMDDENY
+日志关键字 包含 PKEY/6/PKEY_CREATE_HOST_KEY_SUCC
+日志关键字 包含 SSH/5/SSH_USER_LOGIN_FAIL_SCHD
+日志关键字 包含 NTP/2/hwNtpStateChangeTrap
+日志关键字 包含 PING/6/PING_VPN_STATISTICS
+日志关键字 包含 PING/6/PING_VPN_STATIS_INFO
+日志关键字 包含 INFO/4/SUPPRESS_LOG
+日志关键字 包含 NTP/5/NTP_CLOCK_CHANGE
+日志关键字 包含 INFO/6/LOGFILE_DELETED
+日志关键字 包含 SSHS/6/SSHS_ALGORITHM_MISMATCH
+日志关键字 包含 NTP/5/NTP_SOURCE_LOST
+日志关键字 包含 CLI/5/LOGINFAILED
+日志关键字 包含 DEVM/1/hwOpticalRemove_clear
+日志关键字 包含 DEVM/1/hwOpticalRemove_active
+日志关键字 包含 SHELL/5/LOGIN
+日志关键字 包含 OPTMOD/3/CFG_ERR
+日志关键字 包含 SHELL/5/LOGOUT
+日志关键字 包含 CM/5/USER_OFFLINERESULT
+日志关键字 包含 UPDATE/4/DOWNLOAD_FAIL
+日志关键字 包含 PWDCTL/6/ADDBLACKLIST
+日志关键字 包含 HWTACACS/5/HWTACACS_SERVER_DOWN
+日志关键字 包含 CFGMAN/5/CFGMAN_EXIT_FROM_CONFIGURE
+日志关键字 包含 CFGMAN/5/CFGMAN_EXIT
+日志关键字 包含 CLI/5/CMDRECORDFAILED
+日志关键字 包含 NTP/5/NTP_LEAP_CHANGE
+日志关键字 包含 LLDP/6/LLDP_DELETE_NEIGHBOR
+日志关键字 包含 SHELL/5/SHELL_LOGINFAIL
+日志关键字 包含 SSH/4/TrapAuthFailed
+日志关键字 包含 LIC/4/LICENSE
+日志关键字 包含 SC/5/SC_AAA_FAILURE
+日志关键字 包含 WEB/5/LOGIN_FAILED
+日志关键字 包含 ACG/4/APR_LICENSE_UNAVAILABLE
+日志关键字 包含 IPS/4/IPS_LICENSE_UNAVAILABLE
+日志关键字 包含 SSH/4/SSHS_IP_BLOCK_CLIENT
+日志关键字 包含 ANTI-VIR/4/AV_LICENSE_UNAVAILABLE
+日志关键字 包含 FEI_COMM/4/hwMflpVlanLoopAlarm_active
+日志关键字 包含 SSHC/6/SSHC_LOG
+日志关键字 包含 FEI_COMM/4/hwMflpVlanLoopAlarm_clear
+日志关键字 包含 OPTMOD/4/FIBER_SFPMODULE_NOWINVALID
+日志关键字 包含 AAA/5/USER_ATTRIBUTE_CHANGE
+日志关键字 包含 HA/5/HA_BATCHBACKUP_FINISHED
+日志关键字 包含 HA/5/HA_BATCHBACKUP_STARTED
+日志关键字 包含 NTP/5/NTP_SOURCE_CHANGE
+日志关键字 包含 FTP/6/LOGOUT
+日志关键字 包含 QOS/4/QOS_POLICY_APPLYIF_CBFAIL
+日志关键字 包含 FTP/5/OPER
+日志关键字 包含 DEVM/4/hwIfMonitorOutputRateRising_clear
+日志关键字 包含 SCMD/5/JOBINFO
+日志关键字 包含 DEVM/4/hwIfMonitorOutputRateRising_active
+日志关键字 包含 STKUNIT0-S
+日志关键字 包含 SHELL/4/LOGINFAILED
+日志关键字 包含 WEB/5/LOGOUT
+日志关键字 包含 SNMP/4/SNMP_SILENT
+日志关键字 包含 CFM/5/CFM_SAVECONFIG_SUCCESSFULLY
+日志关键字 包含 WEB/5/LOGIN
+日志关键字 包含 SHELL/4/LOGINAUTHFAIL
+日志关键字 包含 SYSEVENT/6/EVENT_TIMEOUT
+日志关键字 包含 TELNET/5/ACL_DENY
+日志关键字 包含 FTP/6/OPER
+日志关键字 包含 SHELL/5/TIMEOUT
+日志关键字 包含 PWDCTL/6/CHANGEPASSWORD
+日志关键字 包含 DEVM/4/hwIfMonitorInputRateRising_active
+日志关键字 包含 OPS/5/OPS_LOGIN
+日志关键字 包含 STP/6/STP_DISABLE
+日志关键字 包含 TELNET/5/FAIL_CONNECT_DUE_WRONG_CONFIG
+日志关键字 包含 DEVM/4/hwIfMonitorInputRateRising_clear
+日志关键字 包含 OPS/5/OPS_LOGOUT
+日志关键字 包含 DEVM/1/hwOpticalUnAuthorized_active
+日志关键字 包含 LOGIN/6/LOGIN_INVALID_USERNAME_PWD
+日志关键字 包含 AAA/5/ADD_NEW_USER_SECURITY
+日志关键字 包含 DEVM/1/hwOpticalUnAuthorized_clear
+日志关键字 包含 EVB/4/EVB_NO_LICENSE
+日志关键字 包含 SSH/6/SSH_AUTH_TIMEOUT
+日志关键字 包含 OPTMOD/3/TYPE_ERR
+日志关键字 包含 SHELL/5/CMDRECORD
+日志关键字 包含 DEV/5/DEV_CLOCK_CHANGE
+日志关键字 包含 CM/5/USER_ACCESSRESULT
+日志关键字 包含 USER-3-SYSTEM_MSG
+日志关键字 包含 SECURITY-SSHD-6-INFO_SUCCESS
+日志关键字 包含 SECURITY-SSHD-6-INFO_USER_LOGOUT
+日志关键字 包含 INFO/4/IM_LOGFILE_AGING
+日志关键字 包含 LICMGR-3-LOG_LIC_FILE_MISSING
+日志关键字 包含 SNMP-3-SNMP_AUTH_FAIL
+日志关键字 包含 ARPMGR-6-MAC_CHANGE
+日志关键字 包含 SYS-5-CONFIG_I
+日志关键字 包含 ARP/5/ARP_DUPLICATE_IPADDR_DETECT
+日志关键字 包含 SEC-5-LOGOUT
+日志关键字 包含 SEC-5-TACACS_ACCESS_ACCEPTED
+日志关键字 包含 SEC-5-LOGIN_SUCCESS
+日志关键字 包含 IP-IP_NTP-5-HP_CONN_RECOVERED
+日志关键字 包含 SECURITY-SSHD-4-INFO_FAILURE
+日志关键字 包含 MGBL-CONFIG-6-DB_COMMIT
+日志关键字 包含 LICENSE-ASR9K_LICENSE-2-INFRA_VRF_NEEDED
+日志关键字 包含 SEC-3-AUTHENTICATION_FAILURE
+日志关键字 包含 SEC-3-AUTHENTICATION_ENABLE_SUCCESS
+日志关键字 包含 SEC-3-LINE_PASSW_NOT_CONFIGURED
+日志关键字 包含 LIBIFMGR-5-INTF_COUNTERS_CLEARED
+日志关键字 包含 VSHD-5-VSHD_SYSLOG_CONFIG_I
+日志关键字 包含 SNMP/3/SNMP_AUTHEN_FAILED
+日志关键字 包含 SNMP/4/SNMP_IPUNLOCK
+日志关键字 包含 SNMP/4/SNMP_IPLOCK
+日志关键字 包含 SEC-5-TACACS_ACCESS_REJECTED
+日志关键字 包含 HTTPD/5/FAIL
+日志关键字 包含 ARPMGR-2-MAC_CHANGE: IP-4-ADDRMOVE
+日志关键字 包含 IP-IP_NTP-5-HP_CONN_LOST
+日志关键字 包含 IP-IP_NTP-5-SYNC_LOSS
+日志关键字 包含 SECURITY-SSHD-6-INFO_GENERAL
+日志关键字 包含 INFO/4/IC_LOGFILE_AGING
+日志关键字 包含 SSH/4/SSH_FAIL
+日志关键字 包含 SSH/5/SSH_CONNECT_CLOSED
+日志关键字 包含 INFO/3/SUPPRESS_LOGINFO
+日志关键字 包含 AUTHPRIV-3-SYSTEM_MSG
+日志关键字 包含 SYS-6-LOGGINGHOST_STARTSTOP
+日志关键字 包含 FILEMGR-5-FILESAVED
+日志关键字 包含 SECURITY-LOGIN-6-AUTHEN_SUCCESS
+日志关键字 包含 SECURITY-LOGIN-6-CLOSE
+日志关键字 包含 SEC-3-LOGIN_FAILURE
+日志关键字 包含 SSH-6-SSH_OPERATION
+日志关键字 包含 SEC-3-SEC_AUTHORIZATION_FAIL
+日志关键字 包含 IP-telnet-6-CONNECT
+日志关键字 包含 SECURITY-SSHD-6-INFO_REKEY
+日志关键字 包含 VTY/5/ACL_DENY
+日志关键字 包含 API/5/NET_OPERATERESULT
+日志关键字 包含 FWD/4/SESSINSERTOVERLOAD
+日志关键字 包含 NTP-6-INVALID PKT
+日志关键字 包含 CHMGR-5-FAN_SPEED_CHANGE
+日志关键字 包含 DS/4/DATASYNC_CFGCHANGE
+日志关键字 包含 CHMGR-2-FAN_SPEED_CHANGE
+日志关键字 包含 CHMGR-2-PSU_FAN_SPEED_CHANGE
+日志关键字 包含 LINE/5/VTYUSERLOGIN
+日志关键字 包含 FEEDBACK/3/GETSERVERR
+日志关键字 包含 SSHS/6/SSHS_AUTH_SUCCESS
+日志关键字 包含 SSHS/6/SSHS_AUTH_PWD_FAIL
+日志关键字 包含 DRVPLAT/4/Log
+日志关键字 包含 TACACS-3-TACACS_ERROR_MESSAGE
+日志关键字 包含 SECURITY-SSHD-3-ERR_GENERAL
+日志关键字 包含 IP-TELNETD-3-ERR_CONNECT
+日志关键字 包含 SYSMIB/4/CLKCHANGE
+日志关键字 包含 SYS-6-CLOCKUPDATE
+日志关键字 包含 AUTHPRIV-5-SYSTEM_MSG
+日志关键字 包含 AUTHPRIV-6-SYSTEM_MSG
+日志关键字 包含 DAEMON-4: bgp_listen_accept
+日志关键字 包含 LLDP_DUPLEX_INCONSISTENT
+日志关键字 包含 INFO/5/IM_SUPPRESS_LOG
+日志关键字 包含 INFO/5/SUPPRESS_LOG
+日志关键字 包含 OPS/5/OPS_OPER_FAIL
+日志关键字 包含 SSH/5/SSHS_REKEY_STATUS
+日志关键字 包含 ECE/6/PORT_ATTACK_END
+日志详情 包含 A user login
+日志详情 包含 A user logout
+日志关键字 包含 10RM/3/RMLOG
+日志关键字 包含 SEC-6-LOGOUT
+日志关键字 包含 ETHPORT-5-IF_DUPLEX
+日志关键字 包含 ETHPORT-5-SPEED
+日志关键字 包含 xntpd-6-INFO
+日志关键字 包含 SEC-6-LOGIN_SUCCESS
+日志关键字 包含 SEC-6-TACACS_ACCESS_ACCEPTED
+日志关键字 包含 SEC-6-AUTHENTICATION_FAILURE
+日志关键字 包含 SEC-6-TACACS_ACCESS_REJECTED
+日志关键字 包含 ETHPORT-5-IF_BANDWIDTH_CHANGE
+日志关键字 包含 AUTH-3
+日志关键字 包含 DAEMON-4:
+日志关键字 包含 SHELL/6/CLI
+日志关键字 包含 CONFIGURATION/6/hwCfgChgNotify
+日志关键字 包含 SYSMGR-3-CFGWRITE_FAILED
+日志关键字 包含 SYSMGR-2-CFGWRITE_ABORTED
+日志关键字 包含 SYSMGR-2-CFGWRITE_USER_ABORT
+日志关键字 包含 CFM/4/SAVE
+日志关键字 包含 SHELL/6/CMDCONFIRM_UNIFORMRECORD
+日志关键字 包含 HWCM/5/TRAPLOG
+日志关键字 包含 SYSMGR-3-BASIC_TRACE
+日志关键字 包含 SNMP/4/SNMP_FAIL
+日志关键字 包含 SSH-6-CONNECTION
+日志关键字 包含 SSH-6-KEY_OP
+日志详情 包含 configurations have been changed.
+日志关键字 包含 KERN-2-SYSTEM_MSG
+日志详情 包含 One log file is deleted due to aging
+日志关键字 包含 CONFIGURATION/6/hwcfgmaneventlog
+日志详情 包含 User has succesfully logged in
+日志关键字 包含 TACACS-4-SERVER_NOT_CONFIGURED
+日志关键字 包含 SEC-3-TACACS_SETUP_NOTREADY
+日志详情 包含 Boot password is initial password, please modify
+日志关键字 包含 01BFD/4/hwBfdSessUp
+日志关键字 包含 OSPF/5/MAXAGE_LSA
+日志关键字 包含 USER-4-UI_CLI_MMAP_INCREASE
+日志关键字 包含 INTERACT-4-UI_COMMIT_COMPLETED
+日志关键字 包含 NETFLOW-6-INFO_CACHE_SIZE_EXCEEDED
+日志关键字 包含 SECURITY-SSHD-4-WARNING_LOGI
+日志关键字 包含 ICMPV6-3-ND_LOG
+日志关键字 包含 SECURITY-SSHD-4-WARNING_LOGIN
+日志关键字 包含 IM-5-IM_INTF_STATE
+日志关键字 包含 NETCONF/6/NCA_OPER_RPC_RSP
+日志关键字 包含 DAEMON-4-DDOS_PROTOCOL_VIOLATION_CLEAR
+日志关键字 包含 DAEMON-4-DDOS_PROTOCOL_VIOLATION_SET
+日志关键字 包含 NETCONF/6/NCA_OPER_RPC_REQ
+日志关键字 包含 INFO/4/hwICLogFileStorageThrd
+日志关键字 包含 BACKUPCONFIG_SUC
+日志关键字 包含 01NLOG/2/DISKFULL
+日志详情 包含 User login authentication failed
+日志详情 包含 Disconnected due to Idle Timeout
+日志详情 包含 User has logged out
+日志详情 包含 User has succesfully logged in
+日志关键字 包含 SSHC/5/SSHC_INTER_CMDRECORD
+日志关键字 包含 DEVM/3/hwLocalFaultAlarm_clear
+日志关键字 包含 01CFM/5/BACKUPCONFIG_FILE_DELETE
+日志关键字 包含 AAA-3-ACCT_DROP
+日志关键字 包含 USER-2-SYSTEM_MSG
+日志关键字 包含 01HRPI/4/COCHK
+日志关键字 包含 01API/5/NET_CLOSECONN
+日志关键字 包含 01MANAGER/4/OUT
+日志关键字 包含 01MANAGER/4/PASS
+日志关键字 包含 SSHS/6/SSHS_INVALID_USERNAME_PWD
+日志关键字 包含 SEC-6-LOGIN_FAILURE
+日志关键字 包含 CFM/3/CFM_SAVECONFIG_FAILED
+日志关键字 包含 HRPI/4/SAVECFG
+日志关键字 包含 CFM/4/CFM_LOG
+日志关键字 包含 SECURITYD-2-FEATURE_ENABLE_DISABLE
+日志关键字 包含 TACACS/3/TAC_CHANGEFAILD
+日志关键字 包含 SHELL/4/CHANGE_PASSWORD_FAIL
+日志关键字 包含 AAA/5/DELETE_USER_SECURITY
+日志关键字 包含 LIBIFMGR-5-ALL_COUNTERS_CLEARED
+日志关键字 包含 USBHSD-1-ABSENT_ALERT
+日志关键字 包含 USBHSD-STANDBY-1-ABSENT_ALERT
+日志关键字 包含 OPS/5/OPS_OPER_SUCCESS
+日志关键字 包含 DAEMON-2-SYSTEM_MSG
+日志详情 包含 The configurations between active and standby device is different
+日志关键字 包含 SSH-4-SSH2_UNEXPECTED_MSG
+日志关键字 包含 LS/5/LS_AUTHEN_FAILURE
+日志关键字 包含 SSHS/6/SSHS_SRV_UNAVAILABLE
+日志详情 包含 CGN/4/PORT_USEDUP_TRAP
+日志详情 包含 CGN/6/PORT_NORMAL_TRAP
+日志关键字 包含 LLDP/5/LLDP_DUPLEX_INCONSISTENT
+日志关键字 包含 LLDP邻居数量超限
+日志关键字 包含 LLDP-3-MAC_PHY_CFG
+日志关键字 包含 TTY/4/TTY_LOGINFAILED

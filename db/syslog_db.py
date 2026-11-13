@@ -8,6 +8,7 @@ syslog_* 规则表读取
     syslog_event          L5 事件属性（state/object_type/窗口/clear_code）
     syslog_severity_rule  L5 事件定级（event_code + 设备 -> severity）
 """
+import time
 import logging
 
 from db.database import MySQLConnection
@@ -26,6 +27,9 @@ class SyslogRuleDB(object):
 
         没有 priority：黑名单只有"丢"一个动作，同一键配多条是数据错误。
         按 rule_id 排序只为让加载日志稳定，不代表匹配顺序。
+
+        不查 hit_count：那是运行时状态，查回来会覆盖内存计数器正在累加
+        的值。命中数单向写，不往回读，见 updateBlacklistHits()。
         """
         sql = '''
         select rule_id, pattern, scope, ip, ignore_case, descr
@@ -38,6 +42,36 @@ class SyslogRuleDB(object):
         except Exception as err:
             logger.error("======SyslogRuleDB getBlacklistRules error========\n%s", err)
             return []
+
+    def updateBlacklistHits(self, hits, now=None):
+        """
+        批量把内存计数器累加的命中数刷进 hit_count
+
+        热路径上不写库：黑名单命中是管线里最高频的判断，日志风暴时一条
+        规则一秒能命中几千次，每次都 UPDATE 会把写入量跟着日志量放大。
+        维护线程按固定间隔调一次，一轮一条规则最多一次 UPDATE。
+
+        :param hits: {rule_id: 本轮新增的命中数}，只传有变化的 rule_id，
+                     调用方不要传 0
+        :param now: epoch 秒，不传就取当前时间
+        :return: 更新的行数；失败返回 0
+        """
+        if not hits:
+            return 0
+        now = str(int(now if now is not None else time.time()))
+        sql = ("update syslog_black_list set hit_count = hit_count + %s, "
+               "last_hit_time = %s where rule_id = %s")
+        params = [(int(count), now, int(rule_id)) for rule_id, count in hits.items() if count]
+        if not params:
+            return 0
+        try:
+            with MySQLConnection() as conn:
+                conn.cursor.executemany(sql, params)
+                conn.conn.commit()
+                return conn.cursor.rowcount
+        except Exception as err:
+            logger.error("======SyslogRuleDB updateBlacklistHits error========\n%s", err)
+            return 0
 
     # ---------------- L3 ----------------
 
