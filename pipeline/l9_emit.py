@@ -6,16 +6,22 @@ L9 告警出口
 
     L7 决策 -> L8 填 muted -> L9: 写库 + 通知
 
-落库：
-    action=raise                    addAlarm，insert 一行
-    action=update/escalate/clear    updateAlarmByFingerprint，更新那一行
-    action=none/ignore              不落库也不通知，L8 那边就没往下交
+落库（没有开关，alarm_list 是看板唯一数据源）：
+    action=raise/escalate           addAlarm，insert 一行
+    action=update/clear             updateAlarmByFingerprint，更新那一行
+    action=clear_orphan             insert 一行 state=clear（视野外恢复）
+    action=clear_orphan_update      窗口内重复的孤立恢复，累加同一行
+    action=ignore_new/ignore_update  L5 判定不告警，照样落库留痕
+    action=notify_only              不写库，只补通知（L8 静默到期）
+    action=none                     什么都不做，L7 那边就没往下交
 
 muted 在 insert 的时候一次写进去，不是先写 0 再 UPDATE —— 中间那一瞬间
 看板轮询到会显示成"割接期间有条没静默的告警"。L8 的判定在这之前就有结果。
 
 通知：
     被静默的（muted=1）只落库不推送，这是 mute 的全部意义
+    ignore 系列和 clear_orphan_update 也只落库不推送，但原因不同：
+    前者是这类事件本来就不该告警，后者是第一次孤立恢复已经通知过了
     闪断（flapping=1）照常推，但带上"需人工确认"
 
 ======================= 通知通道 =======================
@@ -227,33 +233,30 @@ class AlarmEmitter(object):
     worker 共享一个实例。落库走数据库连接各自开，通知通道内部自己加锁。
     """
 
-    def __init__(self, notifier=None, state_machine=None, db=None,
-                 write_db=None, notify=None):
+    def __init__(self, notifier=None, state_machine=None, db=None, notify=None):
         """
         :param notifier:      通知通道，不传按 config.notify_channel 建
         :param state_machine: L7 实例，insert 之后要把 alarm_id 回填进状态
         :param db:            数据源，由 db.get_alarm_db() 注入
-        :param write_db:      落不落 alarm_list，不传读 config.alarm_write_db
         :param notify:        推不推通知，不传读 config.alarm_notify
 
-        两个开关分开：落库和通知是两件事。规则没调稳的时候常见的做法是
-        落库但不推通知 —— 看板上能看到告警，但不打扰人
+        只剩通知一个开关。原来还有个 write_db 控制落不落 alarm_list，
+        给"规则刚配完怕误报刷库"那个场景用 —— 但 alarm_list 是看板的
+        唯一数据源，关掉它看板就全空，真要对规则看 notify.log 就够了，
+        没人会去关它。留着反而多一条"看板为什么没数据"的排查路径
         """
         self._notifier = notifier if notifier is not None else build_notifier()
         self._state_machine = state_machine
         self._db = db
-        self._write_db = self._switch(write_db, "alarm_write_db")
         self._notify_on = self._switch(notify, "alarm_notify")
         self._lock = threading.Lock()
+        # 没有 skipped：那个计数是给 write_db=False（跳过落库）用的，
+        # 开关去掉之后落库是必经路径，不存在"跳过"这种结果
         self._counts = {"inserted": 0, "updated": 0, "notified": 0,
-                        "muted": 0, "failed": 0, "skipped": 0, "ignored": 0}
+                        "muted": 0, "failed": 0, "ignored": 0}
         # fingerprint -> 上次同步出去的 counter。没变就不写，
         # 否则一个 down 了一天的口每 10 秒白写一次 UPDATE
         self._synced = {}
-
-        if not self._write_db:
-            logger.warning("alarm_write_db=False，告警不落 alarm_list，"
-                           "看板上看不到任何告警。只有对规则的时候才该这么配")
 
     @staticmethod
     def _switch(value, config_key):
@@ -292,13 +295,8 @@ class AlarmEmitter(object):
 
         clock = int(now if now is not None else (decision.get("ingest_ts") or time.time()))
 
-        # 落库。alarm_list 是看板的唯一数据源，这一步不做看板上就什么都没有
-        alarm_id = 0
-        if self._write_db:
-            alarm_id = self._write(decision, action, clock)
-        else:
-            with self._lock:
-                self._counts["skipped"] += 1
+        # 落库。alarm_list 是看板的唯一数据源，没有开关可以跳过这一步
+        alarm_id = self._write(decision, action, clock)
 
         if action in IGNORE_ACTIONS:
             # L5 判定不告警，落库留痕即可，不走通知判断（不是被 mute 压住，
@@ -657,8 +655,6 @@ class AlarmEmitter(object):
         :param snapshots: StateMachine.open_snapshots() 的输出
         :return: 刷新的行数
         """
-        if not self._write_db:
-            return 0
         # snapshots 为空也要往下走：那说明所有告警都恢复了，
         # _synced 里的残留要清掉
         snapshots = snapshots or []

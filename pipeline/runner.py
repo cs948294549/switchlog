@@ -80,16 +80,22 @@ class Runner(object):
 
     # ---------------- 组件懒建 ----------------
 
+    # 四个规则加载器一律传 refresh_interval=0：不让它们各自起刷新线程，
+    # 统一由维护线程调 tick() 串行刷。各自起线程的话规则每轮被加载两遍
+    # （自己那条 + tick 那条），白读四次库，而且 Config.rule_refresh_interval
+    # 只能管到 tick 那一遍，调了也不生效 —— 和 tick() 注释里写的
+    # "刷新放在同一个线程串行做，不各自起 refresh 线程" 对不上
+
     @property
     def blacklist(self):
         if self._blacklist is None:
-            self._blacklist = BlacklistFilter()
+            self._blacklist = BlacklistFilter(refresh_interval=0)
         return self._blacklist
 
     @property
     def parser(self):
         if self._parser is None:
-            self._parser = SyslogParser()
+            self._parser = SyslogParser(refresh_interval=0)
         return self._parser
 
     @property
@@ -101,7 +107,7 @@ class Runner(object):
     @property
     def attrs(self):
         if self._attrs is None:
-            self._attrs = EventAttrs()
+            self._attrs = EventAttrs(refresh_interval=0)
         return self._attrs
 
     @property
@@ -119,7 +125,11 @@ class Runner(object):
     @property
     def mute(self):
         if self._mute is None:
-            self._mute = MuteFilter()
+            # mute 保留自己的刷新线程，间隔比其余三张表短（割接窗口是
+            # 分钟级的）。所以 tick() 里不刷它，见 tick() 的说明
+            from config.config import Config
+            self._mute = MuteFilter(
+                refresh_interval=getattr(Config, "mute_refresh_interval", 60))
         return self._mute
 
     @property
@@ -239,7 +249,12 @@ class Runner(object):
         维护线程定期调这个：刷新规则、清理缓存
 
         刷新放在同一个线程串行做，不各自起 refresh 线程 ——
-        几张表的刷新时间点错开没有意义，集中在一处好排查
+        几张表的刷新时间点错开没有意义，集中在一处好排查。
+        所以这三个加载器构造时都传了 refresh_interval=0（见上面的属性）。
+
+        **mute 不在这里刷**，它自己有一条 60s 的线程：割接窗口是分钟级的，
+        工单一开就得尽快生效，跟着 300s 等的话割接都开始了。两边都刷的话
+        syslog_mute_rule 会被读两遍，而且"到底哪个间隔在起作用"说不清
 
         不含落库。规则刷新 300s 一次合理（规则很少改），但告警状态和
         counter 跟着 300s 才落一次就太慢了 —— 看板上 counter 最多滞后
@@ -247,7 +262,7 @@ class Runner(object):
         """
         now = int(now if now is not None else time.time())
         for name, component in (("blacklist", self._blacklist), ("parser", self._parser),
-                                ("attrs", self._attrs), ("mute", self._mute)):
+                                ("attrs", self._attrs)):
             if component is None:
                 continue
             try:

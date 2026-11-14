@@ -41,8 +41,13 @@ class Config:
     queue_size = 20000
 
     # ---------------- 刷新与缓存 ----------------
+    # 四张规则表（黑名单/匹配规则/事件属性+定级/静默）统一由维护线程按这个
+    # 间隔重新加载，各加载器不再自己起刷新线程 —— 见 pipeline/runner.py 的
+    # tick()。静默规则想刷得更勤的话单独调 mute_refresh_interval
     rule_refresh_interval = 300     # 规则表重新加载间隔（秒）
-    enrich_cache_ttl = 600          # devices/ports 查询缓存（秒），含负缓存
+    # 静默规则单独一个间隔：变更窗口是分钟级的，工单一开就得尽快生效，
+    # 跟着 300s 等的话割接都开始了
+    mute_refresh_interval = 60
     stats_interval = 60             # 统计输出间隔（秒）
 
     # ---------------- 数据库 ----------------
@@ -55,11 +60,9 @@ class Config:
     }
 
     # ---------------- 告警出口 ----------------
-    # L9 落 alarm_list。关掉的话告警只在 notify.log 里，看板上什么都没有，
-    # 所以正常运行必须是 True。
-    # 置 False 的唯一场景：规则刚配完、怕误报刷库，先只看 notify.log 对一遍
-    alarm_write_db = True
-
+    # 落 alarm_list 没有开关：那是看板的唯一数据源，关掉看板就全空。
+    # 想对规则看 logs/notify.log 就够了
+    #
     # L9 推通知。规则没调稳之前可以先关掉，只落库不打扰人 ——
     # 看板上能看到告警，但不会推出去
     alarm_notify = True

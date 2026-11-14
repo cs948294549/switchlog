@@ -435,10 +435,10 @@ def run_service(args):
                 runner.attrs.size(), runner.attrs.severity_size())
 
     logger.info("静默规则 %s 条", runner.mute.size())
-    # 两个开关都该是 True，关掉任一个都会让告警看不见或者推不出去，
-    # 起服务时打出来，免得配错了找半天
-    logger.info("告警出口：落 alarm_list=%s，推通知=%s（通道 %s）",
-                Config.alarm_write_db, Config.alarm_notify, Config.notify_channel)
+    # 落库没有开关（alarm_list 是看板唯一数据源）。通知有，关掉的话
+    # 看板上有告警但不推出去，起服务时打出来免得配错了找半天
+    logger.info("告警出口：推通知=%s（通道 %s）",
+                Config.alarm_notify, Config.notify_channel)
 
     # 回放未恢复的告警。不放的话重启后同一个还没好的故障会重新开告警，
     # 等于重复通知一次。两层各回放自己的：L6 回放窗口、L7 回放告警状态
