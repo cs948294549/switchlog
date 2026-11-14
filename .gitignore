@@ -1,6 +1,15 @@
 # 实际配置带数据库口令，只提交 config_example.py
 config/config.py
 
+# 现网日志关键字清单/配置，按环境各自维护，不进仓库。
+# 规则的权威来源是库里那几张 syslog_* 表（种子数据在 sql/schema.sql），
+# 这几个文件是导出和人工整理用的中间产物
+sql/log_ignore.json
+sql/log_config.json
+sql/log_config.txt
+sql/log_ignore.txt
+
+
 __pycache__/
 *.py[cod]
 *.egg-info/
