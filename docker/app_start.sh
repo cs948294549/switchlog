@@ -13,8 +13,8 @@ set -e
 CONTAINER_NAME="switchlog"
 IMAGE_NAME="switchlog"
 IMAGE_TAG="${1:-v1}"
-HOST_PORT="${2:-514}"
-CONTAINER_PORT="514"
+HOST_PORT="${2:-5514}"
+CONTAINER_PORT="5514"
 # 和 central-server / network_bot 共用的网络，容器间可用容器名互访
 DOCKER_NETWORK="${DOCKER_NETWORK:-netops}"
 
