@@ -15,7 +15,7 @@ class Config:
     # 设备 logging host 指向本服务。514 是特权端口，需要 root 或
     # CAP_NET_BIND_SERVICE；用非特权端口时设备侧要配 logging port
     listen_ip = "0.0.0.0"
-    listen_port = 514
+    listen_port = 5514
 
     # 内核 socket 接收缓冲，吸收突发。设大一些，日志风暴时这是第一道缓冲。
     # 实际生效值受 /proc/sys/net/core/rmem_max 限制，起服务时日志会打印真实值

@@ -93,7 +93,7 @@ class AlarmDB(object):
             logger.error("======AlarmDB addAlarm error========\n%s", err)
             return 0
 
-    def updateAlarmByFingerprint(self, fingerprint, data):
+    def updateAlarmByFingerprint(self, fingerprint, data, reset_status=False):
         """
         更新该指纹最近一条未恢复告警；没有未恢复记录时不动历史行
 
@@ -101,6 +101,21 @@ class AlarmDB(object):
         IF_DOWN 变成 IF_FLAP，这一列不跟着改的话，看板上级别提了但
         事件码还是 IF_DOWN，看不出这是闪断。
         fingerprint 不在白名单 —— 它是定位条件，改了就找不到这一行了。
+
+        :param reset_status: True=把已处理的翻回待处理（status -> 0）
+
+            告警页按 status=0 过滤，处理完就出队。但故障还在继续时得能
+            重新入队，否则"处理过"就等于"再也不提醒"，持续的故障会被
+            一次确认永久埋掉。
+
+            CASE 里挡住三种不该翻的：
+              muted=1     割接窗口内，mute 的意思就是"这段时间别烦我"
+              status='4'  人工屏蔽，这是明确表达"一直别提醒到我改它"
+              status='5'  L5 规则判定不告警，系统自己打的，不是待办
+
+            只翻 1/2/3（已确认/已处理/忽略）。status 不走白名单那套
+            传值，因为它是条件逻辑不是定值 —— 同一条 UPDATE 里
+            last_seen/counter 对所有行都要生效，只有 status 要挑行
 
         :return: 影响行数；失败返回 "failed"
         """
@@ -114,6 +129,11 @@ class AlarmDB(object):
                 params.append(data[key])
         if not conditions:
             return "failed"
+
+        if reset_status:
+            conditions.append(
+                "status = case when muted=0 and status in ('1','2','3') "
+                "then '0' else status end")
 
         sql = ("update alarm_list set " + ", ".join(conditions) +
                " where fingerprint=%s and state='open' order by alarm_id desc limit 1")

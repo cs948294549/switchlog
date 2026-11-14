@@ -454,7 +454,13 @@ class AlarmEmitter(object):
         return alarm_id
 
     def _update(self, decision, action, now):
-        """更新已有告警。按指纹更新那条未恢复的"""
+        """
+        更新已有告警。按指纹更新那条未恢复的
+
+        reset_status=True：这些动作都代表"故障有新进展"（又掉了、升级了、
+        恢复了），处理过的要翻回待处理重新入队，否则一次确认就把后面的
+        进展全埋掉了。被 mute 的和人工屏蔽的不翻，见 updateAlarmByFingerprint
+        """
         data = {
             "last_seen": str(decision.get("last_seen") or now),
             "counter": decision.get("counter", 1),
@@ -472,7 +478,8 @@ class AlarmEmitter(object):
             data["clear_time"] = str(decision.get("clear_time") or now)
 
         try:
-            result = self.db.updateAlarmByFingerprint(decision.get("fingerprint"), data)
+            result = self.db.updateAlarmByFingerprint(decision.get("fingerprint"), data,
+                                                      reset_status=True)
         except Exception as err:
             logger.error("======AlarmEmitter update error========\n%s", err)
             result = "failed"
@@ -641,8 +648,11 @@ class AlarmEmitter(object):
         日志风暴时一个指纹刷一万条，那就是一万次 UPDATE。这里一轮
         一个指纹最多一次。
 
-        只刷 counter / last_seen / severity 三列：state 和 clear_time 由
-        正常的 clear 动作管，不能在这里碰。
+        刷 counter / last_seen / severity，外加把已处理的翻回待处理
+        （status -> 0，被 mute 的和人工屏蔽的除外）—— 能走到这里就说明
+        这个指纹又来了新日志，故障还在持续，不该停在"已处理"上。
+
+        state 和 clear_time 不碰：那两列由正常的 clear 动作管。
 
         :param snapshots: StateMachine.open_snapshots() 的输出
         :return: 刷新的行数
@@ -676,7 +686,12 @@ class AlarmEmitter(object):
                 "severity": row.get("severity", 3),
             }
             try:
-                result = self.db.updateAlarmByFingerprint(fingerprint, data)
+                # reset_status=True：走到这里说明 mark 变了，也就是这个
+                # 指纹又来了新日志（同一次故障的后续，L7 返回 ACTION_NONE
+                # 没走 L9）。告警已经被人处理过的话要翻回待处理 ——
+                # 不然"确认"一次之后，故障还在持续也没人知道了
+                result = self.db.updateAlarmByFingerprint(fingerprint, data,
+                                                          reset_status=True)
             except Exception as err:
                 logger.error("======AlarmEmitter sync_counters error========\n%s", err)
                 continue

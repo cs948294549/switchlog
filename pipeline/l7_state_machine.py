@@ -694,7 +694,11 @@ class StateMachine(object):
                     "severity_name": severity_name(state.severity),
                     "base_severity": state.base_severity,
                     "state": state.state,
-                    "counter": 0,
+                    # 传 state.counter，不是 0 —— 上面注释说的"counter 不清零"
+                    # 指的就是要把它留给 alarm_list 展示"这条告警最终有几条
+                    # 日志支撑"。写死 0 的话 L9 的 _update() 会拿这个 0 把
+                    # alarm_list.counter 冲掉，看板上变成"0 条"
+                    "counter": state.counter,
                     "first_seen": state.first_seen,
                     "last_seen": state.last_seen,
                     "clear_time": now,

@@ -444,7 +444,11 @@ CREATE TABLE alarm_log(
     ingest_ts VARCHAR(10) NOT NULL DEFAULT '' COMMENT '采集时间(epoch秒)，不是设备自报时间',
     PRIMARY KEY(log_id),
     INDEX idx_fingerprint_ts (fingerprint, ingest_ts),
-    INDEX idx_ip (ip),
+    -- (ip, ingest_ts) 复合，不是 ip 单列：看板上"按设备看这段时间的全部
+    -- 日志"走这个索引（getAlarmLogsByDevice）。单列 idx_ip 没有查询在用 ——
+    -- 其余查询都走 fingerprint / log_id / ingest_ts，而复合索引的
+    -- 最左前缀已经覆盖了按 ip 单独查的场景
+    INDEX idx_ip_ts (ip, ingest_ts),
     INDEX idx_ingest_ts (ingest_ts)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Syslog原子告警，只留7天';
 
@@ -572,7 +576,19 @@ VALUES
 ('TEMP_ALARM', 'raise', 'none', 3600, 1, 'TEMP_OK',
  '温度异常，需要IDC介入。三家厂商的温度告警/高温/严重告警都归这里'),
 ('TEMP_OK',    'clear', 'none', 3600, 1, '',
- '温度恢复，按TEMP_ALARM的指纹回关告警');
+ '温度恢复，按TEMP_ALARM的指纹回关告警'),
+-- TCAM 资源水线。不抽对象，一台设备一条。
+--
+-- stateless 不配 raise：没有恢复日志 —— TCAM 用量降下来设备不会打
+-- "已恢复"，配成 raise 会开出永远关不掉的告警。
+--
+-- window 86400：只在跨阈值时报，不周期刷（现网 8 台各 1 条）。
+-- 一天一条足够，再短会让同一次配置下发拆成多条。
+--
+-- threshold 1：第一条就要报。这是 TCAM 满之前唯一的预警，
+-- 攒阈值等于把预警往后推。
+('TCAM_THRESHOLD', 'stateless', 'none', 86400, 1, '',
+ 'ACL/QoS的TCAM用量超水线。满了之后改ACL可能编程失败，接口落default ACL');
 
 -- ============================================================
 -- 种子数据：事件定级
@@ -656,6 +672,13 @@ VALUES
 -- 恢复事件 TEMP_OK 不写专门行，落全局兜底的 '*'（P3 正常告警）
 ('TEMP_ALARM',        '', '', 3, '',       100,
  '温度异常，需要IDC介入。老系统等级"提示"，全网生效'),
+-- TCAM 水线。给 P2 不是 P3：它是"下次改 ACL 可能把整个 VLAN 拒掉"的预警，
+-- 比一般容量项要紧。现网 10.39.232.x 那 8 台 RACL 已到 95.31%
+-- （488/512，只剩 24 条余量），而且 Default ACL=DENY、Atomic Update=DISABLED，
+-- 真在余量不够时改 ACL，编程失败会落到 default deny。
+-- 不配 ignore：这是满之前唯一的预警，压掉就没有第二道提示了
+('TCAM_THRESHOLD',    '', '', 2, '',       100,
+ 'TCAM用量超水线。满了改ACL可能编程失败落default deny，需清理ACL或重划TCAM'),
 -- 职场设备的速率/双工/流控变化不告警。
 -- sysname_reg 用不带锚的 'corp' 而不是 '^rsw.*corp'：职场里不只有 rsw，
 -- asw1_corp_ts_m20 / csw1_corp_hz_m09 这些都要盖住，而 ^rsw 开头的写法
@@ -755,6 +778,19 @@ VALUES
 ('h3c', 'IFNET/5/LINK_UPDOWN', 'exact', '', 'changed to up',
  'IF_UP', 'interface (\\S+?) changed', 100,
  'Line protocol state on the interface GigabitEthernet1/0/23 changed to up.（现网样本，S5130S/Comware 7.1.070）'),
+-- Comware 5.20 的第三套写法（S5120-52SC-HI，比 S5130S 老一代）。
+-- 同一个 LINK_UPDOWN 名字，但严重度数字和正文都不一样：
+--   Comware 7.1  IFNET/5/LINK_UPDOWN  'Line protocol state on the interface X changed to up.'
+--   Comware 5.20 IFNET/3/LINK_UPDOWN  'GigabitEthernet1/0/41 link status is UP.'
+-- 数字不同就是两个 mnemonic，dict 查不到彼此，必须各配一套。
+-- 正文也完全不同，object_regex 和 body_match 都不能共用 ——
+-- 这条的接口名在正文开头、后面跟 'link status is'
+('h3c', 'IFNET/3/LINK_UPDOWN', 'exact', '', 'link status is DOWN',
+ 'IF_DOWN', '(\\S+) link status is', 100,
+ 'GigabitEthernet1/0/41 link status is DOWN.（现网样本，S5120-52SC-HI/Comware 5.20）'),
+('h3c', 'IFNET/3/LINK_UPDOWN', 'exact', '', 'link status is UP',
+ 'IF_UP', '(\\S+) link status is', 100,
+ 'GigabitEthernet1/0/41 link status is UP.（现网样本，S5120-52SC-HI/Comware 5.20）'),
 ('huawei', 'IFNET/3/PHY_UPDOWN', 'exact', '', 'turned into DOWN',
  'IF_DOWN', 'interface (\\S+?) has', 100,
  'The interface XGigabitEthernet0/0/1 has turned into DOWN state.'),
@@ -826,6 +862,21 @@ VALUES
 ('cisco_nx', 'L2FM-4-L2FM_MAC_MOVE2', 'exact', '', '',
  'MAC_FLAP', 'Mac\\s+([0-9a-fA-F]{4}\\.[0-9a-fA-F]{4}\\.[0-9a-fA-F]{4})', 100,
  'Mac e67b.0b15.973f in vlan 1080 has moved from Po43 to Po45'),
+-- IOS / IOS-XE 的 MAC 漂移写法，和上面 NX-OS 那条是同一事件的另一套 mnemonic。
+-- 正文结构不同，正则不能共用：
+--   NX-OS  'Mac e67b.0b15.973f in vlan 1080 has moved from Po43 to Po45'
+--   IOS    'Host b64e.d188.8b37 in vlan 148 is flapping between port Po1 and port Gi1/0/18'
+-- 一个是 Mac 开头、一个是 Host 开头，MAC 格式都是点分四位。
+-- 用 'Host\s+' 锚定，不用裸的 MAC 正则 —— 裸正则会在正文里碰到别的
+-- 十六进制串时抓错（这条正文后半截有 Po1 / Gi1/0/18，现在不含点分四位的
+-- 串，但别的型号的正文不保证）。
+--
+-- vendor 用 '*' 不收窄到 cisco_ios：SW_MATM 在 IOS / IOS-XE / 部分
+-- Catalyst 上都见过，而现网这条的源 IP 还没确认到具体设备。
+-- 命中后看 stats 里按 vendor 的分布再决定要不要收窄
+('*', 'SW_MATM-4-MACFLAP_NOTIF', 'exact', '', '',
+ 'MAC_FLAP', 'Host\\s+([0-9a-fA-F]{4}\\.[0-9a-fA-F]{4}\\.[0-9a-fA-F]{4})', 100,
+ 'Host b64e.d188.8b37 in vlan 148 is flapping between port Po1 and port Gi1/0/18'),
 -- 华为 V200R022 口 down/up 的另一套 mnemonic：DEVM 是物理层、IFNET 是接口协议层，
 -- 同一次物理翻动两条一起打，对象字段名不同（EntPhysicalName vs ifName），分别配正则
 ('huawei', 'DEVM/2/hwPortDown', 'exact', '', '',
@@ -926,7 +977,20 @@ VALUES
  '%TAHUSD-SLOT1-4-BUFFER_THRESHOLD_EXCEEDED: Module 1 Instance 0 Pool-group buffer 90 percent threshold is exceeded!（FAC段含中划线，mnemonic剥不出）'),
 ('huawei', '', 'contains', 'hwMflpVlanLoopAlarm_clear', '',
  'MAC_FLAP_RECOVER', '', 300,
- '%%01FWM-ETH/4/hwMflpVlanLoopAlarm_clear(l):...;Mac flapping detection recovered in vlan 136.（模块段含中划线，mnemonic剥不出）');
+ '%%01FWM-ETH/4/hwMflpVlanLoopAlarm_clear(l):...;Mac flapping detection recovered in vlan 136.（模块段含中划线，mnemonic剥不出）'),
+-- TCAM 水线。第三条不得不走 fuzzy 的：'ACLQOS-SLOT1' 的 FAC 段含中划线，
+-- strip_mnemonic 剥出来是空串（和 TAHUSD-SLOT1 / FWM-ETH 同一个坑）。
+--
+-- object_regex 留空，不抽对象：正文里的 Inst/Tcam/Bank 是硬件位置，
+-- 对排查没用 —— 要知道哪个区域满了得登设备看
+-- show hardware access-list resource utilization。一台设备一条就够。
+--
+-- pattern 用 ACLQOS_OVER_THRESHOLD 不用 'ACLQOS'：后者会把这个模块的
+-- 其它消息一起吞掉，那些还没见过，留着进缺口清单。
+-- 已核对与现有 4 条 fuzzy 无交叉误命中
+('cisco_nx', '', 'contains', 'ACLQOS_OVER_THRESHOLD', '',
+ 'TCAM_THRESHOLD', '', 300,
+ '%ACLQOS-SLOT1-4-ACLQOS_OVER_THRESHOLD: Inst 0 Tcam 2 Bank 0 (IPV4 RACL [racl]) usage has reached its threshold（FAC段含中划线，mnemonic剥不出）');
 
 -- ============================================================
 -- 种子数据：温度异常（三家厂商 15 条）
@@ -1067,6 +1131,291 @@ VALUES
 -- L3 的 BFD_SESSION_CHG，见 syslog_rule 那一节
 ('DAEMON-3-SYSTEM_MSG', 'mnemonic', '', 0, 1,
  'Nexus守底进程杂项消息，现网见到的是NTP丢弃公网扫描报文。非网络故障'),
+-- 内核杂项消息，和上面 DAEMON-3-SYSTEM_MSG 是同一类大杂烩 mnemonic。
+-- 现网见到的是风扇调速（cctrl_tor_nep_set_fan_speed_pwm，duty_cycle 79）——
+-- 风扇随温度自动调转速是正常工作，不是故障。真的风扇坏了走 PSU_FAIL
+-- （DEV/1/FAN、DEV/4/FAN）或温度那套（TEMP_ALARM），不靠这条。
+--
+-- 严重度数字各是一个 mnemonic：txt 第 616 行只有 KERN-2-SYSTEM_MSG，
+-- 它那边是全文"包含"所以 KERN-2/KERN-3 都能命中，我们按全名查 dict 不行，
+-- 两个都要配。其余严重度（KERN-4/5/6）以后出现了再补。
+--
+-- 代价：SYSTEM_MSG 是大杂烩，整个 mnemonic 拦掉之后这个严重度下别的内核
+-- 消息也一起丢，不再进 UNKNOWN_MNEMONIC 的缺口清单。要保留发现能力就得
+-- 改成 scope=message 配具体子串（比如 set_fan_speed_pwm），但那比 dict 贵
+('KERN-3-SYSTEM_MSG', 'mnemonic', '', 0, 1,
+ '内核杂项消息，现网见到的是风扇自动调速。风扇故障走PSU_FAIL/TEMP_ALARM，不靠这条'),
+('KERN-2-SYSTEM_MSG', 'mnemonic', '', 0, 1,
+ '内核杂项消息(严重度2)，txt第616行已判为噪声，同族一起配'),
+-- MSTP 端口状态迁移。生成树收敛的正常过程：端口 up 之后依次走
+-- discarding -> learning -> forwarding，一次插拔就刷三条，
+-- 每条都带同一个 PortName，没有告警价值。
+--
+-- txt 第 10/11 行是老写法 MSTP/4/SET_PORT_LEARNING / SET_PORT_FORWARDING，
+-- 判断一致；现网这批是 MSTPLOG_PROPORT_STATE_* 的新写法。两套都配上 ——
+-- 混合版本的现网里两种都可能出现，少配一套那批设备继续落 UNKNOWN_MNEMONIC。
+--
+-- 真正的拓扑变更（根桥切换、BPDU 丢失、环路）有别的 mnemonic，
+-- 不在这几条里，拦掉不影响发现环路。syslog_event 里的 STP_TC 目前
+-- 一条规则都没有，哪天要配拓扑变更告警再往那个码上挂
+('MSTP/4/MSTPLOG_PROPORT_STATE_LEARNING', 'mnemonic', '', 0, 1,
+ 'MSTP端口进入learning，生成树收敛的中间态'),
+('MSTP/4/MSTPLOG_PROPORT_STATE_FORWARDING', 'mnemonic', '', 0, 1,
+ 'MSTP端口进入forwarding，生成树收敛完成'),
+('MSTP/4/MSTPLOG_PROPORT_STATE_DISCARDING', 'mnemonic', '', 0, 1,
+ 'MSTP端口进入discarding，收敛三态里的第一个，之前日志里见过'),
+('MSTP/4/SET_PORT_LEARNING', 'mnemonic', '', 0, 1,
+ 'MSTP端口learning的老写法，txt第10行已判为噪声'),
+('MSTP/4/SET_PORT_FORWARDING', 'mnemonic', '', 0, 1,
+ 'MSTP端口forwarding的老写法，txt第11行已判为噪声'),
+-- ---------- 管理面操作留痕：OPS / CLI / CM 三组 ----------
+--
+-- 这一批是采集侧自己造的。现网一次采集在同一秒内刷十几条：
+-- RESTCONF 登录 -> 开 CLI 终端 -> 执行命令 -> 读回显 -> 登出，
+-- 每一步 REQ/RSP 各一条，加上 CLI 的命令留痕和 CM 的认证/下线留痕。
+-- 样例里 UserName=eca、SourceAddress=0.0.0.0、DestAddress=127.0.0.1 ——
+-- 本机环回，就是采集脚本在干活。
+--
+-- 这些是审计日志，不是故障。设备上本来就有命令审计（display logbuffer），
+-- 走告警管线只会把真告警淹掉 —— 一次采集十几条、几百台设备轮着采。
+--
+-- txt 里已有 6 条（第 179/216/377/503/507/458/517 行），判断一致。
+-- 注意 CM 那两条写法不同：txt 是 CM/5/USER_ACCESSRESULT，
+-- 现网是 CM/5/ADMIN_USER_ACCESSRESULT（多了 ADMIN_）。
+-- 老系统全文"包含"两种都命中，我们按 mnemonic 全名查 dict 必须各配一条。
+--
+-- 登录失败没有一起拦：CLI/5/LOGINFAILED 留着，暴力破解要能看见。
+-- 它在 txt 第 452 行，但那是审计系统的判断，我们这边有 LOGIN_FAIL 事件码
+('OPS/5/OPS_LOGIN', 'mnemonic', '', 0, 1,
+ 'RESTCONF/OPS连接建立，采集侧每次采集都打。txt第503行'),
+('OPS/5/OPS_LOGOUT', 'mnemonic', '', 0, 1,
+ 'RESTCONF/OPS连接断开。txt第507行'),
+('OPS/5/OPS_RESTCONF_REQ', 'mnemonic', '', 0, 1,
+ 'RESTCONF请求留痕，一次采集刷十几条。txt第179行'),
+('OPS/5/OPS_RESTCONF_RSP', 'mnemonic', '', 0, 1,
+ 'RESTCONF响应留痕，和REQ成对。txt第216行'),
+('OPS/5/OPS_OPER_SUCCESS', 'mnemonic', '', 0, 1,
+ 'OPS操作成功留痕。txt第664行，同族一起配'),
+('OPS/5/OPS_OPER_FAIL', 'mnemonic', '', 0, 1,
+ 'OPS操作失败留痕。txt第586行，同族一起配'),
+('CLI/5/CMDRECORD', 'mnemonic', '', 0, 1,
+ '命令留痕。设备上有display logbuffer可查，不用进告警。txt第377行'),
+('CLI/5/INTER_CMDRECORD', 'mnemonic', '', 0, 1,
+ '交互式命令留痕。txt第439行，同族一起配'),
+('CLI/5/CMDRECORDFAILED', 'mnemonic', '', 0, 1,
+ '命令执行失败留痕。txt第464行，同族一起配'),
+('CLI/5/LOGIN', 'mnemonic', '', 0, 1,
+ 'CLI登录留痕。txt第387行'),
+('CLI/5/LOGOUT', 'mnemonic', '', 0, 1,
+ 'CLI登出留痕。txt第386行'),
+('CM/5/ADMIN_USER_ACCESSRESULT', 'mnemonic', '', 0, 1,
+ '管理员认证结果留痕（现网写法带ADMIN_）。txt第517行是不带ADMIN_的写法'),
+('CM/5/ADMIN_USER_OFFLINERESULT', 'mnemonic', '', 0, 1,
+ '管理员下线结果留痕（现网写法带ADMIN_）。txt第458行是不带ADMIN_的写法'),
+('CM/5/USER_ACCESSRESULT', 'mnemonic', '', 0, 1,
+ '用户认证结果留痕，txt第517行的原写法，一并配上'),
+('CM/5/USER_OFFLINERESULT', 'mnemonic', '', 0, 1,
+ '用户下线结果留痕，txt第458行的原写法，一并配上'),
+-- 漂移限速解除。和 SECE/4/UCSUPPRESS（限速开始）是同一次漂移的两条，
+-- 开始那条走 MAC_FLAP_SUPPRESS 事件码（P2 告警，端口被限到 50% 带宽）。
+--
+-- 解除这条拉黑不配规则，理由：MAC_FLAP_SUPPRESS 是 stateless，
+-- 告警靠 600s 窗口静默自动恢复，不靠这条解除日志驱动 ——
+-- 就算配上规则也关不掉告警。而它又没别的用途：要回溯"限速什么时候解除的"，
+-- UCSUPPRESS 那条 P2 告警自己带了时间和解除时刻（sweep 的 clear_time）。
+-- 留着只会汇进 UNKNOWN_MNEMONIC 那条共用告警里（同一设备所有未匹配日志
+-- 共用一个指纹），把真缺口盖住
+('SECE/4/UCSUPPRESSRESUME', 'mnemonic', '', 0, 1,
+ '漂移限速解除。MAC_FLAP_SUPPRESS靠窗口静默自动恢复，不靠这条驱动'),
+-- ---------- LLDP 邻居变化：17 条 ----------
+--
+-- 现网一次邻居变化刷三条（172.26.1.46 的 GE1/0/23，18:03:37 同一秒）：
+--   hwLldpInterfaceNeighborChange   Action=deleted, 带完整邻居信息
+--   hwLldpInterfaceRemTablesChange  Action=deleted, Added=0, Deleted=1
+--   lldpRemTablesChange             Added=0, Deleted=0, Dropped=0, Aged=1
+-- 三条说的是同一件事，只是详细程度递减。
+--
+-- LLDP 邻居表变化不是故障：对端重启、改端口描述、拔插网线、邻居老化
+-- 都会刷。端口真 down 了有 IF_DOWN 那套管，不靠 LLDP 发现。
+--
+-- txt 里 LLDP 一族有 19 条，17 条能剥出 mnemonic 的全配上 ——
+-- 一次配齐，免得以后一个个冒出来。判断和 txt 一致（你这三条在
+-- 第 218/382/385 行）。
+--
+-- 跳过两条剥不出 mnemonic 的，要配得走 scope=message，现网没见过先不配：
+--   'LLDP_DUPLEX_INCONSISTENT'  裸子串，没有模块前缀
+--   'LLDP邻居数量超限'           中文，英文日志里永不命中
+-- 另外 LLDP/5/LLDP_PVID_INCONSISTENT 和 LLDP/5/LLDP_DUPLEX_INCONSISTENT
+-- 这两条其实有排查价值（PVID/双工两端不一致是配置错误），但 txt 判了噪声，
+-- 跟着走。哪天要用把它们 enabled=0 即可
+('LLDP/4/hwLldpInterfaceNeighborChange', 'mnemonic', '', 0, 1,
+ 'LLDP邻居变化(详细)，txt第218行。对端重启/改描述/拔插都会刷'),
+('LLDP/4/hwLldpInterfaceRemTablesChange', 'mnemonic', '', 0, 1,
+ 'LLDP邻居表变化(带接口)，txt第382行，上面那条的伴生'),
+('LLDP/4/lldpRemTablesChange', 'mnemonic', '', 0, 1,
+ 'LLDP邻居表变化(标准MIB)，txt第385行，同一件事的第三条'),
+('LLDP/4/NBRCHGTRAP', 'mnemonic', '', 0, 1,
+ 'LLDP邻居变化trap，txt第51/52行'),
+('LLDP/6/LLDP_CREATE_NEIGHBOR', 'mnemonic', '', 0, 1,
+ 'LLDP邻居建立，txt第394行'),
+('LLDP/6/LLDP_DELETE_NEIGHBOR', 'mnemonic', '', 0, 1,
+ 'LLDP邻居删除，txt第466行'),
+('LLDP/5/LLDP_NEIGHBOR_AGE_OUT', 'mnemonic', '', 0, 1,
+ 'LLDP邻居老化，txt第402行'),
+('LLDP/5/LLDP_PVID_INCONSISTENT', 'mnemonic', '', 0, 1,
+ 'LLDP两端PVID不一致，txt第371行判为噪声。想查配置错误把这条enabled=0'),
+('LLDP/5/LLDP_DUPLEX_INCONSISTENT', 'mnemonic', '', 0, 1,
+ 'LLDP两端双工不一致，txt第672行判为噪声。想查配置错误把这条enabled=0'),
+('LLDP-4-CREATEREM', 'mnemonic', '', 0, 1,
+ 'LLDP邻居建立(Cisco写法)，txt第286行'),
+('LLDP-4-AGEOUTREM', 'mnemonic', '', 0, 1,
+ 'LLDP邻居老化(Cisco写法)，txt第287行'),
+('LLDP-5-NEIGHBOR_NEW', 'mnemonic', '', 0, 1,
+ 'LLDP新邻居，txt第338行'),
+('LLDP-5-NEIGHBOR_GONE', 'mnemonic', '', 0, 1,
+ 'LLDP邻居消失，txt第315行'),
+('LLDP-5-NEIGHBOR_TIMEOUT', 'mnemonic', '', 0, 1,
+ 'LLDP邻居超时，txt第325行'),
+('LLDP-3-MAC_PHY_CFG', 'mnemonic', '', 0, 1,
+ 'LLDP两端速率/双工配置不符，txt第674行'),
+('DAEMON-6-LLDP_NEIGHBOR_UP', 'mnemonic', '', 0, 1,
+ 'LLDP邻居up，txt第184行'),
+('DAEMON-6-LLDP_NEIGHBOR_DOWN', 'mnemonic', '', 0, 1,
+ 'LLDP邻居down，txt第155/225行'),
+-- ---------- 接口速率变化通知：7 条 ----------
+--
+-- 现网样例（172.26.1.45 的 GE1/0/13）：
+--   The output rate change ratio exceeded the threshold.
+--   (ThresholdPercent = 50, CurrentStatisticalPeriodRate = 64,
+--    LastStatisticalPeriodRate = 33133)
+-- 上个统计周期 33133、这个周期 64，跌了 99.8% 所以超了 50% 的变化阈值。
+--
+-- 这是"速率变化率"告警，不是"速率过高"告警 —— 流量正常起落就会触发。
+-- 办公网接口早晚峰谷差几十倍很正常，配了只会天天响。
+-- 真要看带宽占用走流量监控（query_flow_traffic 那套），不靠 syslog。
+--
+-- txt 里同类有 6 条（第 71/75/487/489/502/506 行），判断一致，但写法
+-- 各不相同 —— 现网这条是 DEVM/5/hwOutputRateChange...，txt 里是
+-- DEVM/4/hwIfMonitor...Rising 和 IFPDT/4/...Notice。全配上。
+--
+-- Input 那条现网还没出现，但 Output 都有了它肯定也会来，一起配
+('DEVM/5/hwOutputRateChangeOverThresholdNotice', 'mnemonic', '', 0, 1,
+ '出向速率变化率超阈值。流量正常起落就触发，带宽占用走流量监控不走syslog'),
+('DEVM/5/hwInputRateChangeOverThresholdNotice', 'mnemonic', '', 0, 1,
+ '入向速率变化率超阈值，上面那条的对向，现网还没出现先配上'),
+('DEVM/4/hwIfMonitorOutputRateRising_active', 'mnemonic', '', 0, 1,
+ '出向速率上升，txt第489行'),
+('DEVM/4/hwIfMonitorOutputRateRising_clear', 'mnemonic', '', 0, 1,
+ '出向速率上升恢复，txt第487行'),
+('DEVM/4/hwIfMonitorInputRateRising_active', 'mnemonic', '', 0, 1,
+ '入向速率上升，txt第502行'),
+('DEVM/4/hwIfMonitorInputRateRising_clear', 'mnemonic', '', 0, 1,
+ '入向速率上升恢复，txt第506行'),
+('IFPDT/4/OutputRateChangeOverThresholdNotice', 'mnemonic', '', 0, 1,
+ '出向速率变化率超阈值(IFPDT模块写法)，txt第71行'),
+('IFPDT/4/InputRateChangeOverThresholdNotice', 'mnemonic', '', 0, 1,
+ '入向速率变化率超阈值(IFPDT模块写法)，txt第75行'),
+-- SSH 算法协商失败。现网只有 172.21.32.14（edr1_dc09_m01，Cisco 3945
+-- IOS 15.4(3)M6a，2016 年编译）在报：服务端只支持 SHA-1 时代的 KEX
+-- （group-exchange-sha1 / group14-sha1 / group1-sha1），现代客户端
+-- 一个都不认，所以连不上。
+--
+-- 拦掉是因为它反映的是"这台设备的 IOS 太老"，不是突发故障 ——
+-- 每次有人用新客户端连它都刷一条，刷多少次问题都一样。
+-- 真要解决是升级 IOS 或在客户端放开旧算法，不是靠告警推动。
+--
+-- txt 里没有这条，但第 450 行有华为的同义写法
+-- SSHS/6/SSHS_ALGORITHM_MISMATCH，判断一致，一起配上。
+-- 另外带上 txt 第 667 行的 SSH-4-SSH2_UNEXPECTED_MSG（同属 SSH 协议层异常）
+('SSH-3-NO_MATCH', 'mnemonic', '', 0, 1,
+ 'SSH算法协商失败(Cisco)。老IOS只支持SHA-1时代KEX，是版本能力问题不是故障'),
+('SSHS/6/SSHS_ALGORITHM_MISMATCH', 'mnemonic', '', 0, 1,
+ 'SSH算法不匹配(华为写法)，txt第450行，同义一起配'),
+('SSH-4-SSH2_UNEXPECTED_MSG', 'mnemonic', '', 0, 1,
+ 'SSH2协议层意外报文，txt第667行'),
+-- ---------- SHELL / SSHS 登录与命令审计：28 条 ----------
+--
+-- 现网样例（10.26.252.13，new_csw1_dc19_m01）一次人工登录刷四条：
+--   SSHS/6/SSHS_LOG       Accepted password for chensong from 10.33.103.136
+--   SSHS/6/SSHS_CONNECT   SSH user chensong connected to the server successfully
+--   SHELL/5/SHELL_LOGIN   chensong logged in from 10.33.103.136
+--   SHELL/6/SHELL_CMD     Command is dis cu
+--
+-- 和之前那批 OPS/CLI/CM 一个性质：审计日志不是故障。设备上有
+-- display logbuffer 可查，走告警管线只会把真告警淹掉。
+--
+-- txt 里 SHELL/SSHS 一族 42 条，这里配 28 条（你给的四条在
+-- 第 375/381/403/373 行）。
+--
+-- 故意不拦的 13 条失败/拒绝类，和保留 CLI/5/LOGINFAILED 同一个理由 ——
+-- 这些是安全事件，要能看见：
+--   SHELL/5/SHELL_LOGINFAIL        SHELL/4/LOGINFAILED
+--   SHELL/4/LOGINAUTHFAIL          SHELL/4/CHANGE_PASSWORD_FAIL
+--   SHELL/5/SETPASS_FAIL_FIRSTLOGIN
+--   SHELL/5/SHELL_CMDDENY          SHELL/4/SHELL_CMD_MATCHFAIL
+--   SHELL/4/SHELL_CMD_EXECUTEFAIL
+--   SSHS/6/SSHS_AUTH_PWD_FAIL      SSHS/6/SSHS_AUTHOR_FAIL
+--   SSHS/6/SSHS_INVALID_USERNAME_PWD
+--   SSHS/6/SSHS_AUTH_EXCEED_RETRY_TIMES
+--   SSHS/5/SSHS_ACL_DENY
+-- 它们现在落 UNKNOWN_MNEMONIC。要正式接的话往 LOGIN_FAIL 事件码上挂规则，
+-- 别加到这里来
+('SSHS/6/SSHS_LOG', 'mnemonic', '', 0, 1,
+ 'SSH登录接受留痕，txt第375行'),
+('SSHS/6/SSHS_CONNECT', 'mnemonic', '', 0, 1,
+ 'SSH连接建立，txt第381行'),
+('SSHS/6/SSHS_DISCONNECT', 'mnemonic', '', 0, 1,
+ 'SSH连接断开，txt第379行'),
+('SSHS/6/SSHS_AUTH_SUCCESS', 'mnemonic', '', 0, 1,
+ 'SSH认证成功，txt第572行'),
+('SSHS/6/SSHS_AUTH_TIMEOUT', 'mnemonic', '', 0, 1,
+ 'SSH认证超时，txt第430行'),
+('SSHS/6/SSHS_SCP_OPER', 'mnemonic', '', 0, 1,
+ 'SCP文件操作留痕，txt第120行'),
+('SSHS/6/SSHS_MAC_ERROR', 'mnemonic', '', 0, 1,
+ 'SSH MAC校验错误，txt第275行'),
+('SSHS/6/SSHS_REACH_SESSION_LIMIT', 'mnemonic', '', 0, 1,
+ 'SSH会话数达上限，txt第428行'),
+('SSHS/6/SSHS_VERSION_MISMATCH', 'mnemonic', '', 0, 1,
+ 'SSH版本不匹配，txt第437行'),
+('SSHS/6/SSHS_SRV_UNAVAILABLE', 'mnemonic', '', 0, 1,
+ 'SSH服务不可用，txt第669行'),
+('SHELL/5/SHELL_LOGIN', 'mnemonic', '', 0, 1,
+ '用户登录留痕，txt第403行'),
+('SHELL/5/SHELL_LOGOUT', 'mnemonic', '', 0, 1,
+ '用户登出留痕，txt第378行'),
+('SHELL/4/LOGIN', 'mnemonic', '', 0, 1,
+ '登录留痕(severity 4写法)，txt第404行'),
+('SHELL/4/LOGOUT', 'mnemonic', '', 0, 1,
+ '登出留痕(severity 4写法)，txt第405行'),
+('SHELL/5/LOGIN', 'mnemonic', '', 0, 1,
+ '登录留痕(severity 5写法)，txt第455行'),
+('SHELL/5/LOGOUT', 'mnemonic', '', 0, 1,
+ '登出留痕(severity 5写法)，txt第457行'),
+('SHELL/5/TIMEOUT', 'mnemonic', '', 0, 1,
+ '会话超时退出，txt第500行'),
+('SHELL/6/SHELL_CMD', 'mnemonic', '', 0, 1,
+ '命令留痕，txt第373行。设备上display logbuffer可查'),
+('SHELL/5/CMDRECORD', 'mnemonic', '', 0, 1,
+ '命令留痕(另一写法)，txt第515行'),
+('SHELL/6/SHELL_CMD_INPUT', 'mnemonic', '', 0, 1,
+ '命令输入留痕，txt第414行'),
+('SHELL/6/DISPLAY_CMDRECORD', 'mnemonic', '', 0, 1,
+ 'display类命令留痕，txt第376行'),
+('SHELL/6/SHELL_CMD_CONFIRM', 'mnemonic', '', 0, 1,
+ '命令二次确认留痕，txt第440行'),
+('SHELL/6/CMDCONFIRM_RECORD', 'mnemonic', '', 0, 1,
+ '命令确认留痕，txt第24行'),
+('SHELL/6/CMDCONFIRM_UNIFORMRECORD', 'mnemonic', '', 0, 1,
+ '命令确认统一留痕，txt第609行'),
+('SHELL/5/USERCONFIRM', 'mnemonic', '', 0, 1,
+ '用户确认留痕，txt第70行'),
+('SHELL/5/AUTHCMDNONEED', 'mnemonic', '', 0, 1,
+ '命令无需授权留痕，txt第103行'),
+('SHELL/6/SHELL_SECLOG', 'mnemonic', '', 0, 1,
+ 'shell安全日志留痕，txt第413行'),
+('SHELL/6/CLI', 'mnemonic', '', 0, 1,
+ 'CLI操作留痕，txt第603行'),
 ('DHCP/5/WAITOFFER_TIMEOUT', 'mnemonic', '', 0, 1,
  '设备自身DHCP客户端超时。真失联轮询监控会先报，这条自己不构成故障'),
 ('SYSMIB/4/CLKCHANGE', 'mnemonic', '', 0, 1,
@@ -1122,13 +1471,35 @@ VALUES
  '设备本地证书过期。影响HTTPS管理/802.1X，但不是网络故障，走证书轮换流程'),
 ('PKI/4/CA_VALID', 'mnemonic', '', 0, 1,
  'CA证书有效期提示，txt第33行已判为噪声'),
+-- Comware 5.20 端口翻动的 trap。和 IFNET/3/LINK_UPDOWN 是同一次翻动的
+-- 两条日志，但对象抽出来不一样：
+--   trap 的正文是 'Interface 9437224 is Up'      -> ifIndex
+--   日志的正文是 'GigabitEthernet1/0/41 link ...' -> 接口名
+-- 两个对象不同 -> 指纹不同 -> 一次 down 会开两条告警。
+-- 留日志那条、拦 trap：ifIndex 对人没用，看板上显示 9437224 没人认得出
+-- 是哪个口，而日志那条直接带可读接口名。
+--
+-- 注意 mnemonic 只能填到 'IFNET/4/INTERFACE' —— strip_mnemonic 的正则在
+-- 斜杠最后一段碰到空格就截断，'IFNET/4/INTERFACE UPDOWN' 实际剥出来是
+-- 'IFNET/4/INTERFACE'（和 DEV/1/FAN 同一个坑）
+('IFNET/4/INTERFACE', 'mnemonic', '', 0, 1,
+ 'Comware5.20端口翻动trap，对象是ifIndex不可读。同一次翻动的IFNET/3/LINK_UPDOWN带接口名，留那条'),
 -- License 类。上面已有 LICENSE-6-VIOLATION（用量超授权的周期提示），
 -- 这两条是 license 缺失/文件丢失的告警，txt 第 282/522 行都判过。
 -- 和 VIOLATION 一样：容量与授权的事走 license 审计，不进告警管线
 ('LICMGR-2-LOG_LIC_MISSING_WARNING', 'mnemonic', '', 0, 1,
  'License缺失告警。授权问题走license审计，不是网络故障'),
 ('LICMGR-3-LOG_LIC_FILE_MISSING', 'mnemonic', '', 0, 1,
- 'License文件丢失，txt第522行已判为噪声，同族一起配');
+ 'License文件丢失，txt第522行已判为噪声，同族一起配'),
+-- Smart Licensing 这两条 txt 里没有，本次自行判断。
+-- 同属 LICMGR，和上面两条一个归类：授权的事走 license 审计，不进告警管线。
+-- COMM_FAILED 那条是连不上 CSLU（Could not resolve host: cslu-local）——
+-- 本质是 license 上报通道不通，不影响转发，但要是以后真需要 Smart Licensing
+-- 合规上报，这个 DNS 名没解析到是要单独处理的事，不靠告警推
+('LICMGR-6-LOG_LICAPP_SMART_GLOBAL_CHANGE', 'mnemonic', '', 0, 1,
+ 'Smart Licensing全局通知变更，周期性刷（样例里一次repeated 4 times），无告警价值'),
+('LICMGR-3-LOG_SMART_LIC_COMM_FAILED', 'mnemonic', '', 0, 1,
+ '连不上CSLU(cslu-local域名没解析到)。license上报通道问题，不影响转发，走license审计');
 
 -- ============================================================
 -- 种子数据：L8 静默规则模板（三条，全部 enabled=0）
