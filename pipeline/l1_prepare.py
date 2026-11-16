@@ -43,6 +43,10 @@ MNEMONIC_REGS = (
 # （Cisco 的 %MODULE-SEV-NAME: 那个冒号在 mnemonic 后面，不在行首）
 LEADING_JUNK_REG = re.compile(r"^:\s+")
 
+# 常见时区缩写白名单，不用 [A-Z]{2,5} 泛匹配——那样会把全大写的
+# hostname（理论场景，现网样本未见过）误吃成时区段
+_TZ_ABBR = r"(?:UTC|GMT|CST|EST|EDT|PST|PDT|CET|CEST|JST|KST|BST|IST|MSK|HKT)"
+
 # 信封：和厂商无关，RFC3164 / RFC5424 都在这段消化。
 # 只为了拿到 hostname 和 body，设备自报时间一律不用
 PRI_REG = re.compile(r"^<(\d{1,3})>")
@@ -57,6 +61,13 @@ TS_REGS = (
                r"(?:\.\d+)?(?:\s+\d{4})?(?:\s+[A-Z]{2,5})?\s*"),
     # 2026-11-11T14:03:22.412+08:00   RFC5424 ISO8601
     re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+\-]\d{2}:?\d{2})?\s*"),
+    # Nov 16 2026 03:26:44+08:00   年份夹在日期和时间中间（部分华为/H3C
+    # 设备的写法），时区可以是ISO偏移(+08:00，紧贴时间无空格)或常见缩写
+    # (CST，带空格)。之前三条正则都认不出这种顺序，这批报文剥不出
+    # mnemonic时（如 OID 前缀写法）全部落 PARSE_FAIL，详见
+    # sql/schema.sql 里 'OID 1' 黑名单那条的注释
+    re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{4}\s+\d{2}:\d{2}:\d{2}"
+               r"(?:\.\d+)?(?:[+\-]\d{2}:?\d{2}|\s+" + _TZ_ABBR + r")?\s*"),
 )
 HOSTNAME_REG = re.compile(r"^([A-Za-z0-9][A-Za-z0-9_.\-]{1,63})\s+")
 

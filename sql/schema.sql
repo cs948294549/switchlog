@@ -535,6 +535,9 @@ VALUES
 -- 因为持续发的时候按 300s 切段会产生大量碎窗口
 ('CRYPTO_BW',       'stateless', 'none',      3600, 1, '',
  'Cisco加密功能吞吐撞上license带宽上限。容量问题走license审计，不进告警'),
+-- 光模块电流/光功率越限：劣化前兆，没有标准clear写法，配 stateless
+('SFP_HEALTH',      'stateless', 'interface', 1800, 1, '',
+ '光模块电流/光功率告警，模块劣化前兆。沿用光模块告警窗口给长，避免抖动刷量'),
 -- PoE / 风扇 / 杂项。全部 stateless：这批日志没有一个有可靠的恢复日志，
 -- 配 raise 会开出永远关不掉的告警（DEV/4/FAN 尤其明显，20 分钟刷 30 条）。
 -- 窗口按日志自身的重复节奏给，不统一用 300s
@@ -544,10 +547,9 @@ VALUES
 -- 混进去会让 PSU_FAIL 的恢复配对出错
 ('FAN_LOW_RPM',       'stateless', 'slot',      3600,  1, '',
  '风扇转速过低，其余风扇已升速补偿。是备件工单不是故障告警'),
--- 和 MAC_FLAP 分开：那个码的 object_type 是 mac，这条的对象是被限速的接口，
--- 塞进同一个码会让指纹的对象类型不一致
-('MAC_FLAP_SUPPRESS', 'stateless', 'interface', 600,   1, '',
- 'MAC漂移导致未知单播被限速到端口带宽50%。已在影响业务转发，比单纯MAC_FLAP要紧'),
+-- MAC_FLAP_SUPPRESS 已废弃，SECE/4/UCSUPPRESS（限速开始）改归 MAC_FLAP，
+-- 对象填接口名（正文没有MAC地址，只能用这个）。见下方 syslog_rule 的改动，
+-- 以及 syslog_severity_rule 里对应那条P2定级规则也已删除
 ('MAC_FLAP_RECOVER',  'stateless', 'none',      600,   1, '',
  'MAC漂移检测恢复。MAC_FLAP是stateless、静默即恢复，这条只用于回溯环路何时消失'),
 ('BUFFER_THRESHOLD',  'stateless', 'slot',      3600,  1, '',
@@ -588,7 +590,25 @@ VALUES
 -- threshold 1：第一条就要报。这是 TCAM 满之前唯一的预警，
 -- 攒阈值等于把预警往后推。
 ('TCAM_THRESHOLD', 'stateless', 'none', 86400, 1, '',
- 'ACL/QoS的TCAM用量超水线。满了之后改ACL可能编程失败，接口落default ACL');
+ 'ACL/QoS的TCAM用量超水线。满了之后改ACL可能编程失败，接口落default ACL'),
+-- 配置复制失败。stateless 不配 raise/clear：失败是瞬时事件，没有恢复
+-- 日志（不会有"配置复制成功了"的补发），下一次配置变更如果成功也不会
+-- 回头确认上一次失败的后果，所以用窗口计数即可。
+-- threshold=1：第一条就报，配置没持久化到flash是真风险（下次重启会丢
+-- 最近的配置变更），不该攒。window 给600秒，避免同一轮保存操作里
+-- 多次重试失败被拆成好几条
+('CONFIG_WRITE_FAILED', 'stateless', 'none', 600, 1, '',
+ '配置复制/保存失败(SYSMGR-3-CFGWRITE_FAILED)。running-config未持久化到flash，重启会丢最近变更'),
+-- 接口CRC错误率超阈值/恢复。和TEMP_ALARM/TEMP_OK同一个raise/clear模式：
+-- 华为这条mnemonic本身就是active/clear成对打的，直接配对能让L7正确处理
+-- "同一个口反复抖"的情况——同指纹30分钟内3次新开告警会被L7升级成
+-- IF_FLAP（见pipeline/l7_state_machine.py的闪断逻辑），这正是CRC错误
+-- 典型的"光模块劣化/网线接触不良反复触发阈值"场景，不该把每次单独当
+-- 一条新告警看
+('CRC_ERROR', 'raise', 'interface', 600, 1, 'CRC_ERROR_CLEAR',
+ '接口CRC错误率超阈值。通常是光模块劣化/网线问题/双工不匹配，需查物理层'),
+('CRC_ERROR_CLEAR', 'clear', 'interface', 600, 1, '',
+ 'CRC错误率恢复，按CRC_ERROR的指纹回关告警');
 
 -- ============================================================
 -- 种子数据：事件定级
@@ -658,8 +678,6 @@ VALUES
  'NTP对时的正常结果，不告警'),
 ('NTP_DROP',          '', '', 3, 'ignore', 100,
  '公网NTP扫描，安全侧信息非网络故障，不告警'),
-('MAC_FLAP_SUPPRESS', '', '', 2, '',       100,
- '端口已被限速到50%带宽，已在影响业务转发，比单纯MAC_FLAP要紧'),
 ('FAN_LOW_RPM',       '', '', 3, '',       100,
  '风扇待更换，是备件工单。给P3不给P2：其余风扇已升速补偿，不会立即过温'),
 ('DHCP_TIMEOUT',      '', '', 3, '',       100,
@@ -695,6 +713,15 @@ VALUES
 -- 配默认级别时直接加一行 sysname_reg 为空的，不用再动这一行
 ('IF_ATTR_CHG',       '', 'corp', 3, 'ignore', 50,
  '职场设备的速率/双工/流控变化不告警。终端每天插拔，是端口up的伴生日志'),
+-- 配置复制失败：P2。配置没持久化到flash不是"当下的网络故障"（业务没受
+-- 影响），但比P3默认级别更值得立即看——下次设备重启/断电会丢最近的
+-- 配置变更，而这种事后面很难补救
+('CONFIG_WRITE_FAILED', '', '', 2, '', 100,
+ '配置复制/保存失败。running-config未持久化，重启会丢最近变更，建议尽快核实并重新保存'),
+-- 接口CRC错误率超阈值：P2。CRC错误通常是光模块劣化/网线问题/双工不
+-- 匹配，不是链路直接中断（不到P1的紧急程度），但要能被看到及时排查物理层
+('CRC_ERROR', '', '', 2, '', 100,
+ '接口CRC错误率超阈值。光模块劣化/网线问题/双工不匹配的典型信号，需排查物理层'),
 -- 全局兜底。唯一允许匹配全网所有事件的规则，删了会打 error
 ('*',        '', '',           3, '',       999,
  '全局兜底。没写专门规则的事件码都是P3，加载时查不到这行会打error');
@@ -745,6 +772,9 @@ VALUES
 ('cisco_nx', 'ETH_PORT_CHANNEL-5-PORT_DOWN', 'exact', '', '',
  'IF_DOWN', ':\\s+(\\S+)\\s+is\\s+down', 100,
  'port-channel38: Ethernet1/38 is down。对象是成员口，不是LAG'),
+('cisco_nx', 'ETH_PORT_CHANNEL-5-PORT_UP', 'exact', '', '',
+ 'IF_UP', ':\\s+(\\S+)\\s+is\\s+up', 100,
+ 'port-channel3: Ethernet1/3 is up。和PORT_DOWN成对，对象是成员口'),
 -- 聚合口：FOP_CHANGED 的 'to none' 才是全断，priority 小的先判。
 -- 靠"冒号+空格+名字+冒号"定位行首的 LAG 名
 ('cisco_nx', 'ETH_PORT_CHANNEL-5-FOP_CHANGED', 'exact', '', 'to none',
@@ -797,6 +827,21 @@ VALUES
 ('huawei', 'IFNET/3/PHY_UPDOWN', 'exact', '', 'turned into UP',
  'IF_UP', 'interface (\\S+?) has', 100,
  '华为物理口 up'),
+-- 华为另一套同义写法（IFADP/IFPDT家族），和 IFNET/3/PHY_UPDOWN 语义一样，
+-- 正文句式也一样（'Interface X has turned into DOWN/UP state.'），归同一
+-- event_code，object_regex直接沿用
+('huawei', 'IFADP/4/PORTDOWNINFO', 'exact', '', '',
+ 'IF_DOWN', 'Interface\\s+(\\S+?)\\s+has', 100,
+ 'Interface GigabitEthernet0/0/46 has turned into DOWN state. (Information=...)'),
+('huawei', 'IFADP/4/PORTUPINFO', 'exact', '', '',
+ 'IF_UP', 'Interface\\s+(\\S+?)\\s+has', 100,
+ 'Interface GigabitEthernet0/0/46 has turned into UP state. (Information=...)'),
+('huawei', 'IFPDT/4/IF_STATE', 'exact', '', 'turned into DOWN',
+ 'IF_DOWN', 'Interface\\s+(\\S+?)\\s+has', 100,
+ 'Interface GigabitEthernet0/0/46 has turned into DOWN state.'),
+('huawei', 'IFPDT/4/IF_STATE', 'exact', '', 'turned into UP',
+ 'IF_UP', 'Interface\\s+(\\S+?)\\s+has', 100,
+ '同PORTDOWNINFO成对的up写法'),
 -- 各家写法一致的用 vendor='*' 一行覆盖
 ('*', 'ETHPORT-5-IF_UP', 'exact', '', '',
  'IF_UP', 'Interface\\s+([^\\s,(]+)', 100,
@@ -911,6 +956,10 @@ VALUES
 ('h3c', 'DEV/4/FAN', 'exact', '', 'FAN FAILED',
  'PSU_FAIL', 'Fan\\s+(\\d+)\\s+failed', 100,
  '%%10DEV/4/FAN FAILED(l):-DevIP=10.39.240.33;   Fan 1 failed.'),
+-- H3C 电源故障，并入PSU_FAIL（不单独定级，维持event_code原有的P2）
+('h3c', 'DEV/2/POWER_FAILED', 'exact', '', '',
+ 'PSU_FAIL', 'Power\\s+(\\d+)\\s+failed', 100,
+ '%%10DEV/2/POWER_FAILED: -DevIP=172.31.1.40; Power 2 failed.'),
 -- 思科风扇低转速。单独事件码不并进 PSU_FAIL：没有恢复日志，
 -- 并进去会让 PSU_FAIL->PSU_OK 的配对关不掉它
 ('cisco_ios', 'ENVMON-4-ONE_FAN_LOW_RPM', 'exact', '', '',
@@ -932,9 +981,12 @@ VALUES
 ('huawei', 'POE/4/hwPoePdDisconnected_active', 'exact', '', '',
  'POE_PD_CHG', 'Interface=([^,)]+)', 100,
  'PD disconnected. (IfIndex=47, Interface=GE1/0/47)，PDDISCONNECT的伴生trap'),
--- 华为 MAC 漂移限速。对象是被限速的接口，不是 MAC，所以不能并进 MAC_FLAP
+-- 华为 MAC 漂移限速，已并入 MAC_FLAP（原MAC_FLAP_SUPPRESS已废弃）。
+-- 对象填接口名而不是MAC：正文没有MAC地址，只有被限速的接口。这会让
+-- MAC_FLAP下同时存在"对象=MAC"和"对象=接口"两种指纹，是故意的权衡——
+-- 保留对象类型不一致的代价，换回"一次漂移只有一个事件码"
 ('huawei', 'SECE/4/UCSUPPRESS', 'exact', '', '',
- 'MAC_FLAP_SUPPRESS', 'Interface=([^,)]+)', 100,
+ 'MAC_FLAP', 'Interface=([^,)]+)', 100,
  'MAC address flapping started on port. The rate of unknown unicast packets was limited to 50% of the port bandwidth.(Interface=GigabitEthernet0/0/36)'),
 -- 设备自身做 DHCP 客户端要不到地址，正文里的键名是 InterfaceName
 ('huawei', 'DHCP/5/WAITOFFER_TIMEOUT', 'exact', '', '',
@@ -957,6 +1009,14 @@ VALUES
 ('*', 'CERM-4-TX_BW_LIMIT', 'exact', '', '',
  'CRYPTO_BW', '', 100,
  'Maximum Tx Bandwidth limit of 85000 Kbps reached for Crypto functionality with securityk9 technology package license'),
+-- 光模块电流/光功率越限。cisco_nx 两种严重度(3/4)都归 SFP_HEALTH，
+-- 对象是本机接口——模块装在哪个口就盯哪个口
+('cisco_nx', 'ETHPORT-4-IF_SFP_WARNING', 'exact', '', '',
+ 'SFP_HEALTH', 'Interface\\s+([^\\s,]+),', 100,
+ 'Interface Ethernet1/9, High Current Warning'),
+('cisco_nx', 'ETHPORT-3-IF_SFP_ALARM', 'exact', '', '',
+ 'SFP_HEALTH', 'Interface\\s+([^\\s,]+),', 100,
+ 'Interface Ethernet1/9, High Rx Power Alarm'),
 -- ---------- 以下两条 mnemonic 留空，只对剥不出 mnemonic 的报文生效 ----------
 --
 -- 这两条不得不走 fuzzy：它们的 header 格式 strip_mnemonic 剥不出来。
@@ -1060,7 +1120,36 @@ VALUES
  'TEMP_OK', '', 100, '华三温度恢复'),
 -- SIC 模块温度控制电路异常。老系统归在同一条规则里，照搬
 ('h3c', 'HSC/4/SICTMPEXC', 'exact', '', '',
- 'TEMP_ALARM', '', 100, 'SIC模块温度控制电路异常');
+ 'TEMP_ALARM', '', 100, 'SIC模块温度控制电路异常'),
+-- 配置复制失败。vendor用'*'：样例是NX-OS的SYSMGR facility，但其它厂商
+-- 配置落盘失败也可能走到不同mnemonic，这条先不限厂商，命中后再收窄。
+-- object_regex留空：error-id是正文里变化的十六进制值，不是"对象"，
+-- 不同error-id不该算成不同指纹——都是同一类"配置没写进flash"的故障
+('*', 'SYSMGR-3-CFGWRITE_FAILED', 'exact', '', '',
+ 'CONFIG_WRITE_FAILED', '', 100,
+ 'Configuration copy failed (error-id 0x401E0004). error-id数值不同不消歧，都归同一事件'),
+-- LACP聚合成员口individual状态，两条mnemonic都归IF_DOWN（成员口没能
+-- 正常加入port-channel，异常状态）。body_match消歧两种正文——
+-- PORT_INDIVIDUAL_DOWN是"is down"，PORT_INDIVIDUAL(无DOWN后缀)是
+-- "is operationally individual"，但两者用的object_regex一致。
+-- 注意：这两条mnemonic现网没有对应的IF_UP恢复写法（NX-OS的individual
+-- 转回正常聚合时打的是另一个mnemonic，现网暂未见到），意味着这条
+-- IF_DOWN告警可能需要人工确认接口状态后才能在看板上标记已处理，
+-- 不会自动收到对应的IF_UP日志而回关
+('cisco_nx', 'ETH_PORT_CHANNEL-5-PORT_INDIVIDUAL_DOWN', 'exact', '', 'is down',
+ 'IF_DOWN', 'port\\s+(\\S+?)\\s+is', 100,
+ 'individual port Ethernet1/19 is down'),
+('cisco_nx', 'ETH_PORT_CHANNEL-4-PORT_INDIVIDUAL', 'exact', '', 'is operationally individual',
+ 'IF_DOWN', 'port\\s+(\\S+?)\\s+is', 100,
+ 'port Ethernet1/19 is operationally individual'),
+-- 接口CRC错误率超阈值/恢复（华为写法）。object_regex抽InterfaceName，
+-- active/clear两条正文结构一致，直接复用同一个正则
+('huawei', 'DEVM/1/hwIfMonitorCrcErrorRising_active', 'exact', '', '',
+ 'CRC_ERROR', 'InterfaceName=([^,)]+)', 100,
+ 'The CRC error is rising. (InterfaceIndex=6, hwIfMonitorCrcErrorStatistics=536, hwIfMonitorCrcErrorThreshold=3, ..., InterfaceName=GE1/0/6, ...)'),
+('huawei', 'DEVM/1/hwIfMonitorCrcErrorRising_clear', 'exact', '', '',
+ 'CRC_ERROR_CLEAR', 'InterfaceName=([^,)]+)', 100,
+ 'The CRC error alarm resume. (..., InterfaceName=GE1/0/6, ...)');
 
 -- 不写 rule_id，交给 AUTO_INCREMENT。去重靠 uniq_match
 -- (vendor, mnemonic, match_type, pattern, body_match)，重复执行不会插出第二份
@@ -1217,16 +1306,16 @@ VALUES
 ('CM/5/USER_OFFLINERESULT', 'mnemonic', '', 0, 1,
  '用户下线结果留痕，txt第458行的原写法，一并配上'),
 -- 漂移限速解除。和 SECE/4/UCSUPPRESS（限速开始）是同一次漂移的两条，
--- 开始那条走 MAC_FLAP_SUPPRESS 事件码（P2 告警，端口被限到 50% 带宽）。
+-- 开始那条现在归 MAC_FLAP 事件码（已并入，原MAC_FLAP_SUPPRESS废弃）。
 --
--- 解除这条拉黑不配规则，理由：MAC_FLAP_SUPPRESS 是 stateless，
+-- 解除这条拉黑不配规则，理由：MAC_FLAP 是 stateless，
 -- 告警靠 600s 窗口静默自动恢复，不靠这条解除日志驱动 ——
 -- 就算配上规则也关不掉告警。而它又没别的用途：要回溯"限速什么时候解除的"，
--- UCSUPPRESS 那条 P2 告警自己带了时间和解除时刻（sweep 的 clear_time）。
+-- UCSUPPRESS 那条告警自己带了时间和解除时刻（sweep 的 clear_time）。
 -- 留着只会汇进 UNKNOWN_MNEMONIC 那条共用告警里（同一设备所有未匹配日志
 -- 共用一个指纹），把真缺口盖住
 ('SECE/4/UCSUPPRESSRESUME', 'mnemonic', '', 0, 1,
- '漂移限速解除。MAC_FLAP_SUPPRESS靠窗口静默自动恢复，不靠这条驱动'),
+ '漂移限速解除。MAC_FLAP靠窗口静默自动恢复，不靠这条驱动'),
 -- ---------- LLDP 邻居变化：17 条 ----------
 --
 -- 现网一次邻居变化刷三条（172.26.1.46 的 GE1/0/23，18:03:37 同一秒）：
@@ -1347,12 +1436,12 @@ VALUES
 -- txt 里 SHELL/SSHS 一族 42 条，这里配 28 条（你给的四条在
 -- 第 375/381/403/373 行）。
 --
--- 故意不拦的 13 条失败/拒绝类，和保留 CLI/5/LOGINFAILED 同一个理由 ——
+-- 故意不拦的 12 条失败/拒绝类，和保留 CLI/5/LOGINFAILED 同一个理由 ——
 -- 这些是安全事件，要能看见：
 --   SHELL/5/SHELL_LOGINFAIL        SHELL/4/LOGINFAILED
 --   SHELL/4/LOGINAUTHFAIL          SHELL/4/CHANGE_PASSWORD_FAIL
 --   SHELL/5/SETPASS_FAIL_FIRSTLOGIN
---   SHELL/5/SHELL_CMDDENY          SHELL/4/SHELL_CMD_MATCHFAIL
+--   SHELL/5/SHELL_CMDDENY
 --   SHELL/4/SHELL_CMD_EXECUTEFAIL
 --   SSHS/6/SSHS_AUTH_PWD_FAIL      SSHS/6/SSHS_AUTHOR_FAIL
 --   SSHS/6/SSHS_INVALID_USERNAME_PWD
@@ -1360,6 +1449,19 @@ VALUES
 --   SSHS/5/SSHS_ACL_DENY
 -- 它们现在落 UNKNOWN_MNEMONIC。要正式接的话往 LOGIN_FAIL 事件码上挂规则，
 -- 别加到这里来
+--
+-- SHELL/4/SHELL_CMD_MATCHFAIL 原本也在这份"故意不拦"清单里（命令输错/
+-- 权限不足被拒绝），用户已确认改为拉黑——不再保留"谁在尝试敏感命令"
+-- 这条审计信号，按噪声处理（现网样例大多是管理员打错命令，如
+-- dis poe/乱码输入，而不是真正的越权尝试）
+('SHELL/4/SHELL_CMD_MATCHFAIL', 'mnemonic', '', 0, 1,
+ '命令输错/视图不对被拒绝，原本故意保留的安全审计信号，用户已确认改按噪声拉黑'),
+-- H3C 设备重启留痕，和cisco_nx的LOG-6-SYSTEM_MSG同族
+('SYSLOG/6/SYSLOG_RESTART', 'mnemonic', '', 0, 1,
+ 'H3C设备syslog进程重启留痕，设备重启时必打，无告警价值'),
+-- 手工ping命令的统计结果留痕，不是自动化探测，是人在排查时自己敲的
+('PING/6/PING_STATISTICS', 'mnemonic', '', 0, 1,
+ '手工执行ping命令的统计结果留痕（丢包率等），是操作记录不是告警，真实连通性故障走BFD/接口状态那套'),
 ('SSHS/6/SSHS_LOG', 'mnemonic', '', 0, 1,
  'SSH登录接受留痕，txt第375行'),
 ('SSHS/6/SSHS_CONNECT', 'mnemonic', '', 0, 1,
@@ -1416,6 +1518,19 @@ VALUES
  'shell安全日志留痕，txt第413行'),
 ('SHELL/6/CLI', 'mnemonic', '', 0, 1,
  'CLI操作留痕，txt第603行'),
+-- 进程崩溃。txt 里没有这条（SYSMGR 只有 4 条配置写入失败类），
+-- 是本次自行决定屏蔽的，和之前那些"沿用历史判断"的性质不同。
+--
+-- 样例：Service "snmpd" (PID 20283) hasn't caught signal 11 (core will be saved)
+-- signal 11 = SIGSEGV 段错误。snmpd 崩的那段时间 SNMP 轮询拿不到数据，
+-- 采集侧的 devices/ports 表会出现空洞；反复崩通常是 bug 或内存问题，
+-- core 文件是给 TAC 开 case 的材料。
+--
+-- 拦掉之后这类事件在告警侧完全看不见了。要重新看就把这行 enabled=0。
+-- 另一个办法是配成 action=ignore（日志留在 alarm_log 可回溯，只是不告警），
+-- 但那要先给它配 syslog_rule 和事件码，比直接拦麻烦
+('SYSMGR-2-SERVICE_CRASHED', 'mnemonic', '', 0, 1,
+ '进程崩溃(signal 11段错误)。本次自行决定屏蔽，txt里没有这条，想恢复改enabled=0'),
 ('DHCP/5/WAITOFFER_TIMEOUT', 'mnemonic', '', 0, 1,
  '设备自身DHCP客户端超时。真失联轮询监控会先报，这条自己不构成故障'),
 ('SYSMIB/4/CLKCHANGE', 'mnemonic', '', 0, 1,
@@ -1499,7 +1614,142 @@ VALUES
 ('LICMGR-6-LOG_LICAPP_SMART_GLOBAL_CHANGE', 'mnemonic', '', 0, 1,
  'Smart Licensing全局通知变更，周期性刷（样例里一次repeated 4 times），无告警价值'),
 ('LICMGR-3-LOG_SMART_LIC_COMM_FAILED', 'mnemonic', '', 0, 1,
- '连不上CSLU(cslu-local域名没解析到)。license上报通道问题，不影响转发，走license审计');
+ '连不上CSLU(cslu-local域名没解析到)。license上报通道问题，不影响转发，走license审计'),
+('LICMGR-6-LOG_LIC_FEATURE_INSTALLED', 'mnemonic', '', 0, 1,
+ 'license功能安装成功留痕，和上面LICMGR系列同族，设备重启初始化时打'),
+-- 以下6条是cisco_nx设备重启/初始化时的一次性留痕，和故障无关：
+-- LOG-6-SYSTEM_MSG(syslogd自身重启)、BCM_USD(芯片驱动通知，FAST REBOOT
+-- 开关状态)、USER-2-SYSTEM_MSG(clis命令文件加载进度)、VDC_MGR(虚拟设备
+-- 上下文状态机，create pending是启动过程的中间态)、SENSOR-3-SENSOR_MSG1
+-- (传感器驱动初始化调用栈，不是真的传感器告警——级别3容易误读成故障，
+-- 现网样例是"calling sensor_usd_init"纯函数调用记录)
+('LOG-6-SYSTEM_MSG', 'mnemonic', '', 0, 1,
+ 'syslogd进程自身启动/重启留痕，设备重启时必打，无告警价值'),
+('BCM_USD-2-BCM_USD_NOTIFICATION_IMP', 'mnemonic', '', 0, 1,
+ '芯片驱动(Broadcom USD)重要状态通知，现网样例是FAST REBOOT开关状态，设备启动过程留痕'),
+('USER-2-SYSTEM_MSG', 'mnemonic', '', 0, 1,
+ '用户进程杂项消息，现网样例是clis命令文件加载开始/结束，设备启动过程留痕'),
+('VDC_MGR-5-VDC_STATE_CHANGE', 'mnemonic', '', 0, 1,
+ 'VDC(虚拟设备上下文)状态机变化，现网样例是启动过程的create pending中间态'),
+('SENSOR-3-SENSOR_MSG1', 'mnemonic', '', 0, 1,
+ '传感器驱动初始化留痕(calling sensor_usd_init)，级别3易误读成故障，实际是函数调用记录'),
+-- ---------- 批量屏蔽：接口带宽变化 / 第三方管理面审计 / 非原厂光模块（23条）----------
+--
+-- 带宽变化：聚合口bandwidth值变化，是成员口增减/速率协商后的衍生通知，
+-- 不是故障。真要发现聚合口异常，走 LAG_DOWN / LAG_MEMBER_CHG 那套
+('ETHPORT-5-IF_BANDWIDTH_CHANGE', 'mnemonic', '', 0, 1,
+ '聚合口bandwidth值变化通知，是成员口增减/速率协商的衍生结果，不是故障'),
+-- Linux式syslog转发(sudo session opened/closed)，设备自己的操作系统审计，
+-- 一次sudo操作刷两条（open+close），和之前拦的OPS/CLI/CM/SHELL/SSHS审计
+-- 同一性质：设备上有留痕可查，走告警管线只会被淹掉
+('OPENSRC/6/SYSLOG', 'mnemonic', '', 0, 1,
+ 'Linux子系统syslog转发(如sudo session)，设备自身操作系统审计，非网络故障'),
+-- H3C AAA认证流程留痕（LAUNCH发起、SUCCESS成功），一次登录对AUTHEN/
+-- AUTHOR/ACCOUNT三阶段各打一对，共6条。和之前的CM/认证结果留痕同族，
+-- 失败类(如有)不在这批，故意不拦
+('SC/6/SC_AAA_LAUNCH', 'mnemonic', '', 0, 1,
+ 'AAA认证流程发起(AUTHEN/AUTHOR/ACCOUNT三阶段)，正常登录都会打'),
+('SC/6/SC_AAA_SUCCESS', 'mnemonic', '', 0, 1,
+ 'AAA认证流程成功，和SC_AAA_LAUNCH成对，同族'),
+-- SSH/CFGMAN/CFM/HWCM/SHELL 管理面审计，和之前批次（OPS/CLI/CM/SHELL/SSHS）
+-- 同一性质的后续补充。其中 CFGMAN_CFGCHANGED / HWCM_TRAPLOG / CFM_SAVE 这几条
+-- 带配置变更的EventIndex/ConfigSource——拦掉之后"谁改了配置、什么时候改的"
+-- 这类排查将无法从告警库查，只能登设备看 display logbuffer 或配置历史。
+-- 用户已确认屏蔽，这里记录影响面供后续查阅
+('SSH/6/SSH_LOGIN', 'mnemonic', '', 0, 1,
+ 'SSH登录成功留痕(华为写法)'),
+('SSH/4/TrapLogin', 'mnemonic', '', 0, 1,
+ 'SSH用户登录trap(H3C写法)'),
+('SSH/6/SSH_CONNECTION_CLOSE', 'mnemonic', '', 0, 1,
+ 'SSH连接关闭留痕(华为写法)'),
+('SSH/4/TrapLogoff', 'mnemonic', '', 0, 1,
+ 'SSH用户登出trap(H3C写法)'),
+('CFGMAN/4/TRAP', 'mnemonic', '', 0, 1,
+ '配置变更trap(H3C写法)。拦掉后配置变更审计只能查设备本机日志'),
+('CFGMAN/5/CFGMAN_CFGCHANGED', 'mnemonic', '', 0, 1,
+ '配置变更留痕，带EventIndex/ConfigSource。拦掉后配置变更审计只能查设备本机日志'),
+('CFM/5/CFM_SAVECONFIG_SUCCESSFULLY', 'mnemonic', '', 0, 1,
+ '配置保存成功留痕(华为写法)'),
+('CFGMAN/5/CFGMAN_EXIT', 'mnemonic', '', 0, 1,
+ '退出配置模式留痕(H3C写法)'),
+('HWCM/4/EXIT', 'mnemonic', '', 0, 1,
+ '退出配置模式留痕(华为写法)，和CFGMAN/5/CFGMAN_EXIT同族'),
+('SSH/5/SSH_USER_LOGIN', 'mnemonic', '', 0, 1,
+ 'SSH用户登录成功留痕(H3C写法，带ServiceType/UserName等字段)'),
+('SSH/5/SSH_USER_LOGOUT', 'mnemonic', '', 0, 1,
+ 'SSH用户登出留痕(H3C写法)，和SSH_USER_LOGIN成对'),
+-- 非原厂光模块告警：不是单纯噪声，是资产/质保相关信息——设备检测到非H3C
+-- 光模块，厂商声明不保证兼容性和维保责任。用户已确认按噪声处理拦掉，
+-- 但这台设备用了第三方光模块这件事本身值得记一笔，万一后续该口出问题，
+-- 第一个该排除的嫌疑就是这颗模块
+('OPTMOD/4/PHONY_MODULE', 'mnemonic', '', 0, 1,
+ '检测到非H3C原厂光模块(厂商声明不保证兼容性/维保)。此信息本身有资产价值，按噪声拦掉前请知悉'),
+-- 端口down的中间瞬态(Initializing)，几乎总是伴随紧接着的最终down/up，
+-- 单独告警是重复噪声
+('ETHPORT-5-IF_DOWN_INITIALIZING', 'mnemonic', '', 0, 1,
+ '端口down的中间瞬态(Initializing态)，伴随最终IF_DOWN一起打，单独告警是噪声'),
+-- 华为日志限频抑制留痕：某条trap(这里是hwMflpVlanLoopPeriodicTrap)打太频繁
+-- 被设备自己限速，报的是"抑制动作"本身，不是原始事件。原始trap已有规则
+-- (FEI/4/hwMflpVlanLoopPeriodicTrap -> MAC_FLAP)，拦掉这条不影响漂移检测
+('INFO/4/SUPPRESS_LOGINFO', 'mnemonic', '', 0, 1,
+ '华为日志限频抑制留痕，报"某trap被抑制"而非trap本身，原trap已有规则覆盖'),
+-- IPSEC SPI/SA 异常，用户确认不处理，按噪声拦掉
+('CRYPTO-4-RECVD_PKT_INV_SPI', 'mnemonic', '', 0, 1,
+ 'IPSEC收到SPI不对的包，用户确认不处理'),
+('CRYPTO-4-IKMP_NO_SA', 'mnemonic', '', 0, 1,
+ 'IKE消息无对应SA，用户确认不处理'),
+('USER-3-SYSTEM_MSG', 'mnemonic', '', 0, 1,
+ '用户进程杂项消息(本次样例是core文件写入失败)，和DAEMON-3-SYSTEM_MSG同族大杂烩mnemonic'),
+('CFM/4/SAVE', 'mnemonic', '', 0, 1,
+ '用户选择是否保存配置的交互留痕(华为写法)'),
+('HWCM/5/TRAPLOG', 'mnemonic', '', 0, 1,
+ '配置变更trap(华为写法)，带EventIndex/ConfigSource。拦掉后配置变更审计只能查设备本机日志'),
+('SSH/5/SSH_CONNECT_CLOSED', 'mnemonic', '', 0, 1,
+ 'SSH连接关闭留痕(H3C写法)'),
+('SSH/4/AUTHSUCC', 'mnemonic', '', 0, 1,
+ 'SSH密码认证成功留痕(H3C写法)'),
+('SSH/4/LOGIN', 'mnemonic', '', 0, 1,
+ 'STEL用户登录成功留痕(H3C写法)'),
+('SHELL/4/CMD', 'mnemonic', '', 0, 1,
+ '命令执行留痕，带完整命令内容(task/ip/user/command字段)。拦掉后无法从告警库审计操作命令'),
+('SSH/4/LOGOUT', 'mnemonic', '', 0, 1,
+ 'STEL用户登出留痕(H3C写法)'),
+-- 许可证变更回调，无标准 %FACILITY-SEV-MNEMONIC: 格式，strip_mnemonic
+-- 三条正则都剥不出来，只能走 scope=message 全文子串匹配
+('License change callback', 'message', '', 0, 1,
+ '许可证变更回调通知(clis进程)。无标准mnemonic格式，走全文匹配'),
+-- 带 SNMP OID 前缀，信封时间戳格式是"月 日 年 时:分:秒"（如
+-- "Nov 14 2026 16:01:50"）的那批报文。
+--
+-- 根因已修复：l1_prepare.py 的 TS_REGS 加了第4条正则，认得这种"年份
+-- 夹在日期和时间中间"的写法（包括带ISO时区偏移如+08:00的变体，见
+-- SECE/4/UCSUPPRESS 伴生的 FWM-ETH/4/hwMflpVlanLoopAlarm_clear 样例），
+-- 现在 readable=True。但这条黑名单继续保留——这批报文本身没有标准
+-- %FACILITY-SEV-MNEMONIC: 结构，只有OID数字串，mnemonic依然剥不出来，
+-- readable修复只是让它们能走到L2/L3，不代表能被现有fuzzy规则认出来，
+-- 该拦的噪声还是要拦。
+--
+-- 这不是单一事件类型，是同一个时间戳写法下混杂的几种不同内容：
+--   PKI/2/PKILOCALCERTINVALID       本机证书失效（CERT_EXPIRED同族）
+--   SRM/3/SFP_EXCEPTION             非认证光模块（OPTMOD/4/PHONY_MODULE同族）
+--   L2IFPPI/4/MFLPVLANALARM          MAC漂移（和已有规则FEI/4/hwMflpVlanLoopPeriodicTrap
+--                                    是同一类故障的另一种华为mnemonic写法）
+--   HWCM/5/TRAPLOG(走这条格式的那批)  配置变更（CFGMAN_CFGCHANGED同族）
+--
+-- 已核实：MAC漂移这条(OID ...160.3.7)在现网样例里和 SECE/4/UCSUPPRESS
+-- 几乎同一毫秒一起打（同一次漂移事件的伴生日志），UCSUPPRESS 走的是
+-- 正常的 readable=True 路径，已经配了规则（归 MAC_FLAP，已并入）。
+-- 所以拉黑这条 OID 不会让 MAC 漂移检测能力归零，只是丢了这一种写法的
+-- 冗余信号。
+--
+-- 全量核实：现网样本里含 'OID 1' 的 57 条全部 readable=False，
+-- 没有一条是已经走正常路径的，拉黑是纯收益，不会误伤现有规则。
+--
+-- pattern 用 'OID 1' 不用更短的 'OID'：后半截怕和别的正文里出现的
+-- "OID"字样（如果有）产生交叉，'OID 1' 后面必然跟 SNMP OID 的数字段，
+-- 更精确一点
+('OID 1', 'message', '', 0, 1,
+ '信封时间戳"月 日 年 时:分:秒"格式未被TS_REGS识别导致PARSE_FAIL的一批报文(PKI证书/SFP光模块/MAC漂移/配置变更等多种内容混杂)，根治需改l1_prepare.py的TS_REGS，先在L2拦掉避免持续落PARSE_FAIL');
 
 -- ============================================================
 -- 种子数据：L8 静默规则模板（三条，全部 enabled=0）
