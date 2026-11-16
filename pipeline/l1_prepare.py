@@ -30,8 +30,12 @@ MNEMONIC_REGS = (
     # 中间槛位段可选，SEV 段锁死纯数字不变，两段式格式不受影响
     re.compile(r"%{1,2}([A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z][A-Za-z0-9_]*)?-\d+-[A-Za-z0-9_\-]+)\s*:"),
     # Comware %%10IFNET/3/PHY_UPDOWN:   华为 %%01IFNET/4/LINK_STATE:
-    # 前导数字是日志版本号，剥掉，否则同一事件 V5/V7 算成两个 mnemonic
-    re.compile(r"%{1,2}\d{0,2}([A-Za-z][A-Za-z0-9_]*(?:/\d+)?/[A-Za-z0-9_\-]+)"),
+    # 前导数字是日志版本号，剥掉，否则同一事件 V5/V7 算成两个 mnemonic。
+    # FAC 段收中划线（%%01FWM-ETH/4/...）：华为部分模块名自带中划线，
+    # 原来的 [A-Za-z0-9_]* 收不了，导致这条剥出空串、只能靠 fuzzy
+    # 规则接。已用现网样本回归：只有 FWM-ETH 这一种新增匹配，没有
+    # 任何已有 mnemonic 的剥取结果发生变化
+    re.compile(r"%{1,2}\d{0,2}([A-Za-z][A-Za-z0-9_\-]*(?:/\d+)?/[A-Za-z0-9_\-]+)"),
     # FortiGate  logid="0100032003"
     re.compile(r"\blogid=\"?(\d+)\"?"),
 )

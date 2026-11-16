@@ -941,6 +941,18 @@ VALUES
 ('huawei', 'FEI/4/hwMflpVlanLoopPeriodicTrap', 'exact', '', '',
  'MAC_FLAP', 'address\\s*:\\s*([0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4})', 100,
  'MAC flapping detected, VlanId = 136, Original-Port = Eth-Trunk100, Flapping port 1 = Eth-Trunk1, port 2 = -. ...address : c6e5-964a-24b5'),
+-- 华为MAC漂移的第三种mnemonic写法(FWM-ETH/4/，Comware/分隔式，FAC段
+-- 带中划线)。l1_prepare.py的MNEMONIC_REGS已把中划线收进FAC段字符类，
+-- 现在能正常剥出完整mnemonic，不用再走fuzzy。和FEI/4/
+-- hwMflpVlanLoopPeriodicTrap同族，对象提取正则直接沿用
+('huawei', 'FWM-ETH/4/hwMflpVlanLoopAlarm_active', 'exact', '', '',
+ 'MAC_FLAP', 'address\\s*:\\s*([0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4})', 100,
+ '%%01FWM-ETH/4/hwMflpVlanLoopAlarm_active(l):CID=0x0-alarmID=0x095e0012;MAC flapping detected, VlanId = 128, Original-Port = Eth-Trunk1, Flapping port 1 = Eth-Trunk100, port 2 = -. Check the network connected to the interface learning a flapping MAC address : 92d6-2d33-1343.'),
+-- 上面_active(触发)的恢复对端，归MAC_FLAP_RECOVER（和UCSUPPRESSRESUME
+-- 同理：stateless靠窗口静默自动恢复，这条只用于回溯环路何时消失）
+('huawei', 'FWM-ETH/4/hwMflpVlanLoopAlarm_clear', 'exact', '', '',
+ 'MAC_FLAP_RECOVER', '', 100,
+ '%%01FWM-ETH/4/hwMflpVlanLoopAlarm_clear(l):CID=0x0-alarmID=0x095e0012-clearType=service_resume;Mac flapping detection recovered in vlan 136.'),
 -- H3C 风扇故障。mnemonic 只能填 DEV/1/FAN ——
 -- l1_prepare.strip_mnemonic 的正则在斜杠最后一段碰到空格就截断，
 -- "DEV/1/FAN STATE CHANGES TO FAILURE" 实际剥出来的是 "DEV/1/FAN"，
@@ -1031,15 +1043,29 @@ VALUES
 -- 代价可控：fuzzy_candidates 只在 mnemonic 为空时才跑。现网样本
 -- 38/660 条无 mnemonic（5.8%），其中 10 条 "last message repeated"
 -- 已被 L2 黑名单在更前面拦掉，真正走到这里的是 28 条。
--- 四条 fuzzy 互不重叠，已对现网样本核过，无交叉误命中
+--
+-- !! 发现一个和下面FWM-ETH改动无关的既有问题，先记录不处理：
+-- l3_parser.py 的 _pick() 是"mnemonic非空就只查exact候选表，完全不碰
+-- fuzzy表"（见该文件_pick方法）。但下面这条 BUFFER_THRESHOLD_EXCEEDED
+-- 和ACLQOS_OVER_THRESHOLD(下一条)用的FAC段'TAHUSD-SLOT1'/'ACLQOS-SLOT1'
+-- 实际走的是MNEMONIC_REGS第1条正则（Cisco两/三段式，本来就收中划线），
+-- 剥出来不是空串，是完整的'TAHUSD-SLOT1-4-BUFFER_THRESHOLD_EXCEEDED'
+-- 这种三段式字符串——不满足"mnemonic为空"的前提，fuzzy规则根本不会被
+-- 查到。这两条从配上那天起大概率一直没生效，这两类日志应该一直在落
+-- UNKNOWN_MNEMONIC。要修的话应该把下面两条改成exact、mnemonic填完整
+-- 三段式字符串，和FWM-ETH这次的处理方式一样
 ('cisco_nx', '', 'contains', 'BUFFER_THRESHOLD_EXCEEDED', '',
  'BUFFER_THRESHOLD', 'Module\\s+(\\d+)', 300,
- '%TAHUSD-SLOT1-4-BUFFER_THRESHOLD_EXCEEDED: Module 1 Instance 0 Pool-group buffer 90 percent threshold is exceeded!（FAC段含中划线，mnemonic剥不出）'),
-('huawei', '', 'contains', 'hwMflpVlanLoopAlarm_clear', '',
- 'MAC_FLAP_RECOVER', '', 300,
- '%%01FWM-ETH/4/hwMflpVlanLoopAlarm_clear(l):...;Mac flapping detection recovered in vlan 136.（模块段含中划线，mnemonic剥不出）'),
--- TCAM 水线。第三条不得不走 fuzzy 的：'ACLQOS-SLOT1' 的 FAC 段含中划线，
--- strip_mnemonic 剥出来是空串（和 TAHUSD-SLOT1 / FWM-ETH 同一个坑）。
+ '%TAHUSD-SLOT1-4-BUFFER_THRESHOLD_EXCEEDED: Module 1 Instance 0 Pool-group buffer 90 percent threshold is exceeded!（FAC段含中划线，mnemonic剥不出——存疑，见上方注释）'),
+-- hwMflpVlanLoopAlarm_clear/_active 原来在这里走fuzzy（FWM-ETH是
+-- Comware/分隔式，走MNEMONIC_REGS第2条正则，原来不收中划线，mnemonic
+-- 剥出来是真的空串，和上面两条不是一回事）。l1_prepare.py 已经把
+-- 第2条正则的FAC段也收了中划线，现在能正常剥出mnemonic，两条改成
+-- exact挂到下面 FEI/4/hwMflpVlanLoopPeriodicTrap 旁边了，这里不用再配
+--
+-- TCAM 水线，和上面BUFFER_THRESHOLD_EXCEEDED同一个问题：'ACLQOS-SLOT1'
+-- 也走第1条正则，剥出来是完整的'ACLQOS-SLOT1-4-ACLQOS_OVER_THRESHOLD'，
+-- 不是空串，这条fuzzy大概率同样没生效过
 --
 -- object_regex 留空，不抽对象：正文里的 Inst/Tcam/Bank 是硬件位置，
 -- 对排查没用 —— 要知道哪个区域满了得登设备看
