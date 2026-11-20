@@ -66,8 +66,9 @@ L8 静默排在状态机之后不是随手放的：判据里的 object 要等 L6
     # L5 attrs 第一步：syslog_event 按 event_code 查
     state         str     raise / clear / stateless，被定级规则改成 ignore 时见下
     object_type   str     interface / peer / mac / slot / none
-    window_sec    int     聚合窗口
-    threshold     int     窗口内达到该条数才告警
+    window_sec    int     本事件码自己的聚合窗口。实际聚合用的是下面的
+                          segment_window_sec —— 恢复事件按故障码的窗口算
+    threshold     int     本事件码自己的阈值，同上
     clear_code    str     恢复事件码，L7 据此配对
 
     # L5 attrs 第二步：syslog_severity_rule 按 (event_code, ip, sysname) 查
@@ -90,10 +91,20 @@ corp 职场的 rsw 掉口压根不用看（action=ignore）。定级必须排在
 
 到这里一条原子告警就齐了。后面各层的产出：
 
-    # L5 顺带给 L6 的
+    # L5 顺带给 L6 / L7 的
     raise_code    str     本事件是谁的恢复事件，自己是故障码时为空。
                           L6 据此算指纹：IF_UP 按 IF_DOWN 算，否则恢复
                           事件落到自己的指纹上，故障告警永远关不掉
+    segment_window_sec int 窗口段用的窗口。**取故障码那一行的 window_sec**，
+                          不是本事件自己的 —— 段是故障码的段（指纹按
+                          raise_code 算），"这条日志算不算同一段"也该按
+                          故障码的窗口判。自己就是故障码时两者相等
+    segment_threshold  int 同理，段内攒够几条才插 alarm_list 的行，
+                          取故障码那一行的 threshold
+
+                          有这两个字段，成对的两个码就不需要"window_sec
+                          必须配成一样"这条约束了 —— IF_UP 那一行填多少
+                          都不影响聚合
 
     # L6 aggregate 产出
     fingerprint   str     md5(ip|raise_code or event_code|alarm_object)

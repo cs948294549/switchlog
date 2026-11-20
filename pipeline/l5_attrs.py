@@ -35,6 +35,17 @@ action='ignore' 产出 state=ignore，事件照样走完 L8~L9 并落 ES，只�
 不开告警 —— 割接或事后回看时这段日志还查得到。要彻底不解析的噪声配
 syslog_black_list，要按变更窗口静默的配 L8 的 mute。
 
+本层还顺带给 L6/L7 算三个字段（_fill_segment_attrs）：
+
+    raise_code           本事件是谁的恢复事件，L6 据此算指纹
+    segment_window_sec   窗口段用的窗口
+    segment_threshold    窗口段用的阈值
+
+后两个取**故障码**那一行的值，不是本事件自己的 —— 窗口段是故障码的段
+（指纹按 raise_code 算，IF_UP 落到 IF_DOWN 的指纹上），所以 IF_UP 判在不在
+同一段该用 IF_DOWN 的窗口。这样成对的两个码就不需要"窗口必须配成一样"
+那条约束，IF_UP 那一行填多少都不影响聚合。
+
 两张表查不到都给默认值并记 warning，都属于配置漏项。
 """
 import re
@@ -162,37 +173,26 @@ class EventAttrIndex(object):
                              attr.clear_code, owner, attr.event_code, owner)
                 continue
             self.raise_codes[attr.clear_code] = attr.event_code
-            self._check_paired_window(attr)
+            self._check_clear_code(attr)
 
-    def _check_paired_window(self, raise_attr):
+    def _check_clear_code(self, raise_attr):
         """
-        成对的 raise / clear 两个码 window_sec 必须一样
+        clear_code 指向的事件码在表里得有行
 
-        L7 按窗口段定位 alarm_list 的行，窗口是 L6 按事件自己的 window_sec
-        算的。两个码配得不一样时，恢复事件会落进一个新段：一次故障在看板上
-        变成两行（一行永远 open、一行"生而恢复"）。
+        没有行的话它落到 L5 的默认值（state=stateless），于是这条恢复日志
+        压根不会被当成 clear 处理 —— L7 按故障事件走，那一行永远 open。
 
-        只报不改 —— 自动取其中一个值会让表里写的和实际生效的不一致，
-        下次有人照表排查会对不上
+        **不校两边的 window_sec / threshold。** 窗口段是故障码的段，
+        恢复事件按故障码那一行的值算（见 fill() 里的 _fill_segment_attrs），
+        恢复码自己配多少都不影响聚合
         """
-        clear_attr = self.attrs.get(raise_attr.clear_code)
-        if clear_attr is None:
-            # 恢复码在表里没有行。它会落到 L5 的默认值（stateless/300s），
-            # 恢复事件压根不会被当成 clear 处理
-            logger.error("======syslog_event 缺恢复码的行========\n"
-                         "%s 的 clear_code 是 %s，但 %s 在表里没有行，"
-                         "恢复事件会按 stateless/300s 处理，盖不到告警行上",
-                         raise_attr.event_code, raise_attr.clear_code,
-                         raise_attr.clear_code)
+        if raise_attr.clear_code in self.attrs:
             return
-        if clear_attr.window_sec == raise_attr.window_sec:
-            return
-        logger.error("======syslog_event 成对的窗口不一致========\n"
-                     "%s 的 window_sec 是 %s，恢复码 %s 是 %s。"
-                     "恢复事件会落进新的窗口段，一次故障在看板上会是两行"
-                     "（一行永远 open、一行生而恢复）——把两边改成同一个值",
-                     raise_attr.event_code, raise_attr.window_sec,
-                     clear_attr.event_code, clear_attr.window_sec)
+        logger.error("======syslog_event 缺恢复码的行========\n"
+                     "%s 的 clear_code 是 %s，但 %s 在表里没有行，"
+                     "这条恢复日志会按 stateless 处理，盖不到告警行上",
+                     raise_attr.event_code, raise_attr.clear_code,
+                     raise_attr.clear_code)
 
 
 class SeverityRule(object):
@@ -544,8 +544,41 @@ class EventAttrs(object):
         else:
             event.update(attr.as_dict())
 
+        # 窗口和阈值按故障码那一行算，必须在上面补完自己的属性之后再覆盖
+        self._fill_segment_attrs(event)
         self._grade(event)
         return event
+
+    def _fill_segment_attrs(self, event):
+        """
+        窗口段用的 window_sec / threshold：恢复事件取**故障码**那一行的值
+
+        段是故障码的段 —— 指纹按 raise_code 算（IF_UP 落到 IF_DOWN 的指纹
+        上），那么"这条日志算不算同一段"自然也该按故障码的窗口判。按恢复码
+        自己的窗口判的话，两个码配得不一样就会让一次故障在看板上变成两行
+        （一行永远 open、一行"生而恢复"）。
+
+        这样配置上就不需要"成对的两个码窗口必须一样"这条约束了：
+        IF_UP 那一行的 window_sec / threshold 填多少都不影响聚合。
+
+        state 不跟着故障码取 —— 那个字段正是区分 raise 和 clear 的，
+        取了故障码的值恢复事件就变成故障事件了。
+        """
+        raise_code = event.get("raise_code") or ""
+        if not raise_code:
+            # 自己就是故障码，用自己的值
+            event["segment_window_sec"] = event.get("window_sec", DEFAULT_WINDOW)
+            event["segment_threshold"] = event.get("threshold", DEFAULT_THRESHOLD)
+            return
+        attr = self.attrs_of(raise_code)
+        if attr is None:
+            # 故障码在表里没有行。反查表是按它建的，正常不会发生；
+            # 真发生了退回用自己的值，至少不比原来差
+            event["segment_window_sec"] = event.get("window_sec", DEFAULT_WINDOW)
+            event["segment_threshold"] = event.get("threshold", DEFAULT_THRESHOLD)
+            return
+        event["segment_window_sec"] = attr.window_sec
+        event["segment_threshold"] = attr.threshold
 
     def _grade(self, event):
         """

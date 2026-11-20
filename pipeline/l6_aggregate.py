@@ -16,9 +16,14 @@ L6 聚合
     now - last_seen  > window      -> 新段，count = 1
     否则                            -> 同一段，count += 1，刷新 last_seen
 
-window 取 syslog_event.window_sec，比的是**相邻两条日志的间隔**，不是
-固定分桶的边界。所以"5 分钟窗口 + 日志持续 10 分钟"是一段不是两段 ——
-只要中间没有超过 5 分钟的空档。要分成两段，间隔得大于窗口。
+window 比的是**相邻两条日志的间隔**，不是固定分桶的边界。所以"5 分钟窗口
++ 日志持续 10 分钟"是一段不是两段 —— 只要中间没有超过 5 分钟的空档。
+要分成两段，间隔得大于窗口。
+
+window 取**故障码**那一行的 syslog_event.window_sec（L5 补的
+segment_window_sec），不是进来这条事件自己的：段是故障码的段，指纹也是
+按 raise_code 算的，IF_UP 判在不在同一段自然该用 IF_DOWN 的窗口。
+所以 IF_UP 那一行的 window_sec 填多少都不影响聚合。
 
 **本层算出来的段就是一条告警。** L7 拿 (fingerprint, first_seen) 当段的
 身份，一个段对应 alarm_list 的一行：同段内不管来多少条日志、raise 还是
@@ -254,9 +259,18 @@ class Aggregator(object):
 
     @staticmethod
     def _window_sec(event):
-        """窗口取 syslog_event.window_sec，不同事件码不一样"""
+        """
+        窗口取 syslog_event.window_sec，不同事件码不一样
+
+        用 L5 补的 segment_window_sec，不是事件自己的 window_sec：
+        **段是故障码的段**，指纹按 raise_code 算（IF_UP 落到 IF_DOWN 的
+        指纹上），所以"这条日志算不算同一段"也该按故障码的窗口判。
+        按恢复码自己的窗口判的话，两个码配得不一样就会让一次故障在看板上
+        变成两行。L5 的 _fill_segment_attrs() 负责算这个值
+        """
         try:
-            value = int(event.get("window_sec") or DEFAULT_WINDOW)
+            value = int(event.get("segment_window_sec")
+                        or event.get("window_sec") or DEFAULT_WINDOW)
         except (TypeError, ValueError):
             return DEFAULT_WINDOW
         return value if value > 0 else DEFAULT_WINDOW

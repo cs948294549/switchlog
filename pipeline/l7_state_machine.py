@@ -50,6 +50,9 @@ threshold 留着，判的是**段内日志条数**（L6 的 count），不自己
 MAC_FLAP 配 600/3，攒到第 3 条才在 alarm_list 里出现，虚机迁移造成的
 偶发单次 MAC 迁移不报。绝大多数事件码 threshold=1，等于命中指纹就开。
 
+和窗口一样取**故障码**那一行的值（L5 补的 segment_threshold）：段是故障码
+的段，插不插行该按故障码的阈值判，不按恢复码自己配的值。
+
 ======================= stateless =======================
 
 MAC 漂移、配置变更、登录失败没有恢复日志，靠 sweep() 定时扫：段静默
@@ -436,9 +439,15 @@ class StateMachine(object):
 
     @staticmethod
     def _threshold(event):
-        """段内攒够这么多条才在 alarm_list 里出现。syslog_event.threshold"""
+        """
+        段内攒够这么多条才在 alarm_list 里出现。syslog_event.threshold
+
+        和窗口一样用 L5 补的 segment_threshold：段是故障码的段，
+        插不插行该按故障码那一行的阈值判，不按恢复码自己配的值
+        """
         try:
-            value = int(event.get("threshold") or 1)
+            value = int(event.get("segment_threshold")
+                        or event.get("threshold") or 1)
         except (TypeError, ValueError):
             return 1
         return value if value > 0 else 1

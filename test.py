@@ -269,7 +269,8 @@ def show_window(aggregator, event):
     """L6 的窗口怎么算的，以及恢复事件落到了谁的指纹上"""
     code = event.get("event_code", "")
     raise_code = event.get("raise_code") or ""
-    window_sec = event.get("window_sec", "-")
+    own_window = event.get("window_sec", "-")
+    window_sec = event.get("segment_window_sec", own_window)
 
     print("\n   指纹 = md5(ip | {} | alarm_object)".format(raise_code or code))
     if raise_code:
@@ -277,6 +278,9 @@ def show_window(aggregator, event):
               "否则盖不到故障告警那一行上".format(code, raise_code, raise_code))
 
     print("   窗口 {}s，比的是相邻两条日志的间隔，不是固定分桶的边界".format(window_sec))
+    if raise_code and own_window != window_sec:
+        print("   （{} 自己配的是 {}s，但段是 {} 的段，按 {}s 算）".format(
+            code, own_window, raise_code, window_sec))
     print("   同一段内再来一条就 count+1；间隔超过 {}s 开新段；"
           "一段最长活 max({}, {})s".format(
               window_sec, l6_aggregate.DEFAULT_MAX_LIFETIME, window_sec))
@@ -287,7 +291,7 @@ def show_window(aggregator, event):
         event.get("first_seen", "-")))
     print("   alarm_log 的攒批还在内存里，没调 flush()/persist() 不会真的落库")
     print("   alarm_list 本层不写 —— 阈值 {} 的判断是 L7 的事".format(
-        event.get("threshold", "-")))
+        event.get("segment_threshold", event.get("threshold", "-"))))
     return 0
 
 
