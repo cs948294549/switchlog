@@ -77,19 +77,6 @@ def severity_name(severity):
         return "P3"
 
 
-def escalate(severity, levels=1):
-    """
-    抖动升级：P3 -> P2 -> P1，封顶 P1。
-
-    升级是往小数字走，容易写反；收在这里一处，别在各层里各写一遍。
-    """
-    try:
-        base = int(severity)
-    except (TypeError, ValueError):
-        base = DEFAULT_SEVERITY
-    return max(1, base - max(int(levels or 0), 0))
-
-
 def _to_int(value, default):
     try:
         return int(value)
@@ -139,9 +126,14 @@ class EventAttrIndex(object):
         raise_codes dict[clear_code] -> 拥有这个恢复码的故障码
 
     raise_codes 是 clear_code 的反查表，L6 算指纹要用：IF_UP 必须落到
-    IF_DOWN 的指纹上才关得掉告警，但 clear_code 配在 IF_DOWN 那一行
+    IF_DOWN 的指纹上才盖得到那一行告警，但 clear_code 配在 IF_DOWN 那一行
     （IF_DOWN -> IF_UP），所以得反过来查"谁的 clear_code 是我"。
     加载时建一次，热路径上 dict 查一次。
+
+    加载时还会校一遍**成对的两个码 window_sec 必须一样**。L7 按窗口段
+    定位 alarm_list 的行，而窗口是 L6 按事件自己的 window_sec 算的 ——
+    配得不一样的话，恢复事件会落进一个新段，于是一次故障在看板上是两行
+    （一行永远 open、一行"生而恢复"）。这是配置漏项，代码救不了
     """
 
     __slots__ = ("attrs", "raise_codes", "total", "version")
@@ -166,10 +158,41 @@ class EventAttrIndex(object):
                 # 两个故障码配了同一个恢复码，那条恢复日志不知道该关谁的告警。
                 # 保留先到的并喊一声，不能悄悄吞掉配置问题
                 logger.error("======syslog_event.clear_code 冲突========\n"
-                             "%s 同时是 %s 和 %s 的恢复码，恢复事件只会关 %s 的告警",
+                             "%s 同时是 %s 和 %s 的恢复码，恢复事件只会盖 %s 那一行",
                              attr.clear_code, owner, attr.event_code, owner)
                 continue
             self.raise_codes[attr.clear_code] = attr.event_code
+            self._check_paired_window(attr)
+
+    def _check_paired_window(self, raise_attr):
+        """
+        成对的 raise / clear 两个码 window_sec 必须一样
+
+        L7 按窗口段定位 alarm_list 的行，窗口是 L6 按事件自己的 window_sec
+        算的。两个码配得不一样时，恢复事件会落进一个新段：一次故障在看板上
+        变成两行（一行永远 open、一行"生而恢复"）。
+
+        只报不改 —— 自动取其中一个值会让表里写的和实际生效的不一致，
+        下次有人照表排查会对不上
+        """
+        clear_attr = self.attrs.get(raise_attr.clear_code)
+        if clear_attr is None:
+            # 恢复码在表里没有行。它会落到 L5 的默认值（stateless/300s），
+            # 恢复事件压根不会被当成 clear 处理
+            logger.error("======syslog_event 缺恢复码的行========\n"
+                         "%s 的 clear_code 是 %s，但 %s 在表里没有行，"
+                         "恢复事件会按 stateless/300s 处理，盖不到告警行上",
+                         raise_attr.event_code, raise_attr.clear_code,
+                         raise_attr.clear_code)
+            return
+        if clear_attr.window_sec == raise_attr.window_sec:
+            return
+        logger.error("======syslog_event 成对的窗口不一致========\n"
+                     "%s 的 window_sec 是 %s，恢复码 %s 是 %s。"
+                     "恢复事件会落进新的窗口段，一次故障在看板上会是两行"
+                     "（一行永远 open、一行生而恢复）——把两边改成同一个值",
+                     raise_attr.event_code, raise_attr.window_sec,
+                     clear_attr.event_code, clear_attr.window_sec)
 
 
 class SeverityRule(object):
@@ -559,8 +582,9 @@ class EventAttrs(object):
         定级规则是按 event_code 配的，一条 ('IF_DOWN', '^rsw.*corp',
         ignore) 只盖住 IF_DOWN。但"corp 职场接入口 down 不告警"说的是
         整个 down/up 周期都不用看 —— 配对的 IF_UP 匹配不到那条规则，
-        会落全局兜底（正常告警），然后在 L7 发现没有活跃告警可关，
-        漏出一条 clear_orphan。规则的意图没实现，噪声还是全量进来。
+        会落全局兜底（正常告警），于是 L7 那边 ignore 的段和正常告警的段
+        在同一个指纹上交替出现，看板上一会儿 status=5 一会儿待处理。
+        规则的意图没实现，噪声还是全量进来。
 
         所以恢复事件额外按它的故障码（raise_code，L6 算指纹也用它）
         再查一次规则：故障码被 ignore，恢复事件跟着 ignore。

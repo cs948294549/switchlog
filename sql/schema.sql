@@ -243,16 +243,15 @@ CREATE TABLE syslog_severity_rule(
 -- 匹配字段为空表示"不限"，多个字段同时填写时取与。
 -- start_time 必填（空=立即生效），end_time 空=永久静默。
 --
--- 闪断升级产生的 IF_FLAP 同样要过这一层：割接期间的 raise 照样进闪断
--- 计数，窗口内连续 3 次会升出 IF_FLAP，靠 event_code_reg 一并盖住它，
--- 否则割接自己造成的闪断会在窗口内炸出一条 P1。配规则时注意把 IF_FLAP
--- 写进 event_code_reg，或者干脆留空（不限事件码）。
+-- 一个窗口段只有一行告警，但段内每次"恢复之后又来故障"（L7 的
+-- action=reopen）都会重新过一遍这一层。割接窗口一开这些都被压住，
+-- 窗口一过还在抖的话下一次 reopen 就漏出来，不用在规则里额外配什么。
 -- ============================================================
 DROP TABLE IF EXISTS syslog_mute_rule;
 CREATE TABLE syslog_mute_rule(
     rule_id BIGINT NOT NULL AUTO_INCREMENT COMMENT '规则ID',
     ip_reg VARCHAR(300) NOT NULL DEFAULT '' COMMENT '设备IP正则，空=不限',
-    event_code_reg VARCHAR(300) NOT NULL DEFAULT '' COMMENT '事件码正则，空=不限。注意盖住IF_FLAP',
+    event_code_reg VARCHAR(300) NOT NULL DEFAULT '' COMMENT '事件码正则，空=不限',
     object_reg VARCHAR(300) NOT NULL DEFAULT '' COMMENT '告警对象正则，空=不限',
     start_time VARCHAR(10) NOT NULL DEFAULT '' COMMENT '窗口开始(epoch秒)，空=立即生效',
     end_time VARCHAR(10) NOT NULL DEFAULT '' COMMENT '窗口结束(epoch秒)，空=永久静默',
@@ -269,14 +268,22 @@ CREATE TABLE syslog_mute_rule(
 -- ============================================================
 -- L7 告警状态
 --
--- 保存未恢复的告警状态，进程重启后接着算，不会重复告警。
--- 同一指纹只保留一行。
+-- 保存**当前窗口段**的状态，进程重启后接着算。同一指纹只保留一行 ——
+-- 存的是这个指纹当前在哪一段、那一段对应 alarm_list 的哪一行，
+-- 历史段不在这里（它们在 alarm_list 里各有一行）。
 --
--- severity 和 base_severity 分开存：闪断会把级别临时提一档
--- （P3->P2->P1），稳定后要落回 base_severity，所以原始级别不能丢。
+-- first_seen 是段起点，也就是段的身份。L7 拿它和新进来的事件比：
+-- 一样就是同段（改 alarm_id 指向的那一行），不一样就是新段（插新行）。
+--
+-- raise_count / flapping / ignore_counter / ignore_first_seen /
+-- ignore_alarm_id 五列是闪断判定和 ignore 独立计数留下的，功能已经去掉，
+-- 列保留（不做 ALTER，省一次现网变更），L7 恒写 0 / 空串。别在这几列上
+-- 做判断。base_severity 这一列改了用途：现在存 alarm_list 那一行写着的
+-- 级别，和 severity 比才判得出"定级规则改过、那一行要跟着改"。
 -- ============================================================
--- 注意：清掉这张表等于丢掉所有未恢复告警的状态。日志不会重发，
--- 所以重建后已经 down 的口不会再产生告警，要等它下次翻动才会重新被发现
+-- 注意：清掉这张表等于丢掉所有段的状态。日志不会重发，所以重建后
+-- 已经 down 的口不会再产生告警，要等它下次翻动才会重新被发现；
+-- 而正在进行中的段会被当成新段，alarm_list 里多一行
 DROP TABLE IF EXISTS syslog_alarm_state;
 CREATE TABLE syslog_alarm_state(
     fingerprint VARCHAR(64) NOT NULL COMMENT '告警指纹 md5(ip|event_code|alarm_object)',
@@ -284,19 +291,19 @@ CREATE TABLE syslog_alarm_state(
     event_code VARCHAR(100) NOT NULL DEFAULT '' COMMENT '事件码',
     alarm_object VARCHAR(100) NOT NULL DEFAULT '' COMMENT '告警对象',
     mode VARCHAR(20) NOT NULL DEFAULT 'raise' COMMENT 'raise/clear/stateless/ignore',
-    state VARCHAR(10) NOT NULL DEFAULT 'idle' COMMENT 'open=告警中 idle=已恢复',
-    severity TINYINT NOT NULL DEFAULT 3 COMMENT '当前级别(可能因闪断升级)',
-    base_severity TINYINT NOT NULL DEFAULT 3 COMMENT '事件原始级别，闪断平息后落回这个值',
-    first_seen VARCHAR(10) NOT NULL DEFAULT '' COMMENT '首次出现(epoch秒)',
+    state VARCHAR(10) NOT NULL DEFAULT 'idle' COMMENT 'alarm_list那一行的状态 open=告警中 clear=已恢复 idle=ignore段',
+    severity TINYINT NOT NULL DEFAULT 3 COMMENT '当前级别',
+    base_severity TINYINT NOT NULL DEFAULT 3 COMMENT 'alarm_list那一行写着的级别，和severity比才判得出"定级规则改过"',
+    first_seen VARCHAR(10) NOT NULL DEFAULT '' COMMENT '段起点(epoch秒)。这就是段的身份，L7拿(fingerprint,first_seen)定位alarm_list的行',
     last_seen VARCHAR(10) NOT NULL DEFAULT '' COMMENT '最近出现(epoch秒)',
-    counter INT NOT NULL DEFAULT 0 COMMENT '当前窗口内日志条数',
-    raise_count INT NOT NULL DEFAULT 0 COMMENT '累计开告警次数，闪断判定数这个',
-    clear_count INT NOT NULL DEFAULT 0 COMMENT '累计恢复次数',
-    flapping TINYINT NOT NULL DEFAULT 0 COMMENT '1=闪断中，禁止自动恢复',
-    alarm_id BIGINT NOT NULL DEFAULT 0 COMMENT '对应的 alarm_list 记录',
-    ignore_counter INT NOT NULL DEFAULT 0 COMMENT 'ignore行的日志条数，和counter分开：同一指纹下ignore行和clear_orphan行是两条独立记录',
-    ignore_first_seen VARCHAR(10) NOT NULL DEFAULT '' COMMENT 'ignore行的首次出现(epoch秒)',
-    ignore_alarm_id BIGINT NOT NULL DEFAULT 0 COMMENT 'ignore行对应的alarm_list记录，和alarm_id分开存',
+    counter INT NOT NULL DEFAULT 0 COMMENT '段内日志条数',
+    raise_count INT NOT NULL DEFAULT 0 COMMENT '已废弃，恒0。闪断判定去掉后没有计数点了',
+    clear_count INT NOT NULL DEFAULT 0 COMMENT '本段盖过几次恢复标签',
+    flapping TINYINT NOT NULL DEFAULT 0 COMMENT '已废弃，恒0。闪断判定整套去掉，反复抖动靠段本身合并',
+    alarm_id BIGINT NOT NULL DEFAULT 0 COMMENT '本段对应的 alarm_list 行，0=本段还没插行（未到阈值或insert失败）',
+    ignore_counter INT NOT NULL DEFAULT 0 COMMENT '已废弃，恒0。一个段只有一行，ignore不再需要独立计数',
+    ignore_first_seen VARCHAR(10) NOT NULL DEFAULT '' COMMENT '已废弃，恒空',
+    ignore_alarm_id BIGINT NOT NULL DEFAULT 0 COMMENT '已废弃，恒0',
     updated_time VARCHAR(10) NOT NULL DEFAULT '' COMMENT '最近写入时间(epoch秒)',
     PRIMARY KEY(fingerprint),
     INDEX idx_state (state),
@@ -306,12 +313,19 @@ CREATE TABLE syslog_alarm_state(
 -- ============================================================
 -- 聚合告警列表（L9 写）
 --
--- 一个指纹一行，存聚合后的告警。L6 算指纹、L7 定告警动作、L8 判静默，
--- 最后由 L9 一次写进来 —— muted 跟着其余字段一起 insert，不是先写
--- 再改。原子记录在 alarm_log，靠 fingerprint 关联。
+-- **一个窗口段一行**，不是一个指纹一行：指纹不含时间，同一个口上周那次
+-- down 和今天这次是同一个指纹、两个段、两行。L6 算指纹和段、L7 定这条
+-- 事件在段里做什么、L8 判静默，最后由 L9 一次写进来 —— muted 跟着其余
+-- 字段一起 insert，不是先写再改。原子记录在 alarm_log，靠 fingerprint
+-- 关联（下钻必须带时间范围，见那张表的注释）。
 --
--- counter 由维护线程定期同步（Runner.persist）：L7 对已有活跃告警的
--- 后续日志只累加不产生动作，L9 不跑，所以这一列会停在开告警那一刻。
+-- 同一段内不管来多少条日志、故障还是恢复，都只有这一行：恢复事件盖
+-- clear_time 和 state=clear，段内又来故障就翻回 open 并清空 clear_time。
+-- 所以 L9 的 UPDATE 一律按 alarm_id 定位，不按 fingerprint —— 按指纹只能
+-- "取最新一行"，段切换那一瞬间会串写到隔壁那一行上去。
+--
+-- counter 由维护线程定期同步（Runner.persist）：段内的后续日志多半不产生
+-- 动作，L9 不跑，所以这一列会停在插行那一刻。
 --
 -- 看板和 central-server/api/api_alarm.py 都读这张表。
 --
@@ -320,7 +334,7 @@ CREATE TABLE syslog_alarm_state(
 --   group_label  存 fingerprint
 --
 -- 三组状态字段互相独立，不要混用：
---   state   告警自身还成不成立（open/clear），由 L7 状态机维护
+--   state   告警自身还成不成立（open/clear），由 L7 段状态机维护
 --   status  处理状态（0待处理/1已确认/2已处理/3忽略/4屏蔽/5系统判定忽略），
 --           0~4 只有人点才会变，5 是 L9 写入的，人工操作不会选到这个值
 --   muted   有没有被 L8 的静默规则压住，窗口一过自动恢复通知
@@ -526,10 +540,13 @@ VALUES
  'BFD会话删除/迁移，BGP_DOWN的伴生日志，建议配黑名单在L2截掉'),
 ('IF_ATTR_CHG',     'stateless', 'interface', 600, 1, '',
  '速率/双工/流控变化，端口up的伴生日志（一次up刷四条），建议配黑名单'),
--- L7 自己产生的码：没有对应的 mnemonic，不在 syslog_rule 里
--- clear_code 留空是故意的 —— 闪断禁止自动恢复，必须人工确认才关闭
+-- 已废弃的码，留着不删：闪断升级那套（窗口内N次新开告警 -> 升级成
+-- IF_FLAP、禁止自动恢复、需人工确认）已经从 L7 去掉，现在反复 down/up
+-- 靠窗口段本身合并成一行（见 pipeline/l7_state_machine.py）。
+-- 没有任何一层会再产生这个码，这一行和定级表里那一行永远不命中。
+-- 留着是为了历史 alarm_list 里的 IF_FLAP 行还能查到事件属性
 ('IF_FLAP',         'raise',     'interface', 1800, 3, '',
- '端口闪断。L7长窗口计数升级产生：同指纹30分钟内3次新开告警。禁止自动恢复'),
+ '【已废弃】端口闪断。闪断升级已去掉，不会再产生这个码'),
 -- 加密许可带宽饱和：撞 securityk9 的 85Mbps 上限。是容量项不是网络故障，
 -- 定级表里配了 ignore 不开告警，但日志照样解析归档。窗口给长，
 -- 因为持续发的时候按 300s 切段会产生大量碎窗口
@@ -538,6 +555,22 @@ VALUES
 -- 光模块电流/光功率越限：劣化前兆，没有标准clear写法，配 stateless
 ('SFP_HEALTH',      'stateless', 'interface', 1800, 1, '',
  '光模块电流/光功率告警，模块劣化前兆。沿用光模块告警窗口给长，避免抖动刷量'),
+-- 全部AAA服务器无响应。没有显式恢复日志（下次认证成功不会提这次失败），
+-- 配stateless。object_type用none：正文不带服务器地址，对象没法归一
+('TACACS_FAIL',     'stateless', 'none',      600,  1, '',
+ 'TACACS/AAA认证服务器全部无响应，影响新登录/新认证，现有会话不受影响'),
+-- VLAN因对端配置问题被挂起（样例原因是对端Peer-link不允许该VLAN），
+-- 是二层转发异常，没有稳定的恢复日志格式，配stateless
+('VLAN_SUSPENDED',  'stateless', 'interface', 600,  1, '',
+ 'VLAN因配置冲突(如对端Peer-link不允许)被挂起，该VLAN在此接口上停止转发'),
+-- 设备主动重启，运维应该知道（区分于被动failover/宕机）
+('DEVICE_REBOOT',   'stateless', 'none',      600,  1, '',
+ '设备收到重启指令后主动重启，留痕用于区分计划内/计划外操作'),
+-- 接口输出丢包超阈值/恢复到阈值内，两条stateless各自独立，不配
+-- raise/clear对——阈值型告警反复跨越门限会产生大量碎片化的
+-- raise/clear，不如都当成状态播报处理
+('PKT_DISCARD',     'stateless', 'interface', 600,  1, '',
+ '接口输出丢包超过/恢复到日志阈值，转发质量劣化信号'),
 -- PoE / 风扇 / 杂项。全部 stateless：这批日志没有一个有可靠的恢复日志，
 -- 配 raise 会开出永远关不掉的告警（DEV/4/FAN 尤其明显，20 分钟刷 30 条）。
 -- 窗口按日志自身的重复节奏给，不统一用 300s
@@ -601,10 +634,10 @@ VALUES
  '配置复制/保存失败(SYSMGR-3-CFGWRITE_FAILED)。running-config未持久化到flash，重启会丢最近变更'),
 -- 接口CRC错误率超阈值/恢复。和TEMP_ALARM/TEMP_OK同一个raise/clear模式：
 -- 华为这条mnemonic本身就是active/clear成对打的，直接配对能让L7正确处理
--- "同一个口反复抖"的情况——同指纹30分钟内3次新开告警会被L7升级成
--- IF_FLAP（见pipeline/l7_state_machine.py的闪断逻辑），这正是CRC错误
--- 典型的"光模块劣化/网线接触不良反复触发阈值"场景，不该把每次单独当
--- 一条新告警看
+-- "同一个口反复抖"的情况——600秒内的多次active/clear落在同一个窗口段里，
+-- 看板上是一行、counter看得出抖了多少条（见pipeline/l7_state_machine.py）。
+-- 这正是CRC错误典型的"光模块劣化/网线接触不良反复触发阈值"场景，
+-- 不该把每次单独当一条新告警看
 ('CRC_ERROR', 'raise', 'interface', 600, 1, 'CRC_ERROR_CLEAR',
  '接口CRC错误率超阈值。通常是光模块劣化/网线问题/双工不匹配，需查物理层'),
 ('CRC_ERROR_CLEAR', 'clear', 'interface', 600, 1, '',
@@ -650,11 +683,9 @@ VALUES
 ('MAC_FLAP', '^10[.]19[.]9[.]', '',         3, '',       50,  '测试网段的MAC漂移降P3'),
 ('MAC_FLAP', '', '',           2, '',       100, 'MAC漂移'),
 ('PSU_FAIL', '', '',           2, '',       100, '电源/风扇/板卡故障'),
--- 闪断是轮询监控最容易漏、又最常导致业务抖动的一类，不分角色都是P1。
--- 注意它不继承 IF_DOWN 的定级：corp rsw 的 IF_DOWN 配了 ignore，但同一个口
--- 真闪起来照样会升出 IF_FLAP 并按 P1 告警。要连闪断一起不看，
--- 得在这里补一行 sysname_reg='^rsw.*corp' 的 ignore
-('IF_FLAP',  '', '',           1, '',       100, '端口闪断，L7升级产生'),
+-- 已废弃，和 syslog_event 里那一行一起留着：闪断升级已从 L7 去掉，
+-- 不会再有事件落到这个码上，这一行永远不命中
+('IF_FLAP',  '', '',           1, '',       100, '【已废弃】端口闪断，闪断升级已去掉'),
 -- 加密许可带宽饱和：撞 securityk9 的 85Mbps 上限。这是容量项，不是网络故障，
 -- 照常解析归档但不进告警列表。没配成黑名单是因为这条本身有信息量 ——
 -- 某天真出现 IPsec 会话建不起来时要回溯它到底什么时候开始撞的
@@ -680,6 +711,8 @@ VALUES
  '公网NTP扫描，安全侧信息非网络故障，不告警'),
 ('FAN_LOW_RPM',       '', '', 3, '',       100,
  '风扇待更换，是备件工单。给P3不给P2：其余风扇已升速补偿，不会立即过温'),
+('TACACS_FAIL',       '', '', 2, '',       100,
+ '全部AAA服务器无响应，影响新登录。给P2：现有会话不受影响，不是立即业务中断'),
 ('DHCP_TIMEOUT',      '', '', 3, '',       100,
  '设备自身管理地址拿不到。真失联轮询监控会先报，这条只用于定位原因'),
 ('CERT_EXPIRED',      '', '', 3, '',       100,
@@ -763,6 +796,27 @@ VALUES
 ('cisco_nx', 'ETHPORT-5-IF_DOWN_LINK_FAILURE', 'exact', '', '',
  'IF_DOWN', 'Interface\\s+([^\\s,(]+)', 100,
  'Interface Ethernet1/6 (description:pT:xxx) is down (Link failure)'),
+-- errdisable保护性关闭：端口闪断太多次被硬件自动关掉，归IF_DOWN——
+-- 窗口内的多次down会和这条一起落在同一个窗口段里，看板上是一行、
+-- counter 看得出抖了多少条日志
+('cisco_nx', 'ETHPORT-5-IF_DOWN_ERROR_DISABLED', 'exact', '', '',
+ 'IF_DOWN', 'Interface\\s+([^\\s,(]+)', 100,
+ 'Interface Ethernet1/12 (description:18F_PC_D) is down (Error disabled. Reason:Too many link flaps)'),
+-- errdisable恢复，和上面成对，归IF_UP
+('cisco_nx', 'ETHPORT-5-IF_ERRDIS_RECOVERY', 'exact', '', '',
+ 'IF_UP', 'Interface\\s+([^\\s,(]+)', 100,
+ 'Interface Ethernet1/12 is being recovered from error disabled state (Last Reason:Too many link flaps)'),
+-- 子接口因父接口down而down，归IF_DOWN。对象仍提取子接口本身
+-- (Ethernet1/52.100)，不是父接口——排查要看的是这个子接口
+('cisco_nx', 'ETHPORT-5-IF_DOWN_PARENT_DOWN', 'exact', '', '',
+ 'IF_DOWN', 'Interface\\s+([^\\s,(]+)', 100,
+ 'Interface Ethernet1/52.100 (description:pT:ccn2_dc07) is down (Parent interface is down)'),
+('cisco_nx', 'ETHPORT-5-IF_DOWN_NONE', 'exact', '', '',
+ 'IF_DOWN', 'Interface\\s+([^\\s,(]+)', 100,
+ 'Interface port-channel1000 is down (None)'),
+('cisco_nx', 'ETHPORT-5-IF_DOWN_CFG_CHANGE', 'exact', '', '',
+ 'IF_DOWN', 'Interface\\s+([^\\s,(]+)', 100,
+ 'Interface Ethernet1/1 (description:) is down(Config change)'),
 ('cisco_nx', 'LINEPROTO-5-UPDOWN', 'exact', '', 'changed state to down',
  'IF_DOWN', 'on Interface\\s+([^,\\s]+),', 100,
  'Line protocol on Interface Ethernet1/38, changed state to down'),
@@ -776,12 +830,16 @@ VALUES
  'IF_UP', ':\\s+(\\S+)\\s+is\\s+up', 100,
  'port-channel3: Ethernet1/3 is up。和PORT_DOWN成对，对象是成员口'),
 -- 聚合口：FOP_CHANGED 的 'to none' 才是全断，priority 小的先判。
--- 靠"冒号+空格+名字+冒号"定位行首的 LAG 名
+-- 原来靠"冒号+空格+名字+冒号"定位LAG名(':\\s+(\\S+?):')，行首有孤立
+-- 冒号杂质时会提前命中mnemonic自己尾部的冒号，把alarm_object抽成了
+-- mnemonic本身（现网实例：": ...%ETH_PORT_CHANNEL-5-FOP_CHANGED: ..."
+-- 这种带前导裸冒号的报文）。直接按'port-channelN'这个固定词形提取，
+-- 不依赖冒号位置，更稳
 ('cisco_nx', 'ETH_PORT_CHANNEL-5-FOP_CHANGED', 'exact', '', 'to none',
- 'LAG_DOWN', ':\\s+(\\S+?):', 10,
+ 'LAG_DOWN', '(port-channel\\d+)', 10,
  'first operational port changed from Ethernet1/38 to none，最后一个成员没了'),
 ('cisco_nx', 'ETH_PORT_CHANNEL-5-FOP_CHANGED', 'exact', '', '',
- 'LAG_MEMBER_CHG', ':\\s+(\\S+?):', 200,
+ 'LAG_MEMBER_CHG', '(port-channel\\d+)', 200,
  'changed from Ethernet1/38 to Ethernet1/39，还有成员时是正常冗余切换'),
 ('cisco_nx', 'ETHPORT-5-IF_DOWN_PORT_CHANNEL_MEMBERS_DOWN', 'exact', '', '',
  'LAG_DOWN', 'Interface\\s+([^\\s,(]+)', 100,
@@ -953,6 +1011,18 @@ VALUES
 ('huawei', 'FWM-ETH/4/hwMflpVlanLoopAlarm_clear', 'exact', '', '',
  'MAC_FLAP_RECOVER', '', 100,
  '%%01FWM-ETH/4/hwMflpVlanLoopAlarm_clear(l):CID=0x0-alarmID=0x095e0012-clearType=service_resume;Mac flapping detection recovered in vlan 136.'),
+-- Cisco NX-OS 的MAC漂移限速保护，和华为SECE/4/UCSUPPRESS同族（都是
+-- "漂移触发限速/禁学习"），但这条正文没有接口也没有MAC，只有VLAN号，
+-- 对象只能用VLAN号——MAC_FLAP下又多一种对象语义（MAC/接口/VLAN三种
+-- 都有了），这是继续沿用SECE/4/UCSUPPRESS时就接受的权衡
+('cisco_nx', 'L2FM-2-L2FM_MAC_FLAP_DISABLE_LEARN', 'exact', '', '',
+ 'MAC_FLAP', '(vlan\\s+\\d+)', 100,
+ 'Disabling learning in vlan 1000 for 120s due to too many mac moves'),
+-- 上面禁学习的恢复，归MAC_FLAP_RECOVER，和UCSUPPRESSRESUME/
+-- hwMflpVlanLoopAlarm_clear同理：stateless靠窗口静默自动恢复
+('cisco_nx', 'L2FM-2-L2FM_MAC_FLAP_RE_ENABLE_LEARN', 'exact', '', '',
+ 'MAC_FLAP_RECOVER', '', 100,
+ 'Re-enabling learning in vlan 1000'),
 -- H3C 风扇故障。mnemonic 只能填 DEV/1/FAN ——
 -- l1_prepare.strip_mnemonic 的正则在斜杠最后一段碰到空格就截断，
 -- "DEV/1/FAN STATE CHANGES TO FAILURE" 实际剥出来的是 "DEV/1/FAN"，
@@ -972,6 +1042,14 @@ VALUES
 ('h3c', 'DEV/2/POWER_FAILED', 'exact', '', '',
  'PSU_FAIL', 'Power\\s+(\\d+)\\s+failed', 100,
  '%%10DEV/2/POWER_FAILED: -DevIP=172.31.1.40; Power 2 failed.'),
+-- cisco_nx 电源故障/缺失，并入PSU_FAIL。两条正文开头都是
+-- "Power supply N"，共用同一个提取正则
+('cisco_nx', 'PLATFORM-2-PS_FAIL', 'exact', '', '',
+ 'PSU_FAIL', 'Power supply\\s+(\\d+)', 100,
+ 'Power supply 2 failed or shut down (Serial number LIT25242LUS)'),
+('cisco_nx', 'PLATFORM-2-PS_ABSENT', 'exact', '', '',
+ 'PSU_FAIL', 'Power supply\\s+(\\d+)', 100,
+ 'Power supply 2 is absent/shutdown, ps-redundancy might be affected'),
 -- 思科风扇低转速。单独事件码不并进 PSU_FAIL：没有恢复日志，
 -- 并进去会让 PSU_FAIL->PSU_OK 的配对关不掉它
 ('cisco_ios', 'ENVMON-4-ONE_FAN_LOW_RPM', 'exact', '', '',
@@ -1077,6 +1155,35 @@ VALUES
 ('cisco_nx', '', 'contains', 'ACLQOS_OVER_THRESHOLD', '',
  'TCAM_THRESHOLD', '', 300,
  '%ACLQOS-SLOT1-4-ACLQOS_OVER_THRESHOLD: Inst 0 Tcam 2 Bank 0 (IPV4 RACL [racl]) usage has reached its threshold（FAC段含中划线，mnemonic剥不出）');
+
+-- ============================================================
+-- 种子数据：TACACS认证失败 / VLAN挂起 / 设备重启 / 接口丢包（4条）
+--
+-- 都是全新事件码，object_regex按各自正文格式单独配
+-- ============================================================
+INSERT IGNORE INTO syslog_rule
+    (vendor, mnemonic, match_type, pattern, body_match,
+     event_code, object_regex, priority, descr)
+VALUES
+-- 正文不带服务器地址，object_regex留空，不抽对象
+('cisco_nx', 'TACACS-3-TACACS_ERROR_MESSAGE', 'exact', '', '',
+ 'TACACS_FAIL', '', 100,
+ 'All servers failed to respond'),
+('cisco_nx', 'ETHPORT-3-IF_ERROR_VLANS_SUSPENDED', 'exact', '', '',
+ 'VLAN_SUSPENDED', 'Interface\\s+([^\\s,(]+)', 100,
+ 'VLANs 22 on Interface port-channel21 are being suspended. (Reason: Vlan is not allowed on Peer-link)'),
+-- 正文不带可抽取对象（设备自己就是对象），object_regex留空
+('h3c', 'DEV/5/SYSTEM_REBOOT', 'exact', '', '',
+ 'DEVICE_REBOOT', '', 100,
+ '%%10DEV/5/SYSTEM_REBOOT: -DevIP=172.31.1.40; System is rebooting now.'),
+-- 华为丢包阈值。ABNL(超阈值)/NL(恢复到阈值内)两条mnemonic分别对应，
+-- 都归同一个stateless事件码，不配raise/clear对（见syslog_event注释）
+('huawei', 'IFPDT/4/PKT_OUTDISCARD_ABNL', 'exact', '', '',
+ 'PKT_DISCARD', 'Interface=([^,)]+)', 100,
+ 'Interface output discard exceeded the log threshold. (Interface=GigabitEthernet0/0/32, Statistics=896, LogThreshold=300, LogInterval=...)'),
+('huawei', 'IFPDT/4/PKT_OUTDISCARD_NL', 'exact', '', '',
+ 'PKT_DISCARD', 'Interface=([^,)]+)', 100,
+ 'Interface output discard restored to the log threshold. (Interface=GigabitEthernet0/0/32, Statistics=896, LogThreshold=300, LogInterval=...)');
 
 -- ============================================================
 -- 种子数据：温度异常（三家厂商 15 条）
@@ -1643,6 +1750,48 @@ VALUES
  '连不上CSLU(cslu-local域名没解析到)。license上报通道问题，不影响转发，走license审计'),
 ('LICMGR-6-LOG_LIC_FEATURE_INSTALLED', 'mnemonic', '', 0, 1,
  'license功能安装成功留痕，和上面LICMGR系列同族，设备重启初始化时打'),
+-- 和上面COMM_FAILED同一条Smart Licensing上报链路的另一种失败表现：
+-- 用量上报发出去了，但没收到平台的确认(ACK)。本质还是上报通道/合规
+-- 流程的事，不影响转发，归类和COMM_FAILED一致走license审计
+('LICMGR-6-LOG_SMART_LIC_USAGE_NO_ACK', 'mnemonic', '', 0, 1,
+ 'Smart Licensing用量上报未收到确认(ACK)，和LICMGR-3-LOG_SMART_LIC_COMM_FAILED同一条license合规链路'),
+('LICMGR-2-LOG_LIC_USAGE_NO_ACK', 'mnemonic', '', 0, 1,
+ 'Smart Licensing用量上报未收到确认(ACK)，严重度2的写法，和LICMGR-6-LOG_SMART_LIC_USAGE_NO_ACK同族'),
+-- NTP 批量屏蔽（14条，h3c+huawei两家）：
+-- stratum层级变化/leap秒变化/选源，是对时过程的正常状态播报，和已有
+-- SYSMIB/4/CLKCHANGE(CLOCK_CHG)同族。
+-- 同步丢失/失败(SOURCE_LOST/hwNtpSynchronizationFailure_active/
+-- NTP_SYNCHRONIZE_STATUS变unsynchronized/hwNtpStateChangeTrap)本来是
+-- 真实风险（时钟漂移影响日志时序/证书校验），但用户已确认不开告警，
+-- 全部按噪声拉黑，不新建event_code
+('NTP/5/NTP_CHANGE_STRATUM', 'mnemonic', '', 0, 1,
+ 'NTP层级(stratum)变化，H3C写法，对时后的正常状态播报，和SYSMIB/4/CLKCHANGE(CLOCK_CHG)同族'),
+('NTP/4/NTP_LOG', 'mnemonic', '', 0, 1,
+ 'NTP层级变化留痕，H3C另一种严重度写法，和NTP/5/NTP_CHANGE_STRATUM同族'),
+('NTP/5/NTP_STRATUM_CHANGE', 'mnemonic', '', 0, 1,
+ 'NTP层级变化，H3C写法(带冒号无括号变体)，和NTP_CHANGE_STRATUM同族'),
+('NTP/4/NTP_STRATUM_CHANGE', 'mnemonic', '', 0, 1,
+ 'NTP层级变化，华为写法，和H3C的NTP_STRATUM_CHANGE同族'),
+('NTP/4/STRATUM_CHANGE', 'mnemonic', '', 0, 1,
+ 'NTP层级变化，华为另一种mnemonic写法(不带NTP_前缀)，同族'),
+('NTP/4/NTP_LEAP_CHANGE', 'mnemonic', '', 0, 1,
+ 'NTP leap秒状态变化，设备时钟元数据更新，非故障'),
+('NTP/4/LEAP_CHANGE', 'mnemonic', '', 0, 1,
+ 'NTP leap秒状态变化，华为另一种写法(不带NTP_前缀)，和NTP_LEAP_CHANGE同族'),
+('NTP/4/NTP_PEER_SELE', 'mnemonic', '', 0, 1,
+ '系统选中的NTP源变化，正常选源播报'),
+('NTP/4/PEER_SELE', 'mnemonic', '', 0, 1,
+ '系统选中的NTP源变化，华为另一种写法(不带NTP_前缀)，和NTP_PEER_SELE同族'),
+('NTP/2/NTP_SYNCHRONIZE_STATUS', 'mnemonic', '', 0, 1,
+ 'NTP同步状态变化(含变为unsynchronized)，本质是时钟源丢失风险，用户已确认不开告警按噪声拉黑'),
+('NTP/3/hwNtpSynchronizationFailure_active', 'mnemonic', '', 0, 1,
+ 'NTP同步失败trap(华为)，和NTP_SYNCHRONIZE_STATUS同一类风险，用户已确认不开告警'),
+('NTP/3/hwNtpSynchronizationFailure_clear', 'mnemonic', '', 0, 1,
+ '上面同步失败trap的恢复，同样不开告警'),
+('NTP/2/hwNtpStateChangeTrap', 'mnemonic', '', 0, 1,
+ 'NTP同步状态变化trap(华为OID写法)，和NTP_SYNCHRONIZE_STATUS同一事件的trap版本'),
+('NTP/4/SOURCE_LOST', 'mnemonic', '', 0, 1,
+ 'NTP同步源丢失，华为写法，和hwNtpSynchronizationFailure_active同一类风险，用户已确认不开告警'),
 -- 以下6条是cisco_nx设备重启/初始化时的一次性留痕，和故障无关：
 -- LOG-6-SYSTEM_MSG(syslogd自身重启)、BCM_USD(芯片驱动通知，FAST REBOOT
 -- 开关状态)、USER-2-SYSTEM_MSG(clis命令文件加载进度)、VDC_MGR(虚拟设备
@@ -1659,6 +1808,56 @@ VALUES
  'VDC(虚拟设备上下文)状态机变化，现网样例是启动过程的create pending中间态'),
 ('SENSOR-3-SENSOR_MSG1', 'mnemonic', '', 0, 1,
  '传感器驱动初始化留痕(calling sensor_usd_init)，级别3易误读成故障，实际是函数调用记录'),
+-- 又一批同一台设备(csw1_corp_cq_m19)开机自检留痕，和上面6条同族：
+-- 聚合口创建、风扇/电源自检OK、板卡/主控/VDC上线、syslogd重启、
+-- 命令退出配置视图
+('ETH_PORT_CHANNEL-5-CREATED', 'mnemonic', '', 0, 1,
+ '聚合口创建留痕，配置操作记录，不是故障'),
+('PLATFORM-5-FAN_DETECT', 'mnemonic', '', 0, 1,
+ '风扇模块检测到，设备启动自检留痕'),
+('PLATFORM-5-FAN_STATUS', 'mnemonic', '', 0, 1,
+ '风扇状态上报(样例是FAN_OK)，设备启动自检留痕'),
+('PLATFORM-2-FANMOD_FAN_OK', 'mnemonic', '', 0, 1,
+ '风扇模块正常，设备启动自检留痕'),
+('PLATFORM-5-PS_STATUS', 'mnemonic', '', 0, 1,
+ '电源状态上报(样例是PS_OK)，设备启动自检留痕'),
+('PLATFORM-5-PS_FOUND', 'mnemonic', '', 0, 1,
+ '电源模块检测到，设备启动自检留痕'),
+('PLATFORM-2-PS_OK', 'mnemonic', '', 0, 1,
+ '电源正常，设备启动自检留痕'),
+('PLATFORM-2-PS_FANOK', 'mnemonic', '', 0, 1,
+ '电源内置风扇正常，设备启动自检留痕'),
+('PLATFORM-2-PS_RED_MODE_CHG', 'mnemonic', '', 0, 1,
+ '电源冗余模式变化，现网样例是启动后变成non-redundant（单电源在位），非故障状态播报'),
+('PLATFORM-4-PFM_PS_RED_MODE_CHG', 'mnemonic', '', 0, 1,
+ '电源冗余配置模式变化，和PLATFORM-2-PS_RED_MODE_CHG同族，不同严重度数字'),
+('CARDCLIENT-5-MOD_BOOT_PRIMARY', 'mnemonic', '', 0, 1,
+ '模块从主分区启动，设备启动过程留痕'),
+('CARDCLIENT-2-FPGA_BOOT_PRIMARY', 'mnemonic', '', 0, 1,
+ 'FPGA从主分区启动，设备启动过程留痕'),
+('MODULE-5-ACTIVE_SUP_OK', 'mnemonic', '', 0, 1,
+ '主控板上线正常，设备启动过程留痕'),
+('PLATFORM-5-MOD_STATUS', 'mnemonic', '', 0, 1,
+ '板卡状态上报(样例是MOD_STATUS_ONLINE/OK)，设备启动自检留痕'),
+('VDC_MGR-2-VDC_ONLINE', 'mnemonic', '', 0, 1,
+ 'VDC上线完成，设备启动过程留痕，和VDC_MGR-5-VDC_STATE_CHANGE同族'),
+('VDC_MGR-5-VDC_HOSTNAME_CHANGE', 'mnemonic', '', 0, 1,
+ 'VDC设备名确认，设备启动过程留痕'),
+('USER-0-SYSTEM_MSG', 'mnemonic', '', 0, 1,
+ '用户进程杂项消息(样例是policer初始化完成)，设备启动过程留痕'),
+('SYSLOG-6-SYSTEM_MSG', 'mnemonic', '', 0, 1,
+ 'syslogd重启留痕，和LOG-6-SYSTEM_MSG同族，是cisco_nx另一种写法'),
+('SYSLOG-7-SYSTEM_MSG', 'mnemonic', '', 0, 1,
+ 'syslogd杂项消息(样例是MTS消息接收)，和SYSLOG-6-SYSTEM_MSG同族'),
+('DAEMON-2-SYSTEM_MSG', 'mnemonic', '', 0, 1,
+ '守护进程杂项消息(样例是配置二进制恢复留痕)，和DAEMON-3-SYSTEM_MSG同族大杂烩mnemonic'),
+('CFGMAN/5/CFGMAN_EXIT_FROM_CONFIGURE', 'mnemonic', '', 0, 1,
+ '退出配置视图留痕(H3C写法，带Line/User字段)，和CFGMAN/5/CFGMAN_EXIT同族'),
+-- mgmt0带外管理口状态，不是业务转发接口。真管理口断了会影响远程
+-- 管理能力，但这条样例是设备启动过程中的瞬态down，而且带外失联
+-- 有轮询监控兜底，不靠这条syslog发现
+('IM-5-IM_INTF_STATE', 'mnemonic', '', 0, 1,
+ 'mgmt0管理口状态变化，带外管理面。真失联靠轮询监控先报，不靠这条'),
 -- ---------- 批量屏蔽：接口带宽变化 / 第三方管理面审计 / 非原厂光模块（23条）----------
 --
 -- 带宽变化：聚合口bandwidth值变化，是成员口增减/速率协商后的衍生通知，
@@ -1724,6 +1923,12 @@ VALUES
  'IPSEC收到SPI不对的包，用户确认不处理'),
 ('CRYPTO-4-IKMP_NO_SA', 'mnemonic', '', 0, 1,
  'IKE消息无对应SA，用户确认不处理'),
+('CRYPTO-4-IKMP_BAD_MESSAGE', 'mnemonic', '', 0, 1,
+ 'IKE消息格式校验失败/畸形，和CRYPTO-4-RECVD_PKT_INV_SPI/IKMP_NO_SA同族IPSEC异常，用户确认不处理'),
+-- SSH密码认证失败(pam_aaa)，安全审计信号，用户确认按噪声拉黑（和
+-- 之前"故意不拦的12条"性质一样，但这次按用户明确指示拉黑）
+('AUTHPRIV-3-SYSTEM_MSG', 'mnemonic', '', 0, 1,
+ 'SSH密码认证失败(pam_aaa)，安全审计信号，用户已确认按噪声拉黑'),
 ('USER-3-SYSTEM_MSG', 'mnemonic', '', 0, 1,
  '用户进程杂项消息(本次样例是core文件写入失败)，和DAEMON-3-SYSTEM_MSG同族大杂烩mnemonic'),
 ('CFM/4/SAVE', 'mnemonic', '', 0, 1,
@@ -1775,7 +1980,31 @@ VALUES
 -- "OID"字样（如果有）产生交叉，'OID 1' 后面必然跟 SNMP OID 的数字段，
 -- 更精确一点
 ('OID 1', 'message', '', 0, 1,
- '信封时间戳"月 日 年 时:分:秒"格式未被TS_REGS识别导致PARSE_FAIL的一批报文(PKI证书/SFP光模块/MAC漂移/配置变更等多种内容混杂)，根治需改l1_prepare.py的TS_REGS，先在L2拦掉避免持续落PARSE_FAIL');
+ '信封时间戳"月 日 年 时:分:秒"格式未被TS_REGS识别导致PARSE_FAIL的一批报文(PKI证书/SFP光模块/MAC漂移/配置变更等多种内容混杂)，根治需改l1_prepare.py的TS_REGS，先在L2拦掉避免持续落PARSE_FAIL'),
+-- LOG-6-SYSTEM_MSG 的"剥不出mnemonic"变体：现网同一条syslogd重启日志
+-- 有两种信封写法，带%前缀的能被上面mnemonic维度那条黑名单拦住，不带
+-- %前缀(行首只有裸冒号)的strip_mnemonic剥出来是空串，走fuzzy落
+-- UNKNOWN_MNEMONIC。用message子串补一条，pattern带上后面的
+-- "syslogd"更精确，避免和其他裸冒号开头的报文产生交叉
+('LOG-6-SYSTEM_MSG: syslogd', 'message', '', 0, 1,
+ 'LOG-6-SYSTEM_MSG的裸冒号写法(无%前缀，mnemonic剥不出来)，和mnemonic维度那条黑名单是同一事件的两种信封变体'),
+-- cisco_nx设备自身发出的非标准格式日志：进程名小写+冒号(netstack:/
+-- stp:)，不是%FACILITY-SEV-NAME:格式，mnemonic剥不出来。而且这条
+-- 信封顺序是"hostname在时间戳前面、用冒号分隔"(csw1_corp_cq_m19:
+-- 2026 Nov 14...)，PRI_REG/TS_REGS都是^锚定，从行首就匹配不上，
+-- 导致readable=False直接判PARSE_FAIL。同一设备同批日志里绝大多数
+-- 都带%前缀能正常解析，只有这两条例外，不值得为此改全量热路径的
+-- 信封解析逻辑，用message子串直接拦
+('netstack: Registration with cli server complete', 'message', '', 0, 1,
+ 'netstack进程启动留痕，cisco_nx设备启动过程的非标准格式(无%前缀)日志，PARSE_FAIL但非故障'),
+('stp: Please note that spanning tree port type is changed', 'message', '', 0, 1,
+ 'vPC peer-link的STP端口类型变化为network(Bridge Assurance生效提示)，非标准格式(无%前缀)日志，PARSE_FAIL但非故障'),
+-- OSPF LSA老化(MaxAge)，H3C写法。标准OSPF生命周期行为——LSA超过
+-- MaxAge(3600秒)会被老化触发刷新/清除，不代表邻居down或路由异常。
+-- 用户已确认按设备标准行为处理，不单独记录始发路由器(LsdbRouterId)
+-- 异常这条线索，真正的邻居失联走OSPF_DOWN
+('OSPF/5/MAXAGE_LSA', 'mnemonic', '', 0, 1,
+ 'OSPF LSA老化(MaxAge)，标准生命周期行为，不代表邻居down或路由异常，用户已确认按噪声拉黑');
 
 -- ============================================================
 -- 种子数据：L8 静默规则模板（三条，全部 enabled=0）
@@ -1822,20 +2051,18 @@ SELECT '^10[.]39[.]240[.](32|33)$', '^(PSU_FAIL|FAN_LOW_RPM)$', '', '', '', 0,
 --    把整机盖住 —— 同一台设备上别的口真 down 了还得报
 INSERT INTO syslog_mute_rule
     (ip_reg, event_code_reg, object_reg, start_time, end_time, enabled, descr)
-SELECT '^10[.]16[.]249[.]5$', '^(IF_DOWN|IF_UP|IF_FLAP)$', '^Ethernet1/6$', '', '', 0,
+SELECT '^10[.]16[.]249[.]5$', '^(IF_DOWN|IF_UP)$', '^Ethernet1/6$', '', '', 0,
        '模板-单口静默：换光模块/改配线只动一个接口时用，启用前填 ip/object/时间窗与工单号'
   FROM DUAL
  WHERE NOT EXISTS (SELECT 1 FROM syslog_mute_rule
                     WHERE descr LIKE '模板-单口静默%');
 
 -- 3) 整机房静默模板。event_code_reg 故意留空（不限事件码）：断电演练期间
---    什么都会响，而且留空能自动盖住 IF_FLAP —— 割接期间的 raise 照样进
---    L7 的闪断计数，窗口内连续 3 次会升出一条 P1；只写 ^IF_DOWN$ 的话
---    那条 IF_FLAP 会漏出来
+--    电源、风扇、BGP、OSPF、温度什么都会响，一条条列事件码必然漏
 INSERT INTO syslog_mute_rule
     (ip_reg, event_code_reg, object_reg, start_time, end_time, enabled, descr)
 SELECT '^10[.]19[.]19[.]', '', '', '', '', 0,
-       '模板-机房静默：断电演练/整机房割接用，event_code_reg留空以一并盖住IF_FLAP'
+       '模板-机房静默：断电演练/整机房割接用，event_code_reg留空不限事件码'
   FROM DUAL
  WHERE NOT EXISTS (SELECT 1 FROM syslog_mute_rule
                     WHERE descr LIKE '模板-机房静默%');
@@ -1971,7 +2198,7 @@ SELECT '^10[.]19[.]19[.]', '', '', '', '', 0,
 -- 种子数据应为：
 --   syslog_black_list    20  （全部 enabled=1，没有停用示例了）
 --   syslog_rule          49
---   syslog_event         31  （含 3 个兜底码 + IF_FLAP）
+--   syslog_event         31  （含 3 个兜底码 + 已废弃的 IF_FLAP）
 --   syslog_severity_rule 24  （其中 1 条 enabled=0 停用示例：BGP_UP）
 --   syslog_mute_rule      3  （全部 enabled=0，不静默任何告警）
 --   其余三张表是数据表，重建后为空

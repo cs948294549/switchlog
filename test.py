@@ -26,6 +26,7 @@ from pipeline.l2_blacklist import BlacklistFilter
 from pipeline.l3_parser import SyslogParser
 from pipeline.l4_enrich import DeviceEnricher
 from pipeline.l5_attrs import EventAttrs, severity_name, STATE_IGNORE
+from pipeline import l6_aggregate
 from pipeline.l6_aggregate import Aggregator
 from pipeline.l7_state_machine import StateMachine
 from pipeline.l8_suppress import MuteFilter
@@ -168,11 +169,11 @@ def main():
     print("\n最终 {}  {}  {}  {}".format(
         event.get("sysname", "-"), decision.get("event_code", "-"),
         event.get("alarm_object", "-"), decision.get("severity_name", "-")))
-    if decision.get("action") == "ignore":
-        print("     定级规则判定不开告警（state=ignore），不往 L8 交")
+    if decision.get("ignored"):
+        print("     定级规则判定不开告警（state=ignore）：落 alarm_list 留痕，不通知")
     elif not decision.get("notify"):
-        print("     action={} —— 不产生告警动作（累加或未到阈值）".format(
-            decision.get("action")))
+        print("     action={} —— 这一行没有新信息（段内累加、未到阈值、"
+              "或重复的恢复）".format(decision.get("action")))
     elif decision.get("muted"):
         print("     告警会入库，但命中静默规则 {} 不发通知".format(
             decision.get("mute_rule_id")))
@@ -213,19 +214,19 @@ def show_emit(emitter, decision):
 
 
 def show_decision(machine, decision):
-    """L7 的决策，以及同一条日志反复来会怎样"""
-    print("\n--- L7 state_machine 状态机 ---")
-    for key in ("action", "notify", "state", "counter", "severity_name",
-                "flapping", "raise_count"):
+    """L7 的决策：这条事件在本段那一行上做了什么"""
+    print("\n--- L7 state_machine 段状态机 ---")
+    for key in ("action", "notify", "write", "ignored", "state", "counter",
+                "severity_name", "alarm_id"):
         if key in decision:
             print(" + {:<18}{}".format(key, decision[key]))
 
-    if decision.get("action") == "ignore":
-        print("\n   state=ignore 在这一层就截住，不写状态、不往 L8 交")
-        return 0
+    if decision.get("ignored"):
+        print("\n   定级规则判定不告警：照样按段落 alarm_list（status=5），不发通知")
 
-    print("\n   判据是\"有没有活跃告警\"，不是 L6 的 is_first ——")
-    print("   一个口持续 down 一小时，L6 切两段都给 is_first=True，但那是一条告警")
+    print("\n   一个窗口段 = alarm_list 的一行。判据是段的身份（L6 的")
+    print("   first_seen）变没变，加上本段在 alarm_list 里有没有行 ——")
+    print("   同段内不管来多少条日志、raise 还是 clear，都只有那一行")
     print("   stats:", machine.stats())
     return 0
 
@@ -273,15 +274,18 @@ def show_window(aggregator, event):
     print("\n   指纹 = md5(ip | {} | alarm_object)".format(raise_code or code))
     if raise_code:
         print("   {} 是 {} 的恢复事件，所以按 {} 算指纹 —— "
-              "否则关不掉故障告警".format(code, raise_code, raise_code))
+              "否则盖不到故障告警那一行上".format(code, raise_code, raise_code))
 
     print("   窗口 {}s，比的是相邻两条日志的间隔，不是固定分桶的边界".format(window_sec))
     print("   同一段内再来一条就 count+1；间隔超过 {}s 开新段；"
-          "一段最长活 1800s".format(window_sec))
+          "一段最长活 max({}, {})s".format(
+              window_sec, l6_aggregate.DEFAULT_MAX_LIFETIME, window_sec))
     print("   （不再演示\"隔多久切新段\"——那需要一个干净的内存聚合器，"
           "现在这份 aggregator 连的是真库，不拿它做探测性调用）")
 
-    print("\n   alarm_log 的攒批还在内存里，没调 flush()/persist() 不会真的落库")
+    print("\n   first_seen={} 就是段的身份，L7 拿它定位 alarm_list 的行".format(
+        event.get("first_seen", "-")))
+    print("   alarm_log 的攒批还在内存里，没调 flush()/persist() 不会真的落库")
     print("   alarm_list 本层不写 —— 阈值 {} 的判断是 L7 的事".format(
         event.get("threshold", "-")))
     return 0

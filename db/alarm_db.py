@@ -93,14 +93,17 @@ class AlarmDB(object):
             logger.error("======AlarmDB addAlarm error========\n%s", err)
             return 0
 
-    def updateAlarmByFingerprint(self, fingerprint, data, reset_status=False):
+    def updateAlarmById(self, alarm_id, data, reset_status=False):
         """
-        更新该指纹最近一条未恢复告警；没有未恢复记录时不动历史行
+        按 alarm_id 更新一行告警
 
-        keyword / group_name 也在白名单里：闪断升级时 event_code 从
-        IF_DOWN 变成 IF_FLAP，这一列不跟着改的话，看板上级别提了但
-        事件码还是 IF_DOWN，看不出这是闪断。
-        fingerprint 不在白名单 —— 它是定位条件，改了就找不到这一行了。
+        一律按主键定位，不按 fingerprint —— 一个指纹下会有多行（每个
+        窗口段一行），按指纹定位只能"取最新一行"，段切换那一瞬间会串写
+        到隔壁那一行上去。alarm_id 由 L9 insert 之后 bind_alarm 回填，
+        L7 的段状态里一直带着。
+
+        state 和 clear_time 在白名单里：同一段内 clear 之后又来 raise，
+        要把这一行翻回 open 并清空 clear_time（看板按"空=未恢复"判）。
 
         :param reset_status: True=把已处理的翻回待处理（status -> 0）
 
@@ -119,8 +122,18 @@ class AlarmDB(object):
 
         :return: 影响行数；失败返回 "failed"
         """
+        try:
+            alarm_id = int(alarm_id or 0)
+        except (TypeError, ValueError):
+            alarm_id = 0
+        if alarm_id <= 0:
+            # 没有 alarm_id 说明这一段的 insert 失败过。不退回按指纹更新 ——
+            # 那样会改到上一段那一行上去，比不更新更糟
+            logger.error("======AlarmDB updateAlarmById 没有 alarm_id========\n%s", data)
+            return "failed"
+
         update_keys = ["last_seen", "counter", "severity", "state", "clear_time",
-                       "keyword", "group_name", "msg"]
+                       "keyword", "group_name", "msg", "status"]
         conditions = []
         params = []
         for key in update_keys:
@@ -130,14 +143,14 @@ class AlarmDB(object):
         if not conditions:
             return "failed"
 
-        if reset_status:
+        if reset_status and "status" not in data:
             conditions.append(
                 "status = case when muted=0 and status in ('1','2','3') "
                 "then '0' else status end")
 
         sql = ("update alarm_list set " + ", ".join(conditions) +
-               " where fingerprint=%s and state='open' order by alarm_id desc limit 1")
-        params.append(fingerprint)
+               " where alarm_id=%s")
+        params.append(alarm_id)
         try:
             with MySQLConnection() as conn:
                 cursor = conn.cursor
@@ -145,62 +158,7 @@ class AlarmDB(object):
                 conn.conn.commit()
                 return cursor.rowcount
         except Exception as err:
-            logger.error("======AlarmDB updateAlarmByFingerprint error========\n%s", err)
-            return "failed"
-
-    def updateIgnoreByFingerprint(self, fingerprint, data, alarm_id=0):
-        """
-        更新非 open 行，只刷 last_seen/counter
-
-        两类场景复用这个方法，名字沿用 ignore 但不止它一种：
-            ignore        L5 定级规则判定不告警，state='idle'
-            clear_orphan  视野外恢复，窗口内重复命中时按同一行累加，
-                          state='clear'
-        共同点是都不是 state='open' 的活跃告警，不能走
-        updateAlarmByFingerprint（那个按 open 定位）。
-
-        **优先按 alarm_id 定位，拿不到才退回指纹。** 恢复事件的指纹是按
-        raise_code 换算的（IF_UP 落到 IF_DOWN 的指纹上），所以同一个指纹
-        下可能同时躺着一条 ignore 行和一条 clear_orphan 行。只按
-        "指纹 + alarm_id 最大" 定位会串到隔壁那行上去：把 ignore 的
-        counter 写到 clear_orphan 行上，看板上就是"条数 2 但下钻只有
-        1 条日志"。alarm_id 由 L9 insert 之后 bind_alarm 回填，
-        L7 的状态里一直带着。
-
-        :param alarm_id: 精确定位用，0 表示没拿到（退回按指纹）
-        :return: 影响行数；失败返回 "failed"
-        """
-        update_keys = ["last_seen", "counter"]
-        conditions = []
-        params = []
-        for key in update_keys:
-            if key in data:
-                conditions.append(key + " = %s")
-                params.append(data[key])
-        if not conditions:
-            return "failed"
-
-        try:
-            alarm_id = int(alarm_id or 0)
-        except (TypeError, ValueError):
-            alarm_id = 0
-
-        if alarm_id > 0:
-            sql = ("update alarm_list set " + ", ".join(conditions) +
-                   " where alarm_id=%s")
-            params.append(alarm_id)
-        else:
-            sql = ("update alarm_list set " + ", ".join(conditions) +
-                   " where fingerprint=%s order by alarm_id desc limit 1")
-            params.append(fingerprint)
-        try:
-            with MySQLConnection() as conn:
-                cursor = conn.cursor
-                cursor.execute(sql, tuple(params))
-                conn.conn.commit()
-                return cursor.rowcount
-        except Exception as err:
-            logger.error("======AlarmDB updateIgnoreByFingerprint error========\n%s", err)
+            logger.error("======AlarmDB updateAlarmById error========\n%s", err)
             return "failed"
 
     def setAlarmMute(self, alarm_id, muted, rule_id=0):
@@ -540,7 +498,12 @@ class AlarmDB(object):
 
     def upsertAlarmState(self, data):
         """
-        写一条告警状态，按指纹覆盖。L7 每处理一条事件都会调。
+        写一条窗口段状态，按指纹覆盖。L7 每处理一条事件都会调。
+
+        raise_count / flapping / ignore_counter / ignore_first_seen /
+        ignore_alarm_id 五列是闪断判定和 ignore 独立计数留下的，功能已经
+        去掉，但列保留（NOT NULL，现网不做 ALTER），L7 恒写 0 / 空串。
+        别在这几列上做判断。
 
         :return: "success" / "failed"
         """
@@ -584,24 +547,38 @@ class AlarmDB(object):
             logger.error("======AlarmDB upsertAlarmState error========\n%s", err)
             return "failed"
 
-    def getOpenAlarmStates(self, limit=5000):
-        """进程启动时回放：还没恢复的告警状态"""
+    def getAlarmStatesSince(self, since_ts, limit=5000):
+        """
+        进程启动时回放：last_seen 在 since_ts 之后的窗口段状态
+
+        **不筛 state。** 一个窗口段就是 alarm_list 的一行，已经盖过恢复
+        标签（state='clear'）的段同样要回放 —— 不回放的话，重启后这个段
+        内再来一条重复的恢复日志，L7 认不出"本段已经有行了"，会另插一行。
+        这正是设备把一条 TEMP_OK 发两遍、华为一次口 up 打两条 mnemonic
+        时会踩的那个坑。
+
+        时间下界由调用方给，取最大的 window_sec（现网 CERT_EXPIRED 是
+        86400）就够 —— 比这更早的段无论如何都已经切掉了，回放它只会让
+        内存里多一批永远不会再命中的状态。
+
+        last_seen 是定长 10 位的 epoch 字符串，字符串比较和数值比较等价。
+
+        :return: [{...}]；失败返回 []
+        """
         sql = '''
         select fingerprint, ip, event_code, alarm_object, mode, state, severity,
-               base_severity, first_seen, last_seen, counter, raise_count,
-               clear_count, flapping, alarm_id, ignore_counter,
-               ignore_first_seen, ignore_alarm_id
-        from syslog_alarm_state where state='open' order by last_seen desc limit %s
+               base_severity, first_seen, last_seen, counter, clear_count, alarm_id
+        from syslog_alarm_state where last_seen >= %s
+        order by last_seen desc limit %s
         '''
         proper = ["fingerprint", "ip", "event_code", "alarm_object", "mode", "state",
                   "severity", "base_severity", "first_seen", "last_seen", "counter",
-                  "raise_count", "clear_count", "flapping", "alarm_id",
-                  "ignore_counter", "ignore_first_seen", "ignore_alarm_id"]
+                  "clear_count", "alarm_id"]
         try:
             with MySQLConnection() as conn:
-                return conn.query(sql, (int(limit),), proper=proper)
+                return conn.query(sql, (str(int(since_ts)), int(limit)), proper=proper)
         except Exception as err:
-            logger.error("======AlarmDB getOpenAlarmStates error========\n%s", err)
+            logger.error("======AlarmDB getAlarmStatesSince error========\n%s", err)
             return []
 
     def delOldAlarmStates(self, before_ts):

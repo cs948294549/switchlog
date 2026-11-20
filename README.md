@@ -30,7 +30,7 @@
    l5_attrs          state / 窗口 / clear_code，再按设备定 severity
                      ↓ 原子告警
    l6_aggregate      指纹 + 滑动窗口，写 alarm_log
-   l7_state_machine  raise / clear + 闪断升级
+   l7_state_machine  窗口段 -> alarm_list 的一行
                      ↓ 告警决策
    l8_suppress       时间窗静默，填 muted
    l9_emit           写 alarm_list + 发通知
@@ -43,7 +43,8 @@
 **两件事靠定时扫描，不能等日志驱动**，因为它们的触发条件就是"没有新日志"
 或"时间到了"（`Runner.sweep()`，维护线程 60s 一次）：
 
-- L7 的 `stateless` 事件静默超过窗口 → 自动恢复。没有日志来正是恢复的条件
+- L7 的 `stateless` 段静默超过窗口 → 自动恢复。没有日志来正是恢复的条件。
+  `raise` 类不在这里关，它们等显式的恢复事件
 - L8 的静默窗口过了但故障还在 → 恢复通知。否则割接期间 down 了一直没好的口，
   窗口结束后不会再有新日志进管线，这条告警就永远静默
 
@@ -52,11 +53,26 @@ object 要等 L6 聚合、告警状态要等 L7 定；而且放在这里它从�
 变成冷路径（只有待通知的告警）——一次端口 down 是 3 条日志、1 个指纹、
 1 次静默判断，量级从日志条数掉到告警条数，所以四个判据全用正则也不心疼。
 
+**一个窗口段 = 一条告警**。L6 算出的 `(fingerprint, first_seen)` 就是告警的
+身份，L7 把它映射到 `alarm_list` 的一行：同段内不管来多少条日志、故障还是
+恢复，都只有那一行 —— 恢复事件不判断"有没有活跃告警"，它只是在这一行上盖
+恢复标签（`state=clear` + `clear_time`），段内又来故障就翻回 `open`。
+
+这样设备把一条恢复日志发两遍（现网有这种设备）、或者一次故障有两个不同的
+恢复 mnemonic 都映射到同一个恢复码（华为一次口 up 打 `hwPortUp` +
+`linkDown_clear`，都归 `IF_UP`），第二条都落在同一段里，什么都不做。
+一段内反复 down/up 也只有一行，`counter` 看得出抖了多少条日志 —— 所以没有
+单独的闪断判定（原设计里"窗口内 N 次开告警 → `IF_FLAP`、禁止自动恢复"
+那套已经去掉）。
+
 **两张告警表靠 `fingerprint` 关联**：`alarm_log` 一条日志一行（L6 写，
-只留 7 天，排查下钻用），`alarm_list` 一个指纹一行（L9 写，带 count，看板用）。
-指纹在 `alarm_list` 里查不到说明这组日志没到告警阈值，这本身是有用的信息。
-阈值判断在 L7 不在 L6：`MAC_FLAP` 配 `600/3`，第一条日志进来时
-`alarm_list` 里不该有行，攒到第 3 条才算告警。
+只留 7 天，排查下钻用），`alarm_list` 一个窗口段一行（L9 写，带 count，
+看板用）。指纹在 `alarm_list` 里查不到说明这组日志没到告警阈值，这本身是
+有用的信息。阈值判断在 L7 不在 L6：`MAC_FLAP` 配 `600/3`，第一条日志进来时
+`alarm_list` 里不该有行，段内攒到第 3 条才算告警。
+
+**L9 的 UPDATE 一律按 `alarm_id` 定位**，不按 `fingerprint`：一个指纹下有
+多行（每段一行），按指纹只能"取最新一行"，段切换那一瞬间会串写到隔壁去。
 
 **下钻查日志必须带时间范围**。指纹是 `md5(ip|event_code|object)`，不含时间，
 同一个口上周那次 down 和今天这次是同一个指纹。`AlarmDB.getAlarmLogsByAlarm(alarm_id)`
@@ -64,8 +80,18 @@ object 要等 L6 聚合、告警状态要等 L7 定；而且放在这里它从�
 
 **窗口是间隔上限，不是固定分桶的边界**。`window_sec=300` 的事件，日志持续
 10 分钟只要中间没有超过 5 分钟的空档就是一段、一条告警；要分成两段，间隔
-得大于窗口。另有 `max_life=1800`：一段最长活 30 分钟，持续闪断的接口每
-30 分钟重新开一段，不会像老实现那样无限继承 label 之后永久静默。
+得大于窗口。另有 `max_life`（默认 86400，实际用 `max(它, window_sec)`）：
+一段最长活这么久，免得一行告警的 `first_seen` 停在三周前。
+
+**窗口是纯时间窗，不跟着故障状态延长**。一个口 `down` 了两小时才 `up`，
+那条 `IF_UP` 超过 `window_sec=300` 就落在新段里，自己是一行"生而恢复"的
+记录（故障发生在监控视野之外），上一段那一行保持 `open`。要让一次故障的
+`down` 和 `up` 并进同一行，把这一对事件码的 `window_sec` 调到覆盖得了
+故障持续时长。
+
+**成对的 `raise`/`clear` 两个码 `window_sec` 必须配成一样的**，否则恢复事件
+必然落进新段，一次故障在看板上是两行。L5 加载 `syslog_event` 时会校这件事
+并打 `error`。
 
 **一切按表来**，代码里不内置任何厂商正则或关键字。设备型号、版本差异
 全部下沉到规则表，加一条规则就能支持新事件，不用发版。
@@ -82,8 +108,8 @@ pipeline/          一层一个文件，文件名前缀就是执行顺序
   l3_parser.py       解析归一
   l4_enrich.py       设备富化
   l5_attrs.py        事件属性 + 定级
-  l6_aggregate.py    指纹聚合
-  l7_state_machine.py 状态机
+  l6_aggregate.py    指纹聚合 + 滑动窗口
+  l7_state_machine.py 段状态机（段 -> alarm_list 的一行）
   l8_suppress.py     告警静默
   l9_emit.py         落库 + 通知
   runner.py          串联各层，worker 只调 handle()
@@ -142,7 +168,7 @@ python main.py --replay syslog/xxx.txt --ip 10.16.249.5
 |---|---|---|
 | `syslog_black_list` | 解析前拦掉的噪声 | L2 |
 | `syslog_rule` | `(vendor, mnemonic)` → `event_code`，对象抽取正则 | L3 |
-| `syslog_event` | 事件属性：状态、窗口、阈值、恢复码 | L5 |
+| `syslog_event` | 事件属性：状态、窗口、阈值、恢复码。窗口直接决定看板上是一行还是两行 | L5 |
 | `syslog_severity_rule` | 事件定级：`event_code` + 设备 → 级别 | L5 |
 | `syslog_mute_rule` | 告警静默：设备 + 事件 + 时间窗 | L8 |
 
@@ -188,8 +214,8 @@ IF_DOWN 的候选链   corp rsw -> csw -> rsw -> IF_DOWN 默认 -> *
 ## 几个刻意的设计
 
 **同一设备的日志固定落到同一个 worker**（按 IP hash 分区）。这不是优化，
-是硬要求：L6 聚合和 L7 状态机依赖同设备事件的先后顺序，随机分配会让
-`IF_UP` 先于 `IF_DOWN` 被处理，告警关不掉。
+是硬要求：L6 的窗口和 L7 的段状态依赖同设备事件的先后顺序，随机分配会让
+`IF_UP` 先于 `IF_DOWN` 被处理，那一行的状态就是错的。
 
 **队列满时丢弃而不是阻塞**。阻塞收包线程会让内核 socket buffer 溢出，
 那是无声丢包；主动丢弃能计数、能在统计里看到。

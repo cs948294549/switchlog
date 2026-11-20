@@ -1,267 +1,280 @@
 # -*- coding: utf-8 -*-
 """
-L7 状态机
+L7 段状态机
 
-现有链路完全缺失的一级，也是日志告警能不能用起来的关键。
+**一个窗口段 = alarm_list 的一行。** 本层只做一件事：把 L6 算好的段
+映射到一行告警上，决定这一条事件是"插新行"、"改这一行"还是"什么都不做"。
 
-本层决定"要不要产生一条告警动作"，不决定"要不要通知"（那是 L8）、
-也不落 alarm_list（那是 L9 一次写）。产出一个决策 dict，L8 往上盖 mute
-标记，L9 据此落库发通知。
+======================= 段就是告警 =======================
 
-状态的唯一来源是 syslog_alarm_state（内存 + 启动回放），不读 alarm_list ——
-重启那一瞬间两者可能不一致（状态表回放了，alarm_list 的行是上次进程写的），
-以状态表为准。
+L6 给的 (fingerprint, first_seen) 就是段的身份。本层给每个指纹记住
+当前段的起点和它对应的 alarm_id：
 
-======================= 有状态事件 =======================
+    first_seen 和记住的不一样  ->  新段，alarm_id 清零，下一条够格的插新行
+    一样                        ->  同段，改那一行
 
-state 取 raise / clear：
+同一段内不管来多少条日志、raise 还是 clear，alarm_list 永远只有一行。
+clear **不再判断"有没有活跃告警"**，它只是在这一行上盖恢复标签。
 
-    raise 且无活跃告警   -> 攒到 threshold 就开告警
-    raise 且已有活跃告警 -> 只累加 count
-    clear                -> 按同一指纹关掉活跃告警
+这是和老版本最大的区别。老版本的判据是"有没有活跃告警"，于是一条恢复
+日志被设备发两遍时，第二条找不到活跃告警，被当成"视野外恢复"另插一行；
+华为一次口 up 打 hwPortUp + linkDown_clear 两条、都归 IF_UP，同样多插
+一行。新模型下这两种都是"同一段内的重复 clear"，返回 ACTION_NONE。
 
-指纹含 object，所以 BGP_UP peer=A 只会关 A 的告警，不会误关同台设备上
-B 邻居的告警。恢复事件的指纹由 L6 按 raise_code 算好，这里拿到的已经是
-故障事件的指纹。
+窗口是**纯时间窗，不跟着故障状态延长**。一个口 down 了两小时才 up，
+那条 IF_UP 落在新段里，自己是一行"生而恢复"的记录，上一段那一行保持
+open —— 它的时间范围已经定稿，不回头去改。
 
-不要读 L6 的 is_first 来决定开不开告警。max_life 切新段时它是 True，
-但一个口持续 down 一小时应该是一条告警不是两条 —— 判据是"有没有活跃告警"。
+======================= 动作 =======================
 
-======================= 无状态事件 =======================
+    本段还没插行（alarm_id = 0）
+        count < threshold       ACTION_NONE    只有 alarm_log，看板上没有
+        count >= threshold      ACTION_RAISE   插一行。clear 事件插出来的
+                                               行生而恢复（state=clear）
+    本段已有行
+        clear 且行是 open       ACTION_CLEAR   盖恢复标签
+        clear 且行已经 clear    ACTION_NONE    重复恢复在这里被吃掉
+        raise 且行是 clear      ACTION_REOPEN  翻回 open，清掉恢复时间
+        raise 且级别变了        ACTION_UPDATE
+        raise 且什么都没变      ACTION_NONE    counter 靠 L9 定期同步
 
-MAC 漂移、配置变更、登录失败没有恢复日志，用窗口计数触发，窗口内不再
-出现即自动恢复：
+一段内 down/up/down/up 反复抖：始终是那一行，counter 一路涨，行的状态
+跟着最后一条事件走。闪断判定（窗口内 N 次新开告警 -> 升级成 IF_FLAP、
+禁止自动恢复、需人工确认）整套去掉了 —— 反复抖动现在靠段本身合并，
+不升级级别、不换事件码。syslog_alarm_state 的 flapping / raise_count
+两列保留但恒写 0。
 
-    MAC_FLAP: 同指纹 10 分钟内 >= 3 次 -> 告警
+======================= 阈值 =======================
 
-这个门槛同时起降噪作用，虚机漂移造成的偶发单次 MAC 迁移不报。
+threshold 留着，判的是**段内日志条数**（L6 的 count），不自己数：
+MAC_FLAP 配 600/3，攒到第 3 条才在 alarm_list 里出现，虚机迁移造成的
+偶发单次 MAC 迁移不报。绝大多数事件码 threshold=1，等于命中指纹就开。
 
-"窗口内不再出现即恢复"必须靠定时扫描，不能等日志驱动 —— 没有日志来
-正是恢复的条件。sweep() 负责这件事，维护线程定期调。
+======================= stateless =======================
 
-======================= 闪断识别 =======================
+MAC 漂移、配置变更、登录失败没有恢复日志，靠 sweep() 定时扫：段静默
+超过 silence 就把那一行盖成恢复。必须定时扫，不能等日志驱动 —— 没有
+日志来正是恢复的条件。
 
-同指纹 flap_window（默认 1800s）内 >= flap_threshold（默认 3）次
-「新开告警」-> 升级，severity 提一档，event_code 换成 IF_FLAP。
-
-计数点在"无活跃告警 -> 开告警"这一跳，不在 L6 的日志条数上。一次端口
-down 会产生 2~3 条同指纹日志，按日志条数计的话一次 down 就能凑满 3 次，
-当场误报成闪断。
-
-升级在原指纹上做，不换指纹：指纹是 md5(ip|event_code|object)，换了就是
-另一条告警，原来那条还挂着关不掉。所以 flapping 置位 + 提级别 + 显示用
-的 event_code 改成 IF_FLAP，指纹不动。
-
-闪断禁止自动恢复，需人工确认才关闭（flapping=1 时 clear 不关告警，
-只记一次 clear_count）。
-
-**闪断计数不看 mute。** 割接期间的 raise 照样进计数，窗口内连续 3 次
-照样升出 IF_FLAP —— 本层不反查 L8 的静默规则，两层之间不加反向依赖
-（L8 在本层之后，反查就成了循环）。割接自己造成的闪断由 L8 兜住：
-那条升级动作同样要过 L8，命中同一条 mute 规则就一起被静默。
+raise 类不在 sweep() 里关，它们等显式的恢复事件。一个口 down 了两小时
+没好，那一行就该一直 open。
 
 ======================= ignore =======================
 
-L5 的定级规则配 action=ignore 产生 state=ignore，表示这台设备的这个
-事件不开告警。本层直接返回 ACTION_IGNORE，不写状态、不往 L8 交。
-事件已经在 L6 写进 alarm_log，事后回看查得到。
+L5 的定级规则配 action=ignore 产生 mode=ignore：照样按段落 alarm_list
+（status='5'，人工操作选不到这个值），但不发通知、不进开/关的生命周期。
+落库是为了避免"alarm_log 有记录但看板查不到"的孤儿数据。
 
-ignore 和 mute 都是"不告警"，区别在生效方式：ignore 是静态配置（哪类
-设备的哪个事件码永久不看），mute 是时间窗（割接期间临时不看，窗口过了
-自动恢复）。前者在本层截住，后者要等本层维护完状态再交给 L8 判。
+ignore 和非 ignore 之间切换（定级规则改过）按**开新段**处理：同一段内
+不会一半 ignore 一半不 ignore，省掉"status 5 怎么翻回 0"这类判断。
+正常情况下也切不起来 —— L5 的 _inherit_ignore 保证恢复事件跟着故障
+事件一起 ignore。
+
+======================= 状态存哪 =======================
+
+内存，不引入 Redis：worker 按 IP hash 分区，同一设备的日志固定落到同一个
+worker，所以同一指纹不会跨 worker。但 Runner 是各 worker 共享的，所以
+状态字典仍要加锁。
+
+重启靠 syslog_alarm_state 回放（restore()）。**已经盖过恢复标签的段也要
+回放** —— 不回放的话重启后段内再来一条重复的恢复日志，本层认不出"本段
+已经有行了"，又会另插一行。多实例部署时再上 Redis。
 """
 import time
 import logging
 import threading
 
-from pipeline.l5_attrs import escalate, severity_name
+from pipeline.l5_attrs import severity_name
 
 logger = logging.getLogger(__name__)
 
-# syslog_event.state 的四个取值，对应到状态机的处理模式
+# syslog_event.state 的四个取值。raise 和 stateless 在本层走同一条路径，
+# 区别只在怎么恢复：raise 等显式的 clear 事件，stateless 等 sweep() 静默到期
 MODE_RAISE = "raise"
 MODE_CLEAR = "clear"
 MODE_STATELESS = "stateless"
 MODE_IGNORE = "ignore"
 
 # 本层产出的动作
-ACTION_NONE = "none"            # 什么都不用做（累加、未到阈值、重复恢复）
-ACTION_RAISE = "raise"          # 开告警
-ACTION_UPDATE = "update"        # 已开着的告警有新进展（级别变了）
-ACTION_ESCALATE = "escalate"    # 闪断升级
-ACTION_CLEAR = "clear"          # 关告警
-# 恢复事件到了，但没有活跃告警可关 —— 故障发生在监控视野之外。
-# 典型是初次上线/重建库/进程停机期间：syslog 只在状态变化时发，设备不会
-# 为了我们重发一遍 down，所以监控看到的第一条就是它的 up。
-# 这类事件以前直接丢（返回 ACTION_NONE），结果初次上线什么都收不到。
-# 现在按正常告警流程处理：落一行 state=clear 并发通知。
-# 走 insert 不走 update —— alarm_list 里压根没有这条告警的行可更新
-ACTION_CLEAR_ORPHAN = "clear_orphan"
-# 窗口内重复命中 orphan：同一个口反复发孤立的 up（没有对应 down，纯粹是
-# 链路本身在抖、或者设备侧某种原因连续重发 up），不能每次都插一行，否则
-# 历史列表里会堆出一堆看起来一样的记录。按 DEFAULT_SILENCE 窗口聚合，
-# 只在第一次插入、之后都走 update 只刷 counter/last_seen，不重复通知
-ACTION_CLEAR_ORPHAN_UPDATE = "clear_orphan_update"
-# L5 判定不告警。仍要落 alarm_list（否则 alarm_log 写了但界面查不到这条，
-# 变成孤儿数据），只是不发通知、不进闪断/恢复的生命周期。按指纹聚合，
-# 首次命中 _IGNORE_NEW（插一行），之后命中 _IGNORE_UPDATE（累加 counter）
-ACTION_IGNORE_NEW = "ignore_new"
-ACTION_IGNORE_UPDATE = "ignore_update"
-IGNORE_ACTIONS = (ACTION_IGNORE_NEW, ACTION_IGNORE_UPDATE)
+ACTION_NONE = "none"            # 什么都不用做（没到阈值、累加、重复恢复）
+ACTION_RAISE = "raise"          # 本段第一行，insert
+ACTION_REOPEN = "reopen"        # 同段内恢复之后又来故障，翻回 open
+ACTION_UPDATE = "update"        # 同段内级别变了
+ACTION_CLEAR = "clear"          # 盖恢复标签
 
-# 要通知的动作。ignore 系列和 ACTION_NONE 不发通知，但 ignore 系列仍要
-# 落库——是否落库、是否通知这次拆成了两个判断，不能再共用 notify 一个字段
-NOTIFY_ACTIONS = (ACTION_RAISE, ACTION_UPDATE, ACTION_ESCALATE, ACTION_CLEAR,
-                  ACTION_CLEAR_ORPHAN)
-# 要落库（写/更新 alarm_list）的动作。ACTION_NONE 不落库——它就是
-# "什么都没变"，L6 已经写了 alarm_log，L9 没有新信息要写
-WRITE_ACTIONS = NOTIFY_ACTIONS + (ACTION_IGNORE_NEW, ACTION_IGNORE_UPDATE)
+# 要通知的动作。ignore 段不在这里判——它的 notify 由 _decide() 直接压成
+# False（不是被 mute 压住，是这类事件本来就不该发通知）
+NOTIFY_ACTIONS = (ACTION_RAISE, ACTION_REOPEN, ACTION_UPDATE, ACTION_CLEAR)
+# 要落库的动作。ACTION_NONE 不落库——它就是"这一行没有新信息"，
+# L6 已经写了 alarm_log
+WRITE_ACTIONS = NOTIFY_ACTIONS
 
-STATE_OPEN = "open"
-STATE_IDLE = "idle"
+# alarm_list.state 的三个取值。idle 是 ignore 段专用：它不是活跃告警，
+# 也没有恢复的那一刻
+ROW_OPEN = "open"
+ROW_CLEAR = "clear"
+ROW_IDLE = "idle"
 
-DEFAULT_SILENCE = 600           # stateless 静默多久自动恢复
-DEFAULT_FLAP_WINDOW = 1800      # 闪断统计窗口 30 分钟
-DEFAULT_FLAP_THRESHOLD = 3      # 窗口内新开告警次数达到即判闪断
-
-FLAP_CODE = "IF_FLAP"           # 升级后的事件码，syslog_event 里有行
-
-# 状态在内存里留多久没动静就清掉。比闪断窗口长一截 ——
-# 清早了闪断计数就断了
+DEFAULT_SILENCE = 600           # stateless 段静默多久自动盖恢复
+# 段状态在内存里留多久没动静就清掉。实际用的是
+# max(这个值, 段的 window_sec) —— 清早了段的身份就断了，同一段会被
+# 当成新段再插一行，而 window_sec 最长的 CERT_EXPIRED 是 86400
 DEFAULT_STATE_TTL = 7200
+# restore() 往回捞多久的段。比最长的 window_sec（86400）留一点余量，
+# 更早的段无论如何都已经切掉了，回放它只会让内存里多一批死状态
+DEFAULT_RESTORE_LOOKBACK = 90000
+# 回放时给段的 window_sec 兜底值。表里没有这一列（它来自 syslog_event，
+# 由 L5 带在事件上），而 purge() 的 TTL 要用它。
+#
+# 必须取现网最大的 window_sec（CERT_EXPIRED / TCAM_THRESHOLD 是 86400），
+# 不能用 0 —— 那样 TTL 退回 state_ttl（7200），一个 86400 窗口的段重启后
+# 静默两小时就被清掉，下一条日志会被当成新段再插一行。
+# 宁可多占一会儿内存：L6 那边一段最长也就活到 max_life，超过这个值的段
+# 无论如何都已经切了
+RESTORED_WINDOW_FALLBACK = 86400
 
 
-class AlarmState(object):
+class Segment(object):
     """
-    一个指纹的告警状态，对应 syslog_alarm_state 的一行
+    一个指纹的当前窗口段，对应 syslog_alarm_state 的一行
 
-    severity 和 base_severity 分开存：闪断把级别临时提一档，稳定后要落回
-    base_severity，所以原始级别不能丢。
+    start 就是段的身份（L6 的 first_seen）。alarm_id 是这个段在
+    alarm_list 里那一行；为 0 表示本段还没插行（没到阈值，或者上次
+    insert 失败了）。
 
-    raise_times 只在内存里，不入库 —— 它是闪断计数用的时间戳列表，重启后
-    从零开始数。持久化的 flapping 标记保证已经判定闪断的告警重启后仍然
-    不自动恢复，所以丢掉这个列表不影响正确性。
+    severity 不再分 severity / base_severity 两个值 —— 那是闪断临时提档
+    留下的，闪断去掉之后两者恒等。表里两列都保留，落库时写同一个值。
     """
 
-    __slots__ = ("fingerprint", "ip", "event_code", "alarm_object", "mode", "state",
-                 "severity", "base_severity", "first_seen", "last_seen", "counter",
-                 "raise_count", "clear_count", "flapping", "alarm_id", "raise_times",
-                 "ignore_counter", "ignore_first_seen", "ignore_alarm_id")
+    __slots__ = ("fingerprint", "ip", "event_code", "alarm_object", "mode",
+                 "start", "last_seen", "counter", "clear_count", "severity",
+                 "row_severity", "alarm_id", "row_state", "window_sec")
 
     def __init__(self, fingerprint, ip="", event_code="", alarm_object="",
-                 mode=MODE_RAISE, severity=3):
+                 mode=MODE_RAISE, severity=3, start=0, window_sec=0):
         self.fingerprint = fingerprint
         self.ip = ip
         self.event_code = event_code
         self.alarm_object = alarm_object
         self.mode = mode
-        self.state = STATE_IDLE
         self.severity = int(severity)
-        self.base_severity = int(severity)
-        self.first_seen = 0
-        self.last_seen = 0
+        # alarm_list 那一行当前写着的级别。和 severity 分开存才能判出
+        # "级别变了"——severity 每条事件都会被刷成最新值，拿它和自己比
+        # 永远相等，于是定级规则改过也不会让 L9 去改那一行
+        self.row_severity = 0
+        self.start = int(start)
+        self.last_seen = int(start)
         self.counter = 0
-        self.raise_count = 0
         self.clear_count = 0
-        self.flapping = 0
         self.alarm_id = 0
-        self.raise_times = []
-        # ignore 单独一套计数/时间/alarm_id，不和上面那套混用。
-        #
-        # 为什么必须分开：恢复事件的指纹按 raise_code 换算（IF_UP 落到
-        # IF_DOWN 的指纹上），所以同一个指纹下可能同时躺着两条独立的
-        # alarm_list 行 —— 一条 ignore（state=idle, status=5）、一条
-        # clear_orphan（state=clear）。共用 counter 的话，clear_orphan
-        # 插完行把 counter 置成 1，紧接着来的 ignore 事件会把这个 1 当成
-        # "我自己已经插过行了"，于是走 update 把 counter 写到 clear_orphan
-        # 那一行上 —— 看板上就是"条数 2 但下钻只有 1 条日志"。
-        # alarm_id 同理：共用一个槽位，两条行互相覆盖对方的 id。
-        self.ignore_counter = 0
-        self.ignore_first_seen = 0
-        self.ignore_alarm_id = 0
+        self.row_state = ""        # 空=本段还没插行
+        self.window_sec = int(window_sec)
 
-    def is_open(self):
-        return self.state == STATE_OPEN
+    def has_row(self):
+        """本段在 alarm_list 里有行没有。判的是 alarm_id 不是 row_state"""
+        return self.alarm_id > 0
+
+    def renew(self, start):
+        """换到新段：身份、计数、行的归属全部归位"""
+        self.start = int(start)
+        self.last_seen = int(start)
+        self.counter = 0
+        self.clear_count = 0
+        self.alarm_id = 0
+        self.row_state = ""
+        self.row_severity = 0
 
     def as_row(self, now):
-        """落 syslog_alarm_state 的一行。raise_times 不入库"""
+        """
+        落 syslog_alarm_state 的一行
+
+        raise_count / flapping / ignore_* 五列是闪断判定和 ignore 独立
+        计数留下的，功能去掉了但列保留（NOT NULL，现网不 ALTER），
+        恒写 0 和空串。别在这几列上做判断
+        """
         return {
             "fingerprint": self.fingerprint,
             "ip": self.ip,
             "event_code": self.event_code,
             "alarm_object": self.alarm_object,
             "mode": self.mode,
-            "state": self.state,
+            # 存行的状态（open/clear/idle），不是"段还在不在" ——
+            # 段的身份是 first_seen，它自己就在下一列里
+            "state": self.row_state or ROW_IDLE,
             "severity": self.severity,
-            "base_severity": self.base_severity,
-            "first_seen": str(self.first_seen or ""),
+            # base_severity 这一列原来存"闪断前的原始级别"，闪断去掉之后
+            # 借它存 row_severity（alarm_list 那一行写着的级别）——
+            # 不然重启回放之后判不出级别变没变，会白更新一次
+            "base_severity": self.row_severity,
+            "first_seen": str(self.start or ""),
             "last_seen": str(self.last_seen or ""),
             "counter": self.counter,
-            "raise_count": self.raise_count,
             "clear_count": self.clear_count,
-            "flapping": self.flapping,
             "alarm_id": self.alarm_id,
-            "ignore_counter": self.ignore_counter,
-            "ignore_first_seen": str(self.ignore_first_seen or ""),
-            "ignore_alarm_id": self.ignore_alarm_id,
+            "raise_count": 0,
+            "flapping": 0,
+            "ignore_counter": 0,
+            "ignore_first_seen": "",
+            "ignore_alarm_id": 0,
             "updated_time": str(int(now)),
         }
 
     @classmethod
     def from_row(cls, row):
-        """启动回放用。查不出来的字段给默认值，不让一行坏数据挡住回放"""
+        """
+        启动回放用。查不出来的字段给默认值，不让一行坏数据挡住回放
+
+        window_sec 不在表里（它来自 syslog_event），先给
+        RESTORED_WINDOW_FALLBACK，下一条事件进来时 _locate() 会按真值改掉
+        """
         def to_int(value, default=0):
             try:
                 return int(value)
             except (TypeError, ValueError):
                 return default
 
-        state = cls(row.get("fingerprint", ""), ip=row.get("ip", ""),
-                    event_code=row.get("event_code", ""),
-                    alarm_object=row.get("alarm_object", ""),
-                    mode=row.get("mode") or MODE_RAISE,
-                    severity=to_int(row.get("base_severity"), 3))
-        state.state = row.get("state") or STATE_IDLE
-        state.severity = to_int(row.get("severity"), state.base_severity)
-        state.first_seen = to_int(row.get("first_seen"))
-        state.last_seen = to_int(row.get("last_seen"))
-        state.counter = to_int(row.get("counter"))
-        state.raise_count = to_int(row.get("raise_count"))
-        state.clear_count = to_int(row.get("clear_count"))
-        state.flapping = to_int(row.get("flapping"))
-        state.alarm_id = to_int(row.get("alarm_id"))
-        state.ignore_counter = to_int(row.get("ignore_counter"))
-        state.ignore_first_seen = to_int(row.get("ignore_first_seen"))
-        state.ignore_alarm_id = to_int(row.get("ignore_alarm_id"))
-        return state
+        segment = cls(row.get("fingerprint", ""), ip=row.get("ip", ""),
+                      event_code=row.get("event_code", ""),
+                      alarm_object=row.get("alarm_object", ""),
+                      mode=row.get("mode") or MODE_RAISE,
+                      severity=to_int(row.get("severity"), 3),
+                      start=to_int(row.get("first_seen")),
+                      window_sec=RESTORED_WINDOW_FALLBACK)
+        segment.last_seen = to_int(row.get("last_seen"), segment.start)
+        segment.counter = to_int(row.get("counter"))
+        segment.clear_count = to_int(row.get("clear_count"))
+        segment.alarm_id = to_int(row.get("alarm_id"))
+        segment.row_severity = to_int(row.get("base_severity"), segment.severity)
+        state = row.get("state") or ""
+        # alarm_id=0 的段在 alarm_list 里没有行，row_state 必须跟着空 ——
+        # 留个 idle 在那里会让 has_row() 和 row_state 对不上
+        segment.row_state = state if segment.alarm_id > 0 else ""
+        return segment
 
 
 class StateMachine(object):
     """
-    L7 状态机
+    L7 段状态机
 
     handle() 热路径，sweep() / persist() / purge() 由维护线程调。
     worker 共享同一个实例，状态字典加锁。
     """
 
-    def __init__(self, silence=DEFAULT_SILENCE, flap_window=DEFAULT_FLAP_WINDOW,
-                 flap_threshold=DEFAULT_FLAP_THRESHOLD, state_ttl=DEFAULT_STATE_TTL,
-                 db=None):
+    def __init__(self, silence=DEFAULT_SILENCE, state_ttl=DEFAULT_STATE_TTL,
+                 restore_lookback=DEFAULT_RESTORE_LOOKBACK, db=None):
         """
-        :param silence:        stateless 事件静默多久算恢复
-        :param flap_window:    闪断统计窗口
-        :param flap_threshold: 窗口内新开告警次数达到即判闪断
-        :param state_ttl:      内存状态保留多久
-        :param db:             数据源，由 db.get_alarm_db() 注入
+        :param silence:          stateless 段静默多久算恢复
+        :param state_ttl:        内存里的段状态保留多久
+        :param restore_lookback: 启动回放往回捞多久的段
+        :param db:               数据源，由 db.get_alarm_db() 注入
         """
         self._silence = int(silence)
-        self._flap_window = int(flap_window)
-        self._flap_threshold = int(flap_threshold)
         self._state_ttl = int(state_ttl)
+        self._restore_lookback = int(restore_lookback)
         self._db = db
 
-        self._states = {}           # fingerprint -> AlarmState
-        self._dirty = set()          # 待落库的指纹
+        self._segments = {}        # fingerprint -> Segment
+        self._dirty = set()        # 待落库的指纹
         self._lock = threading.RLock()
 
     @property
@@ -277,269 +290,169 @@ class StateMachine(object):
         """
         处理一条聚合后的事件，返回决策
 
-        :param event: L6 的输出（带 fingerprint / count / state / severity）
+        :param event: L6 的输出（带 fingerprint / first_seen / count）
         :return: 决策 dict。action=none 时 L8 和 L9 都不用管它
         """
         clock = int(now if now is not None else (event.get("ingest_ts") or time.time()))
-        mode = str(event.get("state") or MODE_STATELESS).lower()
-
         fingerprint = event.get("fingerprint") or ""
         if not fingerprint:
-            # L6 没算出指纹，状态机没法做事。L6 那边已经打过 error
+            # L6 没算出指纹，本层没法定位段。L6 那边已经打过 error
             return self._decide(event, ACTION_NONE, None, clock)
 
         with self._lock:
-            state = self._states.get(fingerprint)
-            if state is None:
-                # event_code 优先取 raise_code：恢复事件的指纹是 L6 按
-                # raise_code 换算的（IF_UP 落到 IF_DOWN 的指纹上），这里要是
-                # 存 IF_UP，就出现"指纹是 IF_DOWN 的、event_code 却是 IF_UP"
-                # 的自相矛盾行，看板上也会显示成恢复码告警。
-                # 只影响新建这条路径 —— 正常的 IF_DOWN -> IF_UP，state 在
-                # IF_DOWN 那一刻就建好了，走不到这里
-                state = AlarmState(
-                    fingerprint, ip=event.get("ip", ""),
-                    event_code=event.get("raise_code") or event.get("event_code", ""),
-                    alarm_object=event.get("alarm_object", ""),
-                    mode=mode, severity=event.get("severity", 3))
-                self._states[fingerprint] = state
-
-            if mode == MODE_IGNORE:
-                action = self._on_ignore(state, event, clock)
-            elif mode == MODE_CLEAR:
-                action = self._on_clear(state, event, clock)
-            elif mode == MODE_RAISE:
-                action = self._on_raise(state, event, clock)
-            else:
-                action = self._on_stateless(state, event, clock)
-
-            # ACTION_NONE 也要标 dirty：它多半是"已有活跃告警，只累加"，
-            # counter 和 last_seen 都变了。不标的话这些变化只留在内存里，
-            # persist 的时机一变就丢，重启后 counter 回到上次落库的值。
-            # dirty 是 set，一个指纹刷一万条日志也只有一个条目，
-            # persist 一轮写一次，写入量不会跟着日志量涨
+            segment = self._locate(event, clock)
+            action = self._advance(segment, event, clock)
+            # ACTION_NONE 也要标 dirty：它多半是"同一行只累加"，counter 和
+            # last_seen 都变了。不标的话这些变化只留在内存里，重启后
+            # counter 回到上次落库的值。dirty 是 set，一个指纹刷一万条日志
+            # 也只有一个条目，persist 一轮写一次
             self._dirty.add(fingerprint)
-            return self._decide(event, action, state, clock)
+            return self._decide(event, action, segment, clock)
 
-    # ---------------- 三种模式 ----------------
-
-    def _on_raise(self, state, event, now):
+    def _locate(self, event, now):
         """
-        raise：无活跃告警就攒到阈值开告警，已有活跃告警只累加
+        找到这条事件所属的段，必要时开新段
 
-        判据是"有没有活跃告警"，不是 L6 的 is_first —— 一个口持续 down
-        一小时，L6 按 max_life 切两段、两次给 is_first=True，但那是一条告警
-
-        counter 自己数，不借用 L6 的 count：那个值会在 L6 的窗口过期或
-        max_life 到期时重置为 1，这和本层"告警开着没有"是两套完全独立
-        的生命周期 —— L6 的窗口可能在告警还没恢复时就先断了（比如
-        down 了 17 分钟，窗口 300s 早过期，但故障没好、告警还开着），
-        借它的值反推 counter 会算出负数或错误的差值
+        段的身份是 L6 的 first_seen。L6 没给（异常路径）就退回用 now，
+        那样每条都是新段，至少不会把两次故障算成一段
         """
-        state.mode = MODE_RAISE
-        state.last_seen = now
-        base = int(event.get("severity", state.base_severity))
-        state.base_severity = base
+        fingerprint = event["fingerprint"]
+        mode = str(event.get("state") or MODE_STATELESS).lower()
+        start = self._int(event.get("first_seen"), now)
 
-        state.counter += 1
-        if state.is_open():
-            # 已经开着。级别变了（定级规则改过）要让 L9 更新一下，
-            # 但闪断提过级的不往回降 —— 那是 flapping 的结果不是定级的
-            if not state.flapping and state.severity != base:
-                state.severity = base
-                return ACTION_UPDATE
-            return ACTION_NONE
+        segment = self._segments.get(fingerprint)
+        if segment is None:
+            segment = Segment(
+                fingerprint, ip=event.get("ip", ""),
+                # event_code 取 raise_code：恢复事件的指纹是 L6 按 raise_code
+                # 换算的（IF_UP 落到 IF_DOWN 的指纹上），存 IF_UP 就出现
+                # "指纹是 IF_DOWN 的、event_code 却是 IF_UP"的自相矛盾行
+                event_code=event.get("raise_code") or event.get("event_code", ""),
+                alarm_object=event.get("alarm_object", ""),
+                mode=mode, severity=self._int(event.get("severity"), 3),
+                start=start, window_sec=self._int(event.get("window_sec"), 0))
+            self._segments[fingerprint] = segment
+            return segment
 
-        # 没开着：阈值由 syslog_event.threshold 定，IF_DOWN 是 1 当场开，
-        # PARSE_FAIL 是 5 要攒 —— 没开的时候 counter 就是"攒了几条"，
-        # 每条都加一，攒够才开告警
+        # ignore 和非 ignore 之间切换（定级规则改过）按开新段处理：
+        # 同一行既是 status=5 又要发通知说不清，分成两行各自干净
+        ignore_switched = (segment.mode == MODE_IGNORE) != (mode == MODE_IGNORE)
+        if segment.start != start or ignore_switched:
+            segment.renew(start)
+        segment.window_sec = self._int(event.get("window_sec"), segment.window_sec)
+        return segment
+
+    def _advance(self, segment, event, now):
+        """按模式推进这一段，返回动作"""
+        mode = str(event.get("state") or MODE_STATELESS).lower()
+        segment.mode = mode
+        segment.last_seen = max(segment.last_seen, now)
+        segment.severity = self._int(event.get("severity"), segment.severity)
+        # counter 直接用 L6 的段内条数，不自己数：段和告警现在是一对一，
+        # 两边各数一份只会出现对不上的情况
+        segment.counter = self._int(event.get("count"), segment.counter + 1)
+
         threshold = self._threshold(event)
-        if state.counter < threshold:
+        if mode == MODE_IGNORE:
+            return self._on_ignore(segment, threshold)
+        if mode == MODE_CLEAR:
+            return self._on_clear(segment, threshold)
+        return self._on_raise(segment, threshold)
+
+    # ---------------- 三条路径 ----------------
+
+    def _on_raise(self, segment, threshold):
+        """
+        故障事件（raise / stateless）
+
+        判据是"本段有没有行"，不是"有没有活跃告警"。同段内恢复之后又来
+        故障，翻回 open 就行 —— 不插新行，所以一段内反复抖只有一行
+        """
+        if not segment.has_row():
+            if segment.counter < threshold:
+                # 阈值兼做降噪：MAC_FLAP 配 3，虚机迁移造成的偶发单次不报
+                return ACTION_NONE
+            segment.row_state = ROW_OPEN
+            segment.row_severity = segment.severity
+            return ACTION_RAISE
+
+        if segment.row_state == ROW_CLEAR:
+            segment.row_state = ROW_OPEN
+            segment.row_severity = segment.severity
+            return ACTION_REOPEN
+
+        # 已经 open。级别变了（定级规则改过）要让 L9 更新一下，
+        # 否则什么都没变，counter 靠 L9 的 sync_counters 定期刷
+        if segment.severity != segment.row_severity:
+            segment.row_severity = segment.severity
+            return ACTION_UPDATE
+        return ACTION_NONE
+
+    def _on_clear(self, segment, threshold):
+        """
+        恢复事件
+
+        **不判断有没有活跃告警。** 本段有行就盖恢复标签，没行就插一行
+        "生而恢复"的记录 —— 后者是故障发生在监控视野之外（初次上线 /
+        重建库 / 进程停机期间，或者 down 了两小时才 up，那条 down 在
+        上一段里）。syslog 只在状态变化时发，设备不会为了我们重发一遍
+        down，所以这条 up 就是唯一的线索。
+
+        同段内重复的恢复（设备把一条 TEMP_OK 发两遍、华为一次口 up 打
+        hwPortUp + linkDown_clear 两条）在这里被吃掉：行已经是 clear 了，
+        只累加 counter，不插行、不重复通知
+        """
+        if not segment.has_row():
+            if segment.counter < threshold:
+                return ACTION_NONE
+            segment.row_state = ROW_CLEAR
+            segment.row_severity = segment.severity
+            segment.clear_count += 1
+            return ACTION_RAISE
+
+        if segment.row_state == ROW_CLEAR:
             return ACTION_NONE
 
-        return self._open(state, now, base)
-
-    def _on_clear(self, state, event, now):
-        """
-        clear：关掉同指纹的活跃告警。闪断中的不自动关
-
-        没有活跃告警可关时不再丢弃（原来返回 ACTION_NONE）：那意味着故障
-        发生在监控视野之外 —— 初次上线、重建库、进程停机期间都会这样。
-        syslog 只在状态变化时发，设备不会为了我们重发一遍 down，所以这条
-        up 就是唯一的线索，丢了就等于初次上线什么告警都收不到。
-        按正常流程走 ACTION_CLEAR_ORPHAN，落一行 state=clear 并通知。
-
-        state.state 保持 STATE_IDLE 不动：这不是一条活跃告警，没有要恢复
-        的那一刻。sweep() 只扫 MODE_STATELESS 且 is_open() 的，不会碰它。
-        raise_count 也不动 —— 没有真正"开过告警"，动它会污染闪断计数，
-        连着三次视野外恢复会误升成 IF_FLAP。
-        """
-        if not state.is_open():
-            # 上一次也是孤立恢复（mode 只有这条路径会设成 MODE_CLEAR，
-            # 真正的 raise->clear 走的是下面 375 行，不会设这个值），且还在
-            # 聚合窗口内：同一行累加，不再新插一条、也不重复发通知。
-            # 这里用改动前的 last_seen 判窗口，不能等它被下面覆盖了再判
-            # last_seen 必须真有值：新建的 state 它是 0，而 handle() 建 state
-            # 时 mode 直接取事件的 state 字段，恢复事件进来时新 state 的 mode
-            # 本来就是 MODE_CLEAR —— 只判 mode 的话第一条孤立恢复会被当成
-            # "窗口内的重复"，不插行也不通知
-            was_orphan_in_window = (state.last_seen > 0
-                                    and state.mode == MODE_CLEAR
-                                    and now - state.last_seen <= self._silence)
-            state.last_seen = now
-            state.mode = MODE_CLEAR
-            state.clear_count += 1
-            if was_orphan_in_window:
-                # 只刷 counter，不碰 first_seen —— 这一行从第一次孤立恢复
-                # 算起，first_seen 要保持不变才能看出这批抖动持续了多久
-                state.counter += 1
-                return ACTION_CLEAR_ORPHAN_UPDATE
-            # 窗口已经过了（或者这是第一次孤立恢复）：另起一行
-            # counter 和 first_seen 显式归位：这一行是一条独立的记录，
-            # 不能带着上一轮留下的计数和时间去落库
-            state.counter = 1
-            state.first_seen = now
-            return ACTION_CLEAR_ORPHAN
-
-        state.clear_count += 1
-
-        if state.flapping:
-            # 闪断禁止自动恢复：一个口反复 down/up，每次 up 都关告警的话
-            # 值班永远看不到它在闪。必须人工确认
-            logger.info("闪断中不自动恢复：%s %s %s，需人工确认",
-                        state.ip, state.event_code, state.alarm_object)
-            return ACTION_NONE
-
-        state.state = STATE_IDLE
-        # counter 不清零、不改动 —— 它是这条告警最终的"几条日志支撑"，
-        # 要落进 alarm_list 留着。下一次 raise 会在 _on_raise 里判到
-        # state 不是 open，重新从 1 开始数，不用在这里预先处理
-        state.severity = state.base_severity
+        segment.row_state = ROW_CLEAR
+        segment.row_severity = segment.severity
+        segment.clear_count += 1
         return ACTION_CLEAR
 
-    def _on_stateless(self, state, event, now):
+    def _on_ignore(self, segment, threshold):
         """
-        stateless：窗口内累计到阈值就告警，窗口内不再出现即自动恢复
+        L5 定级规则判定不告警
 
-        没有恢复日志的事件走这里（MAC 漂移、配置变更、登录失败）。
-        自动恢复由 sweep() 负责 —— 没有日志来正是恢复的条件，等不到事件驱动
-
-        这里的"窗口"是本层自己的概念（threshold 条日志内算一轮），
-        不是 L6 的滑动窗口，两者无关也不该混用
+        照样按段落 alarm_list（status='5'），但不发通知、不进开/关的
+        生命周期。row_state 一直是 idle —— 它不是活跃告警，没有要恢复的
+        那一刻，sweep() 也不会碰它（只扫 stateless 且 open 的）
         """
-        state.mode = MODE_STATELESS
-        state.last_seen = now
-        base = int(event.get("severity", state.base_severity))
-        state.base_severity = base
-
-        # counter 和 _on_raise 一样无条件先加：alarm_list.counter 的字段
-        # 语义是"窗口内日志条数"，开了告警之后同指纹日志照样要计入，
-        # 否则 sync_counters 同步过去的永远是 threshold 那个老值，看板上
-        # 看不出这条告警后面还在持续发生
-        state.counter += 1
-        if state.is_open():
-            return ACTION_NONE
-
-        threshold = self._threshold(event)
-        if state.counter < threshold:
-            # 阈值兼做降噪：MAC_FLAP 配 3，虚机迁移造成的偶发单次不报
-            return ACTION_NONE
-
-        return self._open(state, now, base)
-
-    def _on_ignore(self, state, event, now):
-        """
-        ignore：L5 定级规则判定不告警，但要留痕——按指纹聚合写 alarm_list，
-        不走开/关告警的生命周期，不进闪断计数，不发通知。
-
-        没有阈值判断：ignore 不是"攒够了才算事"，命中一次就该记一次。
-        state.state 一直留 STATE_IDLE，不调 self._open()——ignore 永远
-        不是"活跃告警"，没有要恢复的那一刻，L7 的 sweep() 也不会碰它
-        （sweep 只找 STATE_OPEN 的状态）。
-
-        用 ignore_counter / ignore_first_seen / ignore_alarm_id，不碰
-        state.counter 那一套：同一指纹下 ignore 行和 clear_orphan 行是两条
-        独立的 alarm_list 记录（恢复事件的指纹按 raise_code 换算过来），
-        共用计数会让 ignore 把自己的 counter 写到 clear_orphan 那行上去。
-        也不改 state.mode —— 那个字段 sweep() 和 _on_clear() 都在读，
-        ignore 一旦把它改成 MODE_IGNORE，这个指纹后面真来了孤立恢复，
-        _on_clear() 里"上次是不是 orphan"就判错了
-        """
-        state.last_seen = now
-        state.base_severity = int(event.get("severity", state.base_severity))
-        state.severity = state.base_severity
-
-        if state.ignore_counter:
-            state.ignore_counter += 1
-            return ACTION_IGNORE_UPDATE
-
-        state.ignore_counter = 1
-        state.ignore_first_seen = now
-        return ACTION_IGNORE_NEW
-
-    # ---------------- 开告警与闪断 ----------------
-
-    def _open(self, state, now, base_severity):
-        """
-        开告警，并数一次闪断
-
-        计数点就在这里 —— "无活跃告警 -> 开告警"这一跳。不在 L6 的日志
-        条数上：一次端口 down 产生 2~3 条同指纹日志，按日志条数计的话
-        一次 down 就能凑满 3 次，当场误报成闪断
-        """
-        state.state = STATE_OPEN
-        state.first_seen = now
-        state.raise_count += 1
-        state.severity = base_severity
-        state.base_severity = base_severity
-        # 开告警这一刻把 counter 定为 1：_on_raise/_on_stateless 在没开着
-        # 的时候会一直累加（攒阈值用），到这里之前它存的是"攒了几条"，
-        # 不是"这次故障几条"——上一轮恢复后 counter 没清零（要留给
-        # alarm_list 当历史值），这里必须显式归位，否则第二次开告警会把
-        # 上一轮的条数也算进来
-        state.counter = 1
-
-        # 闪断窗口内的开告警次数
-        state.raise_times.append(now)
-        cutoff = now - self._flap_window
-        state.raise_times = [ts for ts in state.raise_times if ts > cutoff]
-
-        if len(state.raise_times) >= self._flap_threshold:
-            return self._escalate(state, now)
-        return ACTION_RAISE
-
-    def _escalate(self, state, now):
-        """
-        闪断升级：提一档级别，换显示用的事件码，指纹不动
-
-        指纹不动是硬要求：指纹是 md5(ip|event_code|object)，换了就是另一条
-        告警，原来那条还挂着关不掉。所以只改级别和 event_code
-        """
-        was_flapping = state.flapping
-        state.flapping = 1
-        state.severity = escalate(state.base_severity, 1)
-        state.event_code = FLAP_CODE
-
-        if not was_flapping:
-            logger.warning("闪断升级：%s %s 在 %s 秒内开告警 %s 次，升为 %s（%s），"
-                           "禁止自动恢复",
-                           state.ip, state.alarm_object, self._flap_window,
-                           len(state.raise_times), FLAP_CODE,
-                           severity_name(state.severity))
-        return ACTION_ESCALATE
+        if not segment.has_row():
+            if segment.counter < threshold:
+                return ACTION_NONE
+            segment.row_state = ROW_IDLE
+            segment.row_severity = segment.severity
+            return ACTION_RAISE
+        return ACTION_NONE
 
     @staticmethod
     def _threshold(event):
-        """窗口内攒够这么多条才告警。syslog_event.threshold"""
+        """段内攒够这么多条才在 alarm_list 里出现。syslog_event.threshold"""
         try:
             value = int(event.get("threshold") or 1)
         except (TypeError, ValueError):
             return 1
         return value if value > 0 else 1
 
+    @staticmethod
+    def _int(value, default):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
     # ---------------- 决策 ----------------
 
-    def _decide(self, event, action, state, now):
+    def _decide(self, event, action, segment, now):
         """
         拼决策 dict 交给 L8
 
@@ -547,9 +460,15 @@ class StateMachine(object):
         不是先写再改 —— 先写 muted=0 再 UPDATE 成 1 的话，中间那一瞬间
         看板轮询到会显示成"割接期间有条没静默的告警"
         """
+        ignored = str(event.get("state") or "").lower() == MODE_IGNORE
         decision = {
             "action": action,
-            "notify": action in NOTIFY_ACTIONS,
+            # ignore 段永远不通知：不是被 mute 压住，是这类事件本来就不该
+            # 发通知。但它照样落库（见 WRITE_ACTIONS），所以这两个判断
+            # 不能共用一个字段
+            "notify": action in NOTIFY_ACTIONS and not ignored,
+            "write": action in WRITE_ACTIONS,
+            "ignored": ignored,
             "fingerprint": event.get("fingerprint", ""),
             "ip": event.get("ip", ""),
             "hostname": event.get("hostname", ""),
@@ -568,143 +487,103 @@ class StateMachine(object):
             "mute_rule_id": 0,
         }
 
-        if state is None:
+        if segment is None:
             decision.update({
                 "event_code": event.get("event_code", ""),
                 "severity": event.get("severity", 3),
                 "severity_name": severity_name(event.get("severity", 3)),
-                "state": STATE_IDLE,
+                "state": ROW_IDLE,
                 "counter": event.get("count", 1),
                 "first_seen": now,
                 "last_seen": now,
-                "flapping": 0,
+                "clear_time": 0,
                 "alarm_id": 0,
             })
             return decision
 
+        row_state = segment.row_state or ROW_IDLE
         decision.update({
-            # 升级之后这里是 IF_FLAP，不是原来的 IF_DOWN
-            "event_code": state.event_code,
-            "severity": state.severity,
-            "severity_name": severity_name(state.severity),
-            "base_severity": state.base_severity,
-            "state": state.state,
-            "counter": state.counter,
-            "first_seen": state.first_seen or now,
-            "last_seen": state.last_seen or now,
-            # clear_orphan 也要填：它落的那一行 state 就是 clear，
-            # 不填的话看板上是一条"已恢复但没有恢复时间"的记录
-            "clear_time": now if action in (ACTION_CLEAR, ACTION_CLEAR_ORPHAN) else 0,
-            "flapping": state.flapping,
-            "raise_count": state.raise_count,
-            "alarm_id": state.alarm_id,
+            # 恢复事件也写故障码（IF_UP 的行写 IF_DOWN）：这一行代表的是
+            # 那条故障告警，不是那条恢复日志
+            "event_code": segment.event_code,
+            "severity": segment.severity,
+            "severity_name": severity_name(segment.severity),
+            "state": row_state,
+            "counter": segment.counter,
+            "first_seen": segment.start or now,
+            "last_seen": segment.last_seen or now,
+            # 盖了恢复标签就有恢复时间；reopen 要把它清空（L9 写空串，
+            # 看板按"空=未恢复"判）
+            "clear_time": now if row_state == ROW_CLEAR else 0,
+            "clear_count": segment.clear_count,
+            "alarm_id": segment.alarm_id,
         })
-
-        if action in IGNORE_ACTIONS:
-            # ignore 行是同一指纹下另一条独立记录，counter/first_seen/
-            # alarm_id 全都走自己那一套，不能用上面那三个共用字段的值
-            decision.update({
-                "counter": state.ignore_counter,
-                "first_seen": state.ignore_first_seen or now,
-                "alarm_id": state.ignore_alarm_id,
-                # ignore 不是"已恢复"，没有恢复时间
-                "clear_time": 0,
-            })
         return decision
 
-    def bind_alarm(self, fingerprint, alarm_id, for_ignore=False):
+    def bind_alarm(self, fingerprint, alarm_id):
         """
-        L9 落库之后把 alarm_id 回填进状态，下次更新同一条告警要用
+        L9 insert 之后把 alarm_id 回填进段状态，本段后面的事件要用它定位行
 
-        :param for_ignore: True=绑到 ignore_alarm_id。同一指纹下 ignore 行和
-                           告警行（raise/clear_orphan）是两条独立的 alarm_list
-                           记录，各自的 id 分开存，否则后插的那条会把前一条的
-                           id 覆盖掉，更新时就改到别人那一行上去了
         :return: True=绑上了
         """
         with self._lock:
-            state = self._states.get(fingerprint)
-            if state is None:
+            segment = self._segments.get(fingerprint)
+            if segment is None:
                 return False
-            if for_ignore:
-                state.ignore_alarm_id = int(alarm_id)
-            else:
-                state.alarm_id = int(alarm_id)
+            segment.alarm_id = int(alarm_id)
             self._dirty.add(fingerprint)
-        return True
-
-    def confirm_flap(self, fingerprint):
-        """
-        人工确认闪断，解除"禁止自动恢复"
-
-        闪断不自动关，必须有人看过。确认之后下一条恢复事件才能关掉它。
-        看板上那个"确认"按钮最终调到这里
-
-        :return: True=解除了
-        """
-        with self._lock:
-            state = self._states.get(fingerprint)
-            if state is None or not state.flapping:
-                return False
-            state.flapping = 0
-            state.severity = state.base_severity
-            state.raise_times = []
-            self._dirty.add(fingerprint)
-        logger.info("闪断已人工确认，恢复自动关闭：%s", fingerprint)
         return True
 
     # ---------------- 周期维护 ----------------
 
     def sweep(self, now=None):
         """
-        stateless 事件的自动恢复：静默超过窗口就关
+        stateless 段的自动恢复：静默超过 silence 就把那一行盖成恢复
 
         必须定时扫，不能等日志驱动 —— 没有日志来正是恢复的条件。
-        raise/clear 类不在这里关，它们等显式的恢复事件。
+        raise 类不在这里关，它们等显式的恢复事件：一个口 down 了两小时
+        没好，那一行就该一直 open。
 
         :return: [决策]，L8/L9 照常处理
         """
         now = int(now if now is not None else time.time())
         decisions = []
         with self._lock:
-            for state in self._states.values():
-                if state.mode != MODE_STATELESS or not state.is_open():
+            for segment in self._segments.values():
+                if segment.mode != MODE_STATELESS or segment.row_state != ROW_OPEN:
                     continue
-                if now - state.last_seen <= self._silence:
+                if now - segment.last_seen <= self._silence:
                     continue
-                if state.flapping:
-                    # 闪断中的不自动关，等人工确认
+                segment.row_state = ROW_CLEAR
+                segment.clear_count += 1
+                self._dirty.add(segment.fingerprint)
+                if not segment.has_row():
+                    # 这一段的 insert 失败过，alarm_list 里没有行可盖。
+                    # 内存状态照样推进，但没有决策可发
                     continue
-                state.state = STATE_IDLE
-                # 和 _on_clear 一样：counter 不清零、不改动，留着给
-                # alarm_list 展示"这条告警最终有几条日志支撑"
-                state.clear_count += 1
-                state.severity = state.base_severity
-                self._dirty.add(state.fingerprint)
                 decisions.append({
                     "action": ACTION_CLEAR,
                     "notify": True,
-                    "fingerprint": state.fingerprint,
-                    "ip": state.ip,
+                    "write": True,
+                    "ignored": False,
+                    "fingerprint": segment.fingerprint,
+                    "ip": segment.ip,
                     "hostname": "",
-                    "event_code": state.event_code,
-                    "alarm_object": state.alarm_object,
+                    "event_code": segment.event_code,
+                    "alarm_object": segment.alarm_object,
                     "message": "",
-                    "severity": state.severity,
-                    "severity_name": severity_name(state.severity),
-                    "base_severity": state.base_severity,
-                    "state": state.state,
-                    # 传 state.counter，不是 0 —— 上面注释说的"counter 不清零"
-                    # 指的就是要把它留给 alarm_list 展示"这条告警最终有几条
-                    # 日志支撑"。写死 0 的话 L9 的 _update() 会拿这个 0 把
-                    # alarm_list.counter 冲掉，看板上变成"0 条"
-                    "counter": state.counter,
-                    "first_seen": state.first_seen,
-                    "last_seen": state.last_seen,
+                    "severity": segment.severity,
+                    "severity_name": severity_name(segment.severity),
+                    "state": ROW_CLEAR,
+                    # 传 segment.counter，不是 0 —— 它是这一行最终"有几条
+                    # 日志支撑"，写死 0 的话 L9 会拿这个 0 把 alarm_list
+                    # 的 counter 冲掉，看板上变成"0 条"
+                    "counter": segment.counter,
+                    "first_seen": segment.start,
+                    "last_seen": segment.last_seen,
                     "clear_time": now,
-                    "flapping": state.flapping,
-                    "raise_count": state.raise_count,
-                    "alarm_id": state.alarm_id,
+                    "clear_count": segment.clear_count,
+                    "alarm_id": segment.alarm_id,
                     "ingest_ts": now,
                     "muted": False,
                     "mute_rule_id": 0,
@@ -715,7 +594,7 @@ class StateMachine(object):
 
     def persist(self, now=None):
         """
-        把变动过的状态落 syslog_alarm_state。进程重启后靠它接着算
+        把变动过的段状态落 syslog_alarm_state。进程重启后靠它接着算
 
         只落 dirty 的 —— 全量 upsert 在指纹多的时候是白写。
         落库失败的留在 dirty 里，下一轮再试
@@ -726,8 +605,8 @@ class StateMachine(object):
         with self._lock:
             if not self._dirty:
                 return 0
-            pending = [(fp, self._states[fp].as_row(now))
-                       for fp in self._dirty if fp in self._states]
+            pending = [(fp, self._segments[fp].as_row(now))
+                       for fp in self._dirty if fp in self._segments]
             self._dirty = set()
 
         failed = 0
@@ -743,18 +622,20 @@ class StateMachine(object):
                     self._dirty.add(fingerprint)
         return len(pending) - failed
 
-    def restore(self, limit=5000):
+    def restore(self, limit=5000, now=None):
         """
-        启动回放未恢复的告警。不回放的话重启后同一个还没好的故障会重新
-        开告警，等于重复通知一次
+        启动回放最近的窗口段
 
-        raise_times 不回放，闪断计数从零开始数。持久化的 flapping 标记
-        保证已经判定闪断的告警重启后仍然不自动恢复
+        **不只回放 open 的。** 段的身份就是行的身份，已经盖过恢复标签的
+        段同样要回放 —— 不回放的话重启后段内再来一条重复的恢复日志，
+        本层认不出"本段已经有行了"，又会另插一行。
 
-        :return: 回放的状态数
+        :return: 回放的段数
         """
+        now = int(now if now is not None else time.time())
+        since = now - self._restore_lookback
         try:
-            rows = self.db.getOpenAlarmStates(limit=limit)
+            rows = self.db.getAlarmStatesSince(since, limit=limit)
         except Exception as err:
             logger.error("======StateMachine restore error========\n%s", err)
             return 0
@@ -763,56 +644,73 @@ class StateMachine(object):
         with self._lock:
             for row in rows or []:
                 fingerprint = row.get("fingerprint")
-                if not fingerprint or fingerprint in self._states:
+                if not fingerprint or fingerprint in self._segments:
                     continue
-                self._states[fingerprint] = AlarmState.from_row(row)
+                segment = Segment.from_row(row)
+                if not segment.start:
+                    # 没有段起点就没有身份，回放它只会让下一条事件
+                    # 误判成同一段
+                    continue
+                self._segments[fingerprint] = segment
                 restored += 1
         if restored:
-            logger.info("StateMachine 回放 %s 条未恢复告警", restored)
+            logger.info("StateMachine 回放 %s 个窗口段", restored)
         return restored
 
     def purge(self, now=None):
         """
-        清理长期没动静的状态。活跃告警和闪断中的永不清 ——
-        清了就等于悄悄关了一条还没好的告警
+        清理长期没动静的段状态
 
-        :return: 清掉的状态数
+        TTL 取 max(state_ttl, 段的 window_sec)：清早了段的身份就断了，
+        同一段的下一条日志会被当成新段再插一行。window_sec 最长的
+        CERT_EXPIRED 是 86400，比默认的 state_ttl 大一个量级。
+
+        活跃告警（row_state=open）不清 —— 清了之后这个段再来恢复事件
+        就找不到行，会另插一行"生而恢复"的记录
+
+        :return: 清掉的段数
         """
         now = int(now if now is not None else time.time())
         with self._lock:
-            expired = [key for key, state in self._states.items()
-                       if not state.is_open() and not state.flapping
+            expired = [key for key, segment in self._segments.items()
+                       if segment.row_state != ROW_OPEN
                        and key not in self._dirty
-                       and now - state.last_seen > self._state_ttl]
+                       and now - segment.last_seen > max(self._state_ttl,
+                                                         segment.window_sec)]
             for key in expired:
-                self._states.pop(key, None)
+                self._segments.pop(key, None)
         return len(expired)
 
-    def open_snapshots(self):
+    def current_snapshots(self):
         """
-        还开着的告警的 (fingerprint, counter, last_seen, severity, alarm_id)
+        所有已经有行的段的 (fingerprint, alarm_id, counter, last_seen,
+        severity, state)
 
-        给 L9 同步 alarm_list.counter 用。累加（ACTION_NONE）不触发 L9，
-        所以 alarm_list 的 counter 会停在开告警那一刻的值 —— 一次端口 down
-        三条日志，看板上显示 1。靠维护线程定期把这里的值刷过去补齐。
+        给 L9 同步 alarm_list.counter 用。段内的后续日志多半是 ACTION_NONE
+        （不重复通知，这是对的），所以 alarm_list 的 counter 会停在插行
+        那一刻的值 —— 一次端口 down 三条日志，看板上显示 1。靠维护线程
+        定期把这里的值刷过去补齐。
 
-        只给还开着的：已恢复的那些 counter 已经定稿了，不用再同步
+        已恢复的段也给：它可能在恢复之后又收到重复的恢复日志，counter
+        还在涨。L9 按 state 决定要不要把"已处理"翻回"待处理"
         """
         with self._lock:
             return [{
-                "fingerprint": state.fingerprint,
-                "counter": state.counter,
-                "last_seen": state.last_seen,
-                "severity": state.severity,
-                "alarm_id": state.alarm_id,
-            } for state in self._states.values() if state.is_open()]
+                "fingerprint": segment.fingerprint,
+                "alarm_id": segment.alarm_id,
+                "counter": segment.counter,
+                "last_seen": segment.last_seen,
+                "severity": segment.severity,
+                "state": segment.row_state,
+            } for segment in self._segments.values() if segment.has_row()]
 
     def stats(self):
         with self._lock:
-            opened = sum(1 for s in self._states.values() if s.is_open())
-            flapping = sum(1 for s in self._states.values() if s.flapping)
-            return {"states": len(self._states), "open": opened,
-                    "flapping": flapping, "dirty": len(self._dirty)}
+            opened = sum(1 for s in self._segments.values()
+                         if s.row_state == ROW_OPEN)
+            rows = sum(1 for s in self._segments.values() if s.has_row())
+            return {"segments": len(self._segments), "open": opened,
+                    "rows": rows, "dirty": len(self._dirty)}
 
     def size(self):
-        return len(self._states)
+        return len(self._segments)

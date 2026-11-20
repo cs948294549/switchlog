@@ -12,7 +12,7 @@ switchlog 告警管线
                          syslog_severity_rule 按设备定 severity
                          ↓ 到这里是一条原子告警
     l6_aggregate.py      指纹 + 滑动窗口，写 alarm_log
-    l7_state_machine.py  raise / clear / stateless + 闪断升级
+    l7_state_machine.py  窗口段 -> alarm_list 的一行
                          ↓ 到这里是一条告警决策
     l8_suppress.py       按 ip/event_code/object + 时间窗静默，填 muted
     l9_emit.py           写 alarm_list + 发通知
@@ -83,10 +83,10 @@ corp 职场的 rsw 掉口压根不用看（action=ignore）。定级必须排在
 命中 action=ignore 的规则时 state 变成第四个值：
 
     ignore        不发通知。事件照样走完后面各层，L6 写 alarm_log，
-                  L7 按指纹聚合也写 alarm_list（status=5，不是人工操作
-                  能选的值），只是不进开/关告警的生命周期、不进闪断计数、
-                  L9 不推通知。写 alarm_list 是为了避免"alarm_log 有记录
-                  但看板查不到"的孤儿数据——L7 的 MODE_IGNORE 对应这个值
+                  L7 按段也写 alarm_list（status=5，不是人工操作能选的
+                  值），只是不进开/关告警的生命周期、L9 不推通知。写
+                  alarm_list 是为了避免"alarm_log 有记录但看板查不到"的
+                  孤儿数据——L7 的 MODE_IGNORE 对应这个值
 
 到这里一条原子告警就齐了。后面各层的产出：
 
@@ -97,13 +97,14 @@ corp 职场的 rsw 掉口压根不用看（action=ignore）。定级必须排在
 
     # L6 aggregate 产出
     fingerprint   str     md5(ip|raise_code or event_code|alarm_object)
-    group_label   str     本段的标签 "指纹:段起点"，max_life 到了会换。
+    group_label   str     本段的标签 "指纹:段起点"，切段时会换。
                           和 alarm_list.group_label 不是一回事 —— 那一列
                           沿用老结构存裸指纹
-    is_first      bool    本段窗口内第一条。**L7 不要拿它决定开不开告警**，
-                          max_life 切新段时它也是 True
+    is_first      bool    本段窗口内第一条。L7 不读它 —— threshold 大于 1
+                          的事件码插行的时机不是第一条
     count         int     落到这个指纹的**日志条数**，不是事故次数
-    first_seen    int     本段起点
+    first_seen    int     本段起点。**这就是段的身份**，L7 拿
+                          (fingerprint, first_seen) 定位 alarm_list 的行
     last_seen     int     本段最近一条
 
     L6 只写 alarm_log（一条日志一行，带指纹，只留 7 天）。alarm_list 不在
@@ -117,42 +118,53 @@ corp 职场的 rsw 掉口压根不用看（action=ignore）。定级必须排在
 封装在 AlarmDB.getAlarmLogsByAlarm(alarm_id)，看板直接调它，别自己拼
 "where fingerprint=?" —— 那样会把这个口所有历史故障的日志混在一起。
 
-不拿 L6 的 group_label 当下钻条件：一条告警可能跨多个段（持续 down 一
-小时会被 max_life 切两段，但 L7 只累加，仍是一条告警），按段标签查只
-能查到其中一段。
+一条告警就是一个段，所以时间范围和段的边界是重合的。但下钻仍然按
+alarm_list 那一行的时间范围查，不按 group_label —— 那个标签只在 L6 的
+内存里和 alarm_log 的排查场景用，alarm_list.group_label 存的是裸指纹
+（老结构，现有分组页面按它分组）。
 
     # L7 state_machine 产出
     L7 不往 event 上加字段，它产出一个独立的决策 dict，挂在
     event["decision"] 上：
 
-    action        str     none / raise / update / escalate / clear /
-                          clear_orphan / clear_orphan_update /
-                          ignore_new / ignore_update
-                              none                开/关都不用做（累加、未到阈值、重复恢复）
-                              raise/update/escalate/clear  正常开关告警
-                              clear_orphan        恢复事件到了但没有活跃
-                                                  告警可关——故障发生在监控
-                                                  视野之外，仍落一行并通知
-                              clear_orphan_update 窗口内重复的孤立恢复，
-                                                  同一行累加 counter，不通知
-                              ignore_new/ignore_update  L5 判定不告警，
-                                                  按指纹聚合写 alarm_list，
-                                                  不通知
-    notify        bool    要不要发通知。none/ignore_new/ignore_update/
-                          clear_orphan_update 都是 False
-    state         str     open / idle / clear，告警自身还成不成立
-    severity      int     闪断升级后是提过档的
-    event_code    str     闪断升级后是 IF_FLAP，不是原来的 IF_DOWN
-    counter       int     窗口内日志条数
-    flapping      int     1=闪断中，禁止自动恢复，需人工确认
-    raise_count   int     累计开告警次数，闪断判定数这个
+    action        str     none / raise / reopen / update / clear
+                              none    这一行没有新信息（未到阈值、
+                                      段内累加、重复恢复）
+                              raise   本段第一行，insert。clear 事件也
+                                      可能产生它 —— 那一行生而恢复
+                                      （state=clear），故障发生在监控
+                                      视野之外
+                              reopen  同段内恢复之后又来故障，翻回 open
+                                      并清掉恢复时间，不插新行
+                              update  同段内级别变了（定级规则改过）
+                              clear   盖恢复标签
+    notify        bool    要不要发通知。none 和 ignore 段都是 False
+    write         bool    要不要落 alarm_list。ignore 段是 True（不通知
+                          但要留痕），none 是 False
+    ignored       bool    L5 定级规则判定不告警。L9 据此写 status=5
+    state         str     open / clear / idle，alarm_list 那一行的状态。
+                          idle 是 ignore 段专用 —— 它不是活跃告警
+    counter       int     段内日志条数
+    alarm_id      int     本段对应 alarm_list 的那一行。L9 的 update
+                          一律按它定位，不按 fingerprint
+
+    **一个窗口段 = alarm_list 的一行。** 段的身份是 L6 的
+    (fingerprint, first_seen)，L7 只做"段 -> 行"的映射：同段内不管来多少
+    条日志、raise 还是 clear，只有一行；clear 不判断"有没有活跃告警"，
+    它只是在这一行上盖恢复标签。
+
+    这样一来重复的恢复日志自然被吃掉（设备把一条恢复日志发两遍、华为一次
+    口 up 打 hwPortUp + linkDown_clear 两条且都归 IF_UP），而一段内反复
+    down/up 也只有一行、state 跟着最后一条事件走。闪断判定（窗口内 N 次
+    开告警 -> 升级成 IF_FLAP、禁止自动恢复）整套去掉了。
 
     状态的唯一来源是 syslog_alarm_state（内存 + 启动回放），不读
-    alarm_list —— 重启那一瞬间两者可能不一致，以状态表为准。
+    alarm_list —— 重启那一瞬间两者可能不一致，以状态表为准。回放**不只
+    回放未恢复的**：段就是行，已恢复的段不接上的话，段内再来一条重复的
+    恢复日志又会多插一行。
 
-    阈值判断在 L7：MAC_FLAP 配 600/3，攒到第 3 条才算告警。
-    闪断升级在原指纹上做，不换指纹 —— 换了就是另一条告警，
-    原来那条还挂着关不掉。
+    阈值判断在 L7：MAC_FLAP 配 600/3，段内攒到第 3 条才在 alarm_list 里
+    出现。判的是 L6 的 count（段内日志条数）。
 
     # L8 mute 产出
     L8 在同一个决策 dict 上填两个字段：

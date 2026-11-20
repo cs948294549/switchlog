@@ -61,11 +61,10 @@ muted 和 alarm_list.status=4（人工屏蔽）分开两个字段存，到期这
 原因：窗口过了只需要把 muted 改回 0，人工屏蔽该留着。塞进同一个字段，
 这时候就得判断"这个 4 是人设的还是规则设的"，判不出来。
 
-闪断和 mute 的交互：割接期间的 raise 照样进 L7 的闪断计数（L7 不反查
-mute 规则，两层之间不加反向依赖），窗口内连续 3 次会升出一条 P1 的
-IF_FLAP。那条 IF_FLAP 同样要过本层，命中同一条 mute 规则就一起被静默 ——
-前提是规则的 event_code_reg 能盖住 IF_FLAP。只写了 ^IF_DOWN$ 的规则会
-让它漏出来，schema.sql 的规则示例里写了这一点。
+段和 mute 的交互：割接期间同一个窗口段内反复 down/up，L7 只有一行告警，
+但每次翻回告警中（action=reopen）都会重新过一遍本层。所以割接窗口一开，
+这些 reopen 全被压住；窗口一过还在抖的话，下一次 reopen 就会漏出来。
+不需要在本层记"这一行压过没有"——mute 判的是这一刻该不该通知。
 
 实现前置条件：
     1. syslog_mute_rule 表定稿（已建，见 sql/schema.sql）
@@ -445,7 +444,7 @@ class MuteFilter(object):
                 "counter": row.get("counter", 0),
                 "first_seen": row.get("first_seen", ""),
                 "last_seen": row.get("last_seen", ""),
-                "flapping": row.get("flapping", 0),
+                "state": "open",
                 "message": "",
                 "ingest_ts": now,
                 "muted": False,

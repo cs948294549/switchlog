@@ -14,7 +14,7 @@ worker 拿到一条原始报文，调 runner.handle() 走完 L1 ~ L9。
       ├─ L5 attrs         state / 窗口 / clear_code，再按设备定 severity
       │      ↓ 原子告警
       ├─ L6 aggregate     指纹 + 滑动窗口，攒批写 alarm_log
-      ├─ L7 state_machine raise / clear / stateless + 闪断升级
+      ├─ L7 state_machine 段 -> alarm_list 的一行（一个窗口段一条告警）
       │      ↓ 告警决策
       ├─ L8 suppress      时间窗静默，填 muted
       └─ L9 emit          写 alarm_list + 发通知
@@ -109,6 +109,10 @@ class Runner(object):
         if self._attrs is None:
             self._attrs = EventAttrs(refresh_interval=0)
         return self._attrs
+
+    # L6 的段上限、L7 的静默窗口和状态 TTL 都不走 config.py：它们是这两层
+    # 内部的调参，不是部署级配置（改它们要先读懂段怎么切、行怎么对应），
+    # 默认值写在各自文件顶部的模块常量里，要调就改那里
 
     @property
     def aggregator(self):
@@ -343,13 +347,13 @@ class Runner(object):
         except Exception as err:
             logger.error("======Runner state persist error========\n%s", err)
 
-        # L7 对已有活跃告警的后续日志返回 ACTION_NONE，L9 不跑，所以
-        # alarm_list.counter 会停在开告警那一刻 —— 一次端口 down 三条日志，
+        # 段内的后续日志多半返回 ACTION_NONE，L9 不跑，所以
+        # alarm_list.counter 会停在插行那一刻 —— 一次端口 down 三条日志，
         # 看板上显示 1。这里把内存里累加的值刷过去补齐
         if self._emitter is not None:
             try:
                 result["counters"] = self._emitter.sync_counters(
-                    self._state_machine.open_snapshots())
+                    self._state_machine.current_snapshots())
             except Exception as err:
                 logger.error("======Runner sync_counters error========\n%s", err)
         return result

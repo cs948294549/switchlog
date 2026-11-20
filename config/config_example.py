@@ -50,6 +50,11 @@ class Config:
     mute_refresh_interval = 60
     stats_interval = 60             # 统计输出间隔（秒）
 
+    # 聚合（L6）和段状态机（L7）的参数不在这里 —— 段怎么切、一个段对应
+    # alarm_list 的哪一行是这两层内部的事，不是部署级配置。默认值在
+    # pipeline/l6_aggregate.py 和 pipeline/l7_state_machine.py 顶部的
+    # 模块常量里，要调就改那里
+
     # ---------------- 数据库 ----------------
     mysql_config = {
         "db_host": "127.0.0.1",

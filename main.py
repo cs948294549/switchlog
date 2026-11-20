@@ -40,6 +40,7 @@ from config.config import Config
 from utils.logger import setup_logger, LOG_DIR
 from utils.stats import stats
 from pipeline.runner import Runner
+from pipeline import l7_state_machine
 
 logger = logging.getLogger(__name__)
 
@@ -331,8 +332,8 @@ def log_decision(decision):
     tail = ""
     if decision.get("muted"):
         tail = "  [静默 rule {}，不通知]".format(decision.get("mute_rule_id"))
-    if decision.get("flapping"):
-        tail += "  [闪断，需人工确认]"
+    if decision.get("action") == "reopen":
+        tail += "  [同一窗口内再次故障]"
     if decision.get("reason") == "mute_expired":
         tail += "  [静默窗口已结束，故障仍未恢复]"
     logger.warning(
@@ -353,7 +354,7 @@ class Maintenance(threading.Thread):
     # 和规则刷新分开 —— 那个 300s 一次，带上删表会把刷新也拖慢
     PURGE_INTERVAL = 3600
 
-    # 到期扫描间隔。两件事等不了 5 分钟：stateless 事件静默恢复、
+    # 到期扫描间隔。两件事等不了 5 分钟：stateless 段静默恢复、
     # 静默窗口过了但故障还在要恢复通知
     SWEEP_INTERVAL = 60
 
@@ -440,14 +441,20 @@ def run_service(args):
     logger.info("告警出口：推通知=%s（通道 %s）",
                 Config.alarm_notify, Config.notify_channel)
 
-    # 回放未恢复的告警。不放的话重启后同一个还没好的故障会重新开告警，
-    # 等于重复通知一次。两层各回放自己的：L6 回放窗口、L7 回放告警状态
-    restored = runner.aggregator.restore()
+    # 回放最近的窗口段。不放的话重启后同一个段会被当成新段，alarm_list
+    # 里又多一行、再通知一次。两层各回放自己的：L6 回放窗口的计数和边界，
+    # L7 回放段和 alarm_list 那一行的对应关系。
+    #
+    # 已经盖过恢复标签的段也要回放 —— 段就是一行告警，不回放的话段内
+    # 再来一条重复的恢复日志就会多插一行（设备把恢复日志发两遍、华为一次
+    # 口 up 打两条 mnemonic 都会这样）
+    lookback = l7_state_machine.DEFAULT_RESTORE_LOOKBACK
+    restored = runner.aggregator.restore(int(time.time()) - lookback)
     if restored:
         logger.info("回放 %s 个指纹的聚合窗口", restored)
     restored = runner.state_machine.restore()
     if restored:
-        logger.info("回放 %s 条未恢复告警", restored)
+        logger.info("回放 %s 个窗口段的告警状态", restored)
 
     workers = [Worker(i, queues[i], runner, stop_event) for i in range(args.workers)]
     for worker in workers:
