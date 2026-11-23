@@ -275,11 +275,17 @@ CREATE TABLE syslog_mute_rule(
 -- first_seen 是段起点，也就是段的身份。L7 拿它和新进来的事件比：
 -- 一样就是同段（改 alarm_id 指向的那一行），不一样就是新段（插新行）。
 --
--- raise_count / flapping / ignore_counter / ignore_first_seen /
--- ignore_alarm_id 五列是闪断判定和 ignore 独立计数留下的，功能已经去掉，
--- 列保留（不做 ALTER，省一次现网变更），L7 恒写 0 / 空串。别在这几列上
--- 做判断。base_severity 这一列改了用途：现在存 alarm_list 那一行写着的
--- 级别，和 severity 比才判得出"定级规则改过、那一行要跟着改"。
+-- raise_count / ignore_counter / ignore_first_seen / ignore_alarm_id 四列
+-- 是闪断判定和 ignore 独立计数留下的，功能已经去掉，列保留（不做 ALTER，
+-- 省一次现网变更），L7 恒写 0 / 空串。别在这几列上做判断。
+--
+-- 另外两列**改了用途**，不是列名的原意，看代码别按名字理解：
+--   base_severity  存 row_severity —— alarm_list 那一行写着的级别，
+--                  和 severity 比才判得出"定级规则改过、那一行要跟着改"
+--   flapping       存 row_muted —— alarm_list 那一行是不是静默的。
+--                  L9 拿它和 L8 这次的判定比，从"是"变"不是"时要把
+--                  status='4' 翻回 '0'。这一跳只有调用方认得出：同一条
+--                  UPDATE 里 muted 刚被改成 0，SQL 的 CASE 读到的是旧值
 -- ============================================================
 -- 注意：清掉这张表等于丢掉所有段的状态。日志不会重发，所以重建后
 -- 已经 down 的口不会再产生告警，要等它下次翻动才会重新被发现；
@@ -299,7 +305,7 @@ CREATE TABLE syslog_alarm_state(
     counter INT NOT NULL DEFAULT 0 COMMENT '段内日志条数',
     raise_count INT NOT NULL DEFAULT 0 COMMENT '已废弃，恒0。闪断判定去掉后没有计数点了',
     clear_count INT NOT NULL DEFAULT 0 COMMENT '本段盖过几次恢复标签',
-    flapping TINYINT NOT NULL DEFAULT 0 COMMENT '已废弃，恒0。闪断判定整套去掉，反复抖动靠段本身合并',
+    flapping TINYINT NOT NULL DEFAULT 0 COMMENT '改了用途：存row_muted(alarm_list那行是不是静默的)。原语义闪断标记已废弃',
     alarm_id BIGINT NOT NULL DEFAULT 0 COMMENT '本段对应的 alarm_list 行，0=本段还没插行（未到阈值或insert失败）',
     ignore_counter INT NOT NULL DEFAULT 0 COMMENT '已废弃，恒0。一个段只有一行，ignore不再需要独立计数',
     ignore_first_seen VARCHAR(10) NOT NULL DEFAULT '' COMMENT '已废弃，恒空',

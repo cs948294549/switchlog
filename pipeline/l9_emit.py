@@ -288,11 +288,21 @@ class AlarmEmitter(object):
 
         "要不要落库"和"要不要通知"是两个独立判断：ignore 段要落库
         （否则 alarm_log 写了但 alarm_list 查不到，变成孤儿数据），
-        但不通知；none 既不落库也不通知——它就是"什么都没变"
+        但不通知；none 既不落库也不通知——它就是"什么都没变"。
+
+        **例外是 mute 状态变了。** action=none 的意思是"告警本身没有新
+        进展"，但人可能刚在前端加了一条静默规则：这条日志走到 L8 命中了，
+        而库里那一行还是 muted=0 / status='0'。不单独处理的话这一行永远
+        改不过来 —— 段内后续的日志全是 none（PSU_FAIL 窗口 7 天，一次
+        风扇故障后面所有日志都落在同一段里），看板上就是"日志里一直在打
+        静默，但告警还挂在待处理里"。所以 none 也要判一次 mute 有没有变，
+        变了就只改那三列
         """
         action = decision.get("action", "") if decision else ""
-        if not decision or action not in WRITE_ACTIONS:
+        if not decision:
             return None
+        if action not in WRITE_ACTIONS:
+            return self._sync_mute(decision, now)
 
         clock = int(now if now is not None else (decision.get("ingest_ts") or time.time()))
 
@@ -427,12 +437,9 @@ class AlarmEmitter(object):
 
         with self._lock:
             self._counts["inserted"] += 1
-        # alarm_id 回填进 L7 的段状态，本段后面的事件全靠它定位这一行
-        if self._state_machine is not None:
-            try:
-                self._state_machine.bind_alarm(decision.get("fingerprint"), alarm_id)
-            except Exception as err:
-                logger.error("======AlarmEmitter bind_alarm error========\n%s", err)
+        # alarm_id 和 muted 一起回填进 L7 的段状态：前者定位这一行，
+        # 后者让下一条事件判得出"这一行刚从静默解除"
+        self._bind(decision.get("fingerprint"), alarm_id, row.get("muted"))
         return alarm_id
 
     def _emit_without_db(self, decision, row, now, is_ignore):
@@ -457,11 +464,7 @@ class AlarmEmitter(object):
                     row.get("ip"), row.get("keyword"), row.get("alarm_object"),
                     row.get("state"), row.get("status"), row.get("muted"),
                     alarm_id)
-        if self._state_machine is not None:
-            try:
-                self._state_machine.bind_alarm(decision.get("fingerprint"), alarm_id)
-            except Exception as err:
-                logger.error("======AlarmEmitter bind_alarm error========\n%s", err)
+        self._bind(decision.get("fingerprint"), alarm_id, row.get("muted"))
         return alarm_id
 
     def _update(self, decision, action, now):
@@ -474,11 +477,19 @@ class AlarmEmitter(object):
 
         reset_status=True：这些动作都代表"故障有新进展"（又掉了、级别变了、
         恢复了），处理过的要翻回待处理重新入队，否则一次确认就把后面的
-        进展全埋掉了。被 mute 的和人工屏蔽的不翻，见 updateAlarmById
+        进展全埋掉了。被 mute 的和已屏蔽的不翻，见 updateAlarmById
 
         reopen 要把 state 写回 open 并清空 clear_time —— 看板按
         "clear_time 为空 = 未恢复"判，只改 state 的话会显示成
         "告警中但有恢复时间"
+
+        **mute 那三列每次都写。** 段内后续的日志照样过 L8，规则可能是在
+        这一行 insert 之后才加的（PSU_FAIL 窗口 7 天，一次风扇故障后面
+        所有日志都落在同一段里），只在 insert 时写的话库里永远是
+        muted=0 / status='0'，看板上就是"日志里一直在打静默，但告警还挂在
+        待处理里"。两个方向都写：
+            命中规则    muted=1  mute_rule_id=N  status='4'
+            不命中      muted=0  mute_rule_id=0  status 见下
         """
         data = {
             "last_seen": str(decision.get("last_seen") or now),
@@ -492,6 +503,17 @@ class AlarmEmitter(object):
             data["state"] = "clear"
             data["clear_time"] = str(decision.get("clear_time") or now)
 
+        muted = bool(decision.get("muted"))
+        data["muted"] = muted
+        data["mute_rule_id"] = decision.get("mute_rule_id", 0) if muted else 0
+        if muted:
+            # L8 填的 '4'。它一定有值 —— handle() 命中规则时写的
+            data["status"] = decision.get("status") or "4"
+        # 上次是静默的、这次不命中了（窗口过了）：要把 status='4' 翻回 '0'。
+        # 交给 SQL 的 CASE 做，不在这里写死 —— 人工设的 1/2/3 得留着，
+        # 由 reset_status 那条分支管
+        unmute = bool(decision.get("row_muted")) and not muted
+
         alarm_id = decision.get("alarm_id", 0)
         if not self._write_db:
             with self._lock:
@@ -502,7 +524,8 @@ class AlarmEmitter(object):
             return alarm_id
 
         try:
-            result = self.db.updateAlarmById(alarm_id, data, reset_status=True)
+            result = self.db.updateAlarmById(alarm_id, data, reset_status=True,
+                                             unmute=unmute)
         except Exception as err:
             logger.error("======AlarmEmitter update error========\n%s", err)
             result = "failed"
@@ -519,7 +542,80 @@ class AlarmEmitter(object):
         else:
             with self._lock:
                 self._counts["updated"] += 1
+            # 把实际写进去的 muted 回填进段状态，下一条事件才判得出
+            # "刚从静默解除"这一跳
+            self._bind(decision.get("fingerprint"), None, muted)
+            if unmute:
+                logger.info("解除静默：alarm_id=%s %s %s（窗口已过，"
+                            "status 翻回待处理）", alarm_id,
+                            decision.get("ip"), decision.get("alarm_object"))
         return alarm_id
+
+    def _sync_mute(self, decision, now=None):
+        """
+        action=none 时只同步 mute 那三列
+
+        触发条件是 L8 这次的判定和库里那一行不一致（人刚加了规则、或者
+        规则的窗口刚过）。不改 last_seen / counter —— 那两列由
+        sync_counters() 定期刷，这里只管 mute。
+
+        :return: {"alarm_id", "notified", "muted"}；没变化返回 None
+        """
+        muted = bool(decision.get("muted"))
+        was_muted = bool(decision.get("row_muted"))
+        alarm_id = decision.get("alarm_id", 0)
+        # 没有行可改（本段还没到阈值 / insert 失败过），或者状态没变
+        if not alarm_id or muted == was_muted:
+            return None
+
+        clock = int(now if now is not None else (decision.get("ingest_ts") or time.time()))
+        data = {
+            "muted": muted,
+            "mute_rule_id": decision.get("mute_rule_id", 0) if muted else 0,
+        }
+        if muted:
+            data["status"] = decision.get("status") or "4"
+
+        if not self._write_db:
+            with self._lock:
+                self._counts["skipped"] += 1
+            logger.info("[write_db=False] 跳过同步 mute：alarm_id=%s %s",
+                        alarm_id, data)
+            self._bind(decision.get("fingerprint"), None, muted)
+            return None
+
+        try:
+            # reset_status=False：这一跳不是"故障有新进展"，不该把人工
+            # 设的 1/2/3 翻回待处理。unmute 那条 CASE 照常要
+            result = self.db.updateAlarmById(alarm_id, data, reset_status=False,
+                                             unmute=(was_muted and not muted))
+        except Exception as err:
+            logger.error("======AlarmEmitter sync_mute error========\n%s", err)
+            result = "failed"
+
+        if result in ("failed", 0):
+            with self._lock:
+                self._counts["failed"] += 1
+            return None
+
+        with self._lock:
+            self._counts["updated"] += 1
+        self._bind(decision.get("fingerprint"), None, muted)
+        logger.info("%s：alarm_id=%s %s %s %s（rule %s）",
+                    "静默" if muted else "解除静默", alarm_id,
+                    decision.get("ip"), decision.get("event_code"),
+                    decision.get("alarm_object"), data["mute_rule_id"])
+        # 这一跳不发通知：告警本身没有新进展，只是标记变了
+        return {"alarm_id": alarm_id, "notified": False, "muted": muted}
+
+    def _bind(self, fingerprint, alarm_id, muted):
+        """回填落库结果进 L7 的段状态。没挂状态机（单测）时什么都不做"""
+        if self._state_machine is None:
+            return
+        try:
+            self._state_machine.bind_alarm(fingerprint, alarm_id, muted=muted)
+        except Exception as err:
+            logger.error("======AlarmEmitter bind_alarm error========\n%s", err)
 
     # ---------------- 通知 ----------------
 

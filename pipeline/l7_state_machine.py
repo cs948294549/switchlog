@@ -151,7 +151,8 @@ class Segment(object):
 
     __slots__ = ("fingerprint", "ip", "event_code", "alarm_object", "mode",
                  "start", "last_seen", "counter", "clear_count", "severity",
-                 "row_severity", "alarm_id", "row_state", "window_sec")
+                 "row_severity", "alarm_id", "row_state", "window_sec",
+                 "row_muted")
 
     def __init__(self, fingerprint, ip="", event_code="", alarm_object="",
                  mode=MODE_RAISE, severity=3, start=0, window_sec=0):
@@ -172,6 +173,10 @@ class Segment(object):
         self.alarm_id = 0
         self.row_state = ""        # 空=本段还没插行
         self.window_sec = int(window_sec)
+        # alarm_list 那一行当前是不是静默的。L9 靠它判"这次要不要把
+        # status='4' 翻回 '0'"——解除静默只能由调用方认出来，SQL 里的
+        # CASE 读到的 muted 是改之前的旧值
+        self.row_muted = False
 
     def has_row(self):
         """本段在 alarm_list 里有行没有。判的是 alarm_id 不是 row_state"""
@@ -186,14 +191,20 @@ class Segment(object):
         self.alarm_id = 0
         self.row_state = ""
         self.row_severity = 0
+        self.row_muted = False
 
     def as_row(self, now):
         """
         落 syslog_alarm_state 的一行
 
-        raise_count / flapping / ignore_* 五列是闪断判定和 ignore 独立
-        计数留下的，功能去掉了但列保留（NOT NULL，现网不 ALTER），
-        恒写 0 和空串。别在这几列上做判断
+        raise_count / ignore_* 四列是闪断判定和 ignore 独立计数留下的，
+        功能去掉了但列保留（NOT NULL，现网不 ALTER），恒写 0 和空串。
+        别在这几列上做判断。
+
+        另外两列改了用途，不是原来的语义：
+            base_severity  存 row_severity（alarm_list 那行写着的级别）
+            flapping       存 row_muted（alarm_list 那行是不是静默的）
+        都是为了重启回放之后还能判出"那一行和内存里不一致"，省一次白更新
         """
         return {
             "fingerprint": self.fingerprint,
@@ -215,7 +226,8 @@ class Segment(object):
             "clear_count": self.clear_count,
             "alarm_id": self.alarm_id,
             "raise_count": 0,
-            "flapping": 0,
+            # flapping 这一列原来是闪断标记，闪断去掉之后借它存 row_muted
+            "flapping": 1 if self.row_muted else 0,
             "ignore_counter": 0,
             "ignore_first_seen": "",
             "ignore_alarm_id": 0,
@@ -248,6 +260,8 @@ class Segment(object):
         segment.clear_count = to_int(row.get("clear_count"))
         segment.alarm_id = to_int(row.get("alarm_id"))
         segment.row_severity = to_int(row.get("base_severity"), segment.severity)
+        # flapping 这一列借来存 row_muted，见 as_row()
+        segment.row_muted = bool(to_int(row.get("flapping")))
         state = row.get("state") or ""
         # alarm_id=0 的段在 alarm_list 里没有行，row_state 必须跟着空 ——
         # 留个 idle 在那里会让 has_row() 和 row_state 对不上
@@ -533,12 +547,22 @@ class StateMachine(object):
             "clear_time": now if row_state == ROW_CLEAR else 0,
             "clear_count": segment.clear_count,
             "alarm_id": segment.alarm_id,
+            # alarm_list 那一行当前是不是静默的。L9 拿它和 L8 这次的判定
+            # 比，从"是"变"不是"时要把 status='4' 翻回 '0'
+            "row_muted": segment.row_muted,
         })
         return decision
 
-    def bind_alarm(self, fingerprint, alarm_id):
+    def bind_alarm(self, fingerprint, alarm_id, muted=None):
         """
-        L9 insert 之后把 alarm_id 回填进段状态，本段后面的事件要用它定位行
+        L9 落库之后把结果回填进段状态
+
+        alarm_id 在 insert 之后回填，本段后面的事件要用它定位行。
+
+        :param muted: 这次往 alarm_list 写进去的 muted 值。不传就不改 ——
+            insert 和 update 都会带上它，让内存里的 row_muted 和库里那一行
+            保持一致。下一条事件进来时 L9 拿它判"这一行刚从静默解除没有"，
+            要翻 status='4' 的话必须认得出这一跳
 
         :return: True=绑上了
         """
@@ -546,7 +570,10 @@ class StateMachine(object):
             segment = self._segments.get(fingerprint)
             if segment is None:
                 return False
-            segment.alarm_id = int(alarm_id)
+            if alarm_id is not None:
+                segment.alarm_id = int(alarm_id)
+            if muted is not None:
+                segment.row_muted = bool(muted)
             self._dirty.add(fingerprint)
         return True
 
@@ -600,6 +627,10 @@ class StateMachine(object):
                     "clear_time": now,
                     "clear_count": segment.clear_count,
                     "alarm_id": segment.alarm_id,
+                    # 这条决策还要过 L8（Runner.sweep 里会调），它可能把
+                    # muted 改成 True。row_muted 带上那一行当前的状态，
+                    # L9 据此判要不要把 status='4' 翻回 '0'
+                    "row_muted": segment.row_muted,
                     "ingest_ts": now,
                     "muted": False,
                     "mute_rule_id": 0,

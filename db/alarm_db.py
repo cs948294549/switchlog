@@ -93,7 +93,7 @@ class AlarmDB(object):
             logger.error("======AlarmDB addAlarm error========\n%s", err)
             return 0
 
-    def updateAlarmById(self, alarm_id, data, reset_status=False):
+    def updateAlarmById(self, alarm_id, data, reset_status=False, unmute=False):
         """
         按 alarm_id 更新一行告警
 
@@ -112,13 +112,24 @@ class AlarmDB(object):
             一次确认永久埋掉。
 
             CASE 里挡住三种不该翻的：
-              muted=1     割接窗口内，mute 的意思就是"这段时间别烦我"
-              status='4'  人工屏蔽，这是明确表达"一直别提醒到我改它"
+              muted=1     静默中，mute 的意思就是"这段时间别烦我"
+              status='4'  已屏蔽（人工屏蔽就是 mute，统一这个值）
               status='5'  L5 规则判定不告警，系统自己打的，不是待办
 
             只翻 1/2/3（已确认/已处理/忽略）。status 不走白名单那套
             传值，因为它是条件逻辑不是定值 —— 同一条 UPDATE 里
             last_seen/counter 对所有行都要生效，只有 status 要挑行
+
+            data 里显式带了 status 时这段整体不生效：调用方已经算好了要写
+            什么值（L8 命中规则写 '4'），别再让 CASE 盖一遍
+
+        :param unmute: True=这一行刚从静默解除（上次 muted=1、这次规则
+            不命中了），把 status='4' 翻回 '0'。
+
+            为什么要单独一个参数，不跟着 muted 判：同一条 UPDATE 里
+            muted 刚被设成 0，但 CASE 读到的是**改之前的旧值**（1），
+            靠 `when muted=0` 判永远进不去那条分支，'4' 就卡住了。
+            只有调用方知道"这一行上次是不是静默的"。
 
         :return: 影响行数；失败返回 "failed"
         """
@@ -132,21 +143,45 @@ class AlarmDB(object):
             logger.error("======AlarmDB updateAlarmById 没有 alarm_id========\n%s", data)
             return "failed"
 
+        # muted / mute_rule_id 也在白名单里：段内后续的日志照样过 L8，
+        # 命中规则就要把这一行改成静默。规则是在告警产生之后才加的
+        # （PSU_FAIL 窗口 7 天，一次故障后面所有日志都落在同一段里），
+        # 不更新这两列的话库里永远是 muted=0，L8 的判定只停在日志上
         update_keys = ["last_seen", "counter", "severity", "state", "clear_time",
-                       "keyword", "group_name", "msg", "status"]
+                       "keyword", "group_name", "msg", "status",
+                       "muted", "mute_rule_id"]
         conditions = []
         params = []
         for key in update_keys:
-            if key in data:
-                conditions.append(key + " = %s")
+            if key not in data:
+                continue
+            conditions.append(key + " = %s")
+            # muted 是 TINYINT，调用方传的是 bool。和 addAlarm 一样
+            # 显式转成 1/0，不依赖驱动怎么映射 False
+            if key == "muted":
+                params.append(1 if data[key] else 0)
+            else:
                 params.append(data[key])
         if not conditions:
             return "failed"
 
-        if reset_status and "status" not in data:
+        if "status" not in data and (reset_status or unmute):
+            # 解除静默（unmute=True）时把 '4' 也翻回 '0'。这一条必须和
+            # reset_status 那段合成同一个 CASE —— 两个 "status = ..." 写进
+            # 同一条 UPDATE 的话，后面那个会盖掉前面那个。
+            #
+            # 判 muted=0 用的是**改之前的旧值**（同一条 UPDATE 里
+            # muted 刚被设成 0，CASE 读到的还是 1），所以解除静默这条
+            # 不能跟着 muted 判，只能靠调用方传 unmute
+            branches = []
+            if reset_status:
+                # 静默中的不翻：mute 的意思就是"这段时间别烦我"。
+                # 这里的 muted 是改之前的旧值，正是想要的
+                branches.append("when muted=0 and status in ('1','2','3') then '0'")
+            if unmute:
+                branches.append("when status='4' then '0'")
             conditions.append(
-                "status = case when muted=0 and status in ('1','2','3') "
-                "then '0' else status end")
+                "status = case {} else status end".format(" ".join(branches)))
 
         sql = ("update alarm_list set " + ", ".join(conditions) +
                " where alarm_id=%s")
@@ -509,13 +544,14 @@ class AlarmDB(object):
         """
         sql = '''
         select fingerprint, ip, event_code, alarm_object, mode, state, severity,
-               base_severity, first_seen, last_seen, counter, clear_count, alarm_id
+               base_severity, first_seen, last_seen, counter, clear_count,
+               alarm_id, flapping
         from syslog_alarm_state where last_seen >= %s
         order by last_seen desc limit %s
         '''
         proper = ["fingerprint", "ip", "event_code", "alarm_object", "mode", "state",
                   "severity", "base_severity", "first_seen", "last_seen", "counter",
-                  "clear_count", "alarm_id"]
+                  "clear_count", "alarm_id", "flapping"]
         try:
             with MySQLConnection() as conn:
                 return conn.query(sql, (str(int(since_ts)), int(limit)), proper=proper)
