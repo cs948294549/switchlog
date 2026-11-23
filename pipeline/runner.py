@@ -55,7 +55,7 @@ class Runner(object):
 
     def __init__(self, prepare_fn=prepare, blacklist=None, parser=None,
                  enricher=None, attrs=None, aggregator=None, state_machine=None,
-                 mute=None, emitter=None, stats=None):
+                 mute=None, emitter=None, stats=None, write_db=True):
         """
         :param blacklist:     BlacklistFilter，默认懒建
         :param parser:        SyslogParser，默认懒建
@@ -66,8 +66,16 @@ class Runner(object):
         :param mute:          MuteFilter，默认懒建
         :param emitter:       AlarmEmitter，默认懒建
         :param stats:         utils.stats.Stats，默认用进程内单例
+        :param write_db:      False=整条管线只读不写。往下传给懒建的
+                              L2/L6/L7/L8/L9（那五层有写库操作），
+                              **外部传进来的实例不改**（它们自己的开关
+                              由构造方决定）。规则表/设备表的读取不受
+                              影响，否则没规则可判。
+                              给 test.py 这类调试脚本用：拿真实日志过
+                              一遍完整管线看判定结果，不污染生产库
         """
         self._prepare = prepare_fn
+        self._write_db = bool(write_db)
         self._blacklist = blacklist
         self._parser = parser
         self._enricher = enricher
@@ -89,7 +97,8 @@ class Runner(object):
     @property
     def blacklist(self):
         if self._blacklist is None:
-            self._blacklist = BlacklistFilter(refresh_interval=0)
+            self._blacklist = BlacklistFilter(refresh_interval=0,
+                                              write_db=self._write_db)
         return self._blacklist
 
     @property
@@ -117,13 +126,13 @@ class Runner(object):
     @property
     def aggregator(self):
         if self._aggregator is None:
-            self._aggregator = Aggregator()
+            self._aggregator = Aggregator(write_db=self._write_db)
         return self._aggregator
 
     @property
     def state_machine(self):
         if self._state_machine is None:
-            self._state_machine = StateMachine()
+            self._state_machine = StateMachine(write_db=self._write_db)
         return self._state_machine
 
     @property
@@ -133,14 +142,16 @@ class Runner(object):
             # 分钟级的）。所以 tick() 里不刷它，见 tick() 的说明
             from config.config import Config
             self._mute = MuteFilter(
-                refresh_interval=getattr(Config, "mute_refresh_interval", 60))
+                refresh_interval=getattr(Config, "mute_refresh_interval", 60),
+                write_db=self._write_db)
         return self._mute
 
     @property
     def emitter(self):
         if self._emitter is None:
             # 带上状态机：insert 之后要把 alarm_id 回填进状态
-            self._emitter = AlarmEmitter(state_machine=self.state_machine)
+            self._emitter = AlarmEmitter(state_machine=self.state_machine,
+                                         write_db=self._write_db)
         return self._emitter
 
     # ---------------- 热路径 ----------------
@@ -384,12 +395,13 @@ class Runner(object):
             except Exception as err:
                 logger.error("======Runner state sweep error========\n%s", err)
 
-        if self._mute is not None:
-            try:
-                # 静默到期放出来的已经在 L8 里改过库了，这里只补通知
-                pending.extend(self._mute.sweep(now=now))
-            except Exception as err:
-                logger.error("======Runner mute sweep error========\n%s", err)
+        # L8 没有 sweep：静默是**告警产生那一刻**判一次的事 ——
+        # L6 聚合出告警 -> L8 拿告警发生时间（ingest_ts）比规则的时间窗，
+        # 在窗口内就打屏蔽标签，不在就正常往 L9 走。判完就定了，不回头改。
+        #
+        # 以前有个定时 sweep 把"窗口过了但还没恢复"的告警放出来补发通知，
+        # 已经删掉：窗口过了而期间没有新告警产生，就说明没有新的事情发生，
+        # 不需要把旧告警翻回待处理。有新日志进来自然会重新走一遍判定。
 
         for decision in pending:
             self._count_decision(decision)

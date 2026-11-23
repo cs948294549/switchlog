@@ -1,44 +1,48 @@
--- 告警漏斗统计：原始日志 -> 聚合告警 -> 有效告警
--- 口径说明：
---   原始日志接收量 = 黑名单拦截量(syslog_black_list.hit_count 累计) + alarm_log 实际入库条数
---     （被 L2 黑名单命中的日志在解析前就丢弃，不会写入 alarm_log，必须两者相加才是完整接收量）
---   系统屏蔽聚合告警 = status=5（L9系统判定ignore） 或 muted=1（L8静默压制），两者并列统计 + 合计
---   有效告警 = 全部聚合告警 - 系统屏蔽聚合告警（即 status!=5 且 muted=0）
--- 时间范围：以下默认全量统计。按天/按区间统计时，在各 SELECT 的 WHERE 里加：
---   AND create_time >= '2026-11-01 00:00:00' AND create_time < '2026-11-12 00:00:00'   -- alarm_list
---   AND ingest_ts   >= '2026-11-01 00:00:00' AND ingest_ts   < '2026-11-12 00:00:00'   -- alarm_log
---   黑名单 hit_count 是累计计数器，没有时间戳，无法按区间拆分，只能取全量。
+-- ============================================================
+-- 告警漏斗统计：日志总量 -> 按处理状态分三类
+--
+-- 只查 alarm_list 和 alarm_log 两张表。
+--
+-- ========== status 分组口径 ==========
+--
+--   pending   status='0'              待处理。L9 写入的初始值
+--   handled   status IN ('1','2')     已确认 + 已处理，人工在看板上点的
+--   ignored   status IN ('3','4','5') 人工忽略 + 人工屏蔽 + 系统判定忽略
+--                                     （3/4 是人点的，5 由 L9 自动写）
+--
+-- 三组互斥，相加等于 alarm_list 总行数。
+--
+-- ========== 其余两个维度 ==========
+--
+-- muted 和 status 是**正交**的：L8 静默规则压住通知，但那行告警的
+-- status 可能还是 0（待处理）。所以 muted 单独列一个数，不混进上面
+-- 三组里，否则同一行会被重复计数。
+--
+-- state（open告警中 / clear已恢复 / idle=ignore判定）同样正交，
+-- 单独列 open 的数量 —— 这个数才是"当前还需要盯的告警"，
+-- 和看板上看到的条数对得上。
+--
+-- ========== 日志总量 ==========
+--
+-- alarm_log 的行数（一条日志一行）。注意这是**过了 L2 黑名单之后**的
+-- 量：被黑名单拦下的日志在解析前就丢弃，从没写进 alarm_log。
+-- 另外这张表只留 7 天。
+--
+-- ========== 时间范围 ==========
+--
+-- 两张表的时间列都是 VARCHAR(10) 存 epoch 秒，不是 datetime。
+-- 按区间统计在对应 WHERE 里加（epoch 定长10位，字典序==数值序，
+-- 比字符串能走索引；空串会被当成"很早"，所以要带 <> ''）：
+--   alarm_log ： AND ingest_ts   <> '' AND ingest_ts   >= CAST(UNIX_TIMESTAMP('2026-11-01 00:00:00') AS CHAR)
+--   alarm_list： AND create_time <> '' AND create_time >= CAST(UNIX_TIMESTAMP('2026-11-01 00:00:00') AS CHAR)
+-- ============================================================
 
--- 1. 黑名单拦截的原始日志数（L2层丢弃，从未进入 alarm_log）
-SELECT COALESCE(SUM(hit_count), 0) AS blacklist_dropped
-FROM syslog_black_list;
-
--- 2. alarm_log 实际原始日志条数（过了黑名单、进入管线解析的原子日志）
-SELECT COUNT(*) AS raw_log_count
-FROM alarm_log;
-
--- 3. alarm_list 全部聚合告警数量
-SELECT COUNT(*) AS total_aggregated
-FROM alarm_list;
-
--- 4. 系统屏蔽聚合告警数量：status=5 与 muted=1 分开列 + 合计（去重，避免同时满足两者被算两次）
 SELECT
-    SUM(CASE WHEN status = '5' THEN 1 ELSE 0 END)              AS suppressed_by_status5,
-    SUM(CASE WHEN muted = 1    THEN 1 ELSE 0 END)               AS suppressed_by_muted,
-    SUM(CASE WHEN status = '5' OR muted = 1 THEN 1 ELSE 0 END) AS suppressed_total
-FROM alarm_list;
-
--- 5. 有效告警数量（排除系统屏蔽后，实际会展示给人工处理的聚合告警）
-SELECT COUNT(*) AS effective_alarms
-FROM alarm_list
-WHERE status != '5' AND muted = 0;
-
--- 6. 一把梭：完整漏斗汇总（单行输出，便于报表/监控直接取值）
-SELECT
-    (SELECT COALESCE(SUM(hit_count), 0) FROM syslog_black_list)              AS blacklist_dropped,
-    (SELECT COUNT(*) FROM alarm_log)                                        AS raw_log_count,
-    (SELECT COALESCE(SUM(hit_count), 0) FROM syslog_black_list)
-        + (SELECT COUNT(*) FROM alarm_log)                                 AS total_received_logs,
-    (SELECT COUNT(*) FROM alarm_list)                                       AS total_aggregated,
-    (SELECT COUNT(*) FROM alarm_list WHERE status = '5' OR muted = 1)      AS suppressed_total,
-    (SELECT COUNT(*) FROM alarm_list WHERE status != '5' AND muted = 0)    AS effective_alarms;
+    (SELECT COUNT(*) FROM alarm_log)                                          AS raw_logs,
+    (SELECT COUNT(*) FROM alarm_list)                                         AS total_alarms,
+    (SELECT COUNT(*) FROM alarm_list WHERE status = '0')                      AS pending,
+    (SELECT COUNT(*) FROM alarm_list WHERE status IN ('1','2'))               AS handled,
+    (SELECT COUNT(*) FROM alarm_list WHERE status IN ('3','4','5'))           AS ignored,
+    -- 下面两个和上面三组正交，不参与相加
+    (SELECT COUNT(*) FROM alarm_list WHERE muted = 1)                         AS muted_rows,
+    (SELECT COUNT(*) FROM alarm_list WHERE state = 'open')                     AS still_open;

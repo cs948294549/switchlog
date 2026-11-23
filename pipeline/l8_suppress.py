@@ -34,32 +34,42 @@ INSERT 进去（AlarmDB.addAlarm 的入参里就有这两个）。不要先 INSE
 muted=0 再 UPDATE 成 1 —— 中间那一瞬间看板轮询到会显示成"割接期间有条
 没静默的告警"。
 
-已经开着的告警：静默状态后来变了才用 AlarmDB.setAlarmMute()，两个方向
-都要管：
+======================= 判一次就定了，没有定时扫描 =======================
 
-    窗口开始  已开着的告警进了割接窗口     -> setAlarmMute(id, True, rule_id)
-    窗口结束  窗口过了但告警还没好         -> setAlarmMute(id, False)
+静默是**告警产生那一刻**判一次的事，判完就定了，不回头改：
 
-======================= 到期扫描 =======================
+    L6 聚合出一条告警
+    -> L8 拿这条告警的发生时间（decision["ingest_ts"]）比规则的时间窗
+    -> 在窗口内且判据命中  -> 打屏蔽标签（muted=1 status='4'）
+    -> 否则                -> 正常往 L9 走
 
-第二个方向必须靠定时扫描，不能等日志驱动：窗口到期是时间到了，不是来了
-新日志。一个口在割接窗口里 down 了一直没好，窗口结束之后不会再有新日志
-进管线（L7 看到已有活跃告警只累加，也不会重新判 mute），这条告警就会
-永远 muted —— 割接结束了、故障还在，但没人收到通知。
+本层**没有 sweep()**。以前有一个定时扫描，把"窗口过了但告警还没恢复"的
+放出来补发通知，已经删掉 —— 窗口过了而这期间没有新告警产生，就说明没有
+新的事情发生，不需要把旧告警翻回待处理。真有新日志进来，自然会重新走一
+遍上面的判定，那时候窗口已经过了，这条新告警就不会被静默。
 
-所以本层除了 handle() 还要有个 sweep()：
+handle() 里原来还有一道 `if not notify: return` 的门槛（L7 判
+ACTION_NONE 就不判 mute），也去掉了：原始日志进来就按流程判。那道门槛
+的后果是同一窗口段内的重复 raise 全部跳过正则，人在前端新加的规则对已
+经开着的告警永远不生效（hit_count 一直是 0）。
 
-    AlarmDB.getMutedOpenAlarms()  取还在告警中且被静默的
-    -> 逐条重新判当前时刻还命不命中规则
-    -> 不命中的 setAlarmMute(id, False)，并交给 L9 补发一次通知
+muted 和 alarm_list.status 两列**同步变**，不是分开的两套语义 ——
+人工屏蔽就是 mute，不区分"人点的4"和"规则设的4"：
 
-补不补发通知要定：窗口结束时故障还在，值班应该被叫醒；但如果窗口里这条
-告警已经恢复过又重开，补发的内容要以当前状态为准。实现时按"扫描时
-state 仍是 open 就补发"处理。
+    命中规则  muted=1  status='4'（看板显示已屏蔽）
+    不命中    muted=0  status 交给 L9 定（ignore段='5'，其余='0'）
 
-muted 和 alarm_list.status=4（人工屏蔽）分开两个字段存，到期这一刻就是
-原因：窗口过了只需要把 muted 改回 0，人工屏蔽该留着。塞进同一个字段，
-这时候就得判断"这个 4 是人设的还是规则设的"，判不出来。
+两列都留着是因为用途不同：muted 是 L9 判断发不发通知用的开关，
+status 是看板上的处理状态标签。
+
+注意这是**每条告警各判一次**，不是给某条告警反复改状态：窗口过了之后
+新产生的告警判出来就是 muted=0，窗口内产生的那条保持 muted=1 不动。
+
+三个字段各管一件事，别混：
+    state   open/clear，**只影响展示标签**（告警中/已恢复的事实记录），
+            不参与"该不该静默"的判断
+    status  处理状态，0待处理 1已确认 2已处理 3忽略 4已屏蔽 5系统忽略
+    muted   发不发通知的开关
 
 段和 mute 的交互：割接期间同一个窗口段内反复 down/up，L7 只有一行告警，
 但每次翻回告警中（action=reopen）都会重新过一遍本层。所以割接窗口一开，
@@ -74,8 +84,7 @@ muted 和 alarm_list.status=4（人工屏蔽）分开两个字段存，到期这
 
 ======================= 接口 =======================
 
-    handle(decision, now) -> 原地往 decision 上填 muted / mute_rule_id
-    sweep(now)            -> [放出的告警]，维护线程定期调
+    handle(decision, now) -> 原地往 decision 上填 muted / mute_rule_id / status
 
 入参是 L7 的决策（带 fingerprint / ip / event_code / alarm_object），
 不是原始 event —— 本层在 L7 之后，拿到的已经是告警不是日志。
@@ -85,24 +94,20 @@ import time
 import logging
 import threading
 
-from pipeline.l5_attrs import severity_name
 
 logger = logging.getLogger(__name__)
 
 ACTION_PASS = "pass"
 ACTION_MUTE = "mute"
 
-# sweep() 放出来的决策用这个动作：告警早就在 alarm_list 里了，
-# muted 这一列本层也改过了，L9 只需要补一条通知，不要再写库
-ACTION_NOTIFY_ONLY = "notify_only"
+# alarm_list.status 的取值。命中 mute 规则写 '4'（已屏蔽）——
+# 人工屏蔽就是 mute，不区分"人点的4"和"规则设的4"，统一这一个值。
+# 不命中时本层不写 status，交给 L9 定（ignore段='5'，其余='0'）
+STATUS_MUTED = "4"
 
 # syslog_mute_rule 刷新间隔。比其他规则表短（那几张是 300s）：
 # 变更窗口是分钟级的，工单一开就得尽快生效，等 5 分钟割接都开始了
 DEFAULT_REFRESH = 60
-
-# 到期扫描间隔。窗口结束要尽快恢复通知 —— 割接完了故障还在，
-# 晚一分钟就是晚一分钟没人知道
-DEFAULT_SWEEP_INTERVAL = 60
 
 
 class MuteRule(object):
@@ -171,9 +176,10 @@ class MuteRule(object):
         """
         当前时刻在窗口内。start_time 空=立即生效，end_time 空=永久
 
-        数据库那边 getMuteRules() 已经按时间过滤过一遍，这里再判一次是为了
-        sweep() —— 它要用内存里的规则判"现在还命不命中"，而规则是 60s 前
-        加载的，窗口可能已经过了
+        数据库那边 getMuteRules() 已经按时间过滤过一遍，这里还要再判一次：
+        规则是最多 60s 前加载到内存的，这期间窗口可能已经过了。而判窗口
+        用的是**这条告警的发生时间**（decision["ingest_ts"]），不是当前
+        时刻 —— 告警什么时候发生的，就按那一刻在不在窗口内算
         """
         if self.start_time and now < self.start_time:
             return False
@@ -236,24 +242,26 @@ class MuteFilter(object):
     """
     L8 静默
 
-    handle() 判一条决策要不要静默，sweep() 把窗口过了的放出来。
+    handle() 判一条决策要不要静默。判一次就定了，没有回头修改的机制。
     和其他规则层一样定时刷新，索引整体替换，读路径不加锁。
     """
 
-    def __init__(self, refresh_interval=DEFAULT_REFRESH, db=None):
+    def __init__(self, refresh_interval=DEFAULT_REFRESH, db=None, write_db=True):
         """
         :param refresh_interval: syslog_mute_rule 刷新间隔（秒），0=只加载一次
         :param db: 数据源，由 db.get_alarm_db() 注入
+        :param write_db: False=只读不写，persist() 不回写 hit_count。
+                         规则照常加载、静默照常判，只是不往库里留痕
         """
         self._refresh_interval = int(refresh_interval)
         self._db = db
+        self._write_db = bool(write_db)
         self._index = MuteIndex([])
         self._version = 0
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._refresh_thread = None
         self._muted_count = 0
-        self._released_count = 0
 
         self.refresh()
 
@@ -322,8 +330,14 @@ class MuteFilter(object):
         和 BlacklistFilter.persist() 同一个模式：维护线程按固定间隔调，
         不在热路径上写库；增量 = 当前 hits - 上次刷过的值。
 
+        write_db=False 时直接返回 0 —— 内存里的 hits 照常累加
+        （stats() 还能看到命中了几次），只是不回写库
+
         :return: 更新的行数
         """
+        if not self._write_db:
+            return 0
+
         with self._lock:
             deltas = {}
             rules = []
@@ -353,22 +367,40 @@ class MuteFilter(object):
 
     def handle(self, decision, now=None):
         """
-        判一条 L7 决策要不要静默，原地填 muted / mute_rule_id
+        判一条 L7 决策要不要静默，原地填 muted / mute_rule_id / status
 
         不丢决策、不拦记录：muted 是记录上的状态，不是"要不要入库"的开关。
         被静默的告警照样入库，只是 L9 不发通知。
 
-        L7 说不用通知的（action=none/ignore）直接跳过，不白跑正则
+        **不看 L7 的 action/notify**：原始日志进来后按流程判断，遇到 mute
+        匹配就打上 mute 状态。以前这里有一道 `if not notify: return` 的
+        门槛，后果是同一个窗口段内重复的 raise（L7 判 ACTION_NONE，
+        notify=False）压根不过正则 —— 人在前端新加一条规则，对已经开着
+        的告警永远不生效（hit_count 一直是 0）。PSU_FAIL 窗口 7 天的
+        场景下尤其明显：一次风扇故障后续所有日志都落在同一段里。
+
+        命中后同时写三个字段：
+            muted=1         L9 据此不发通知
+            mute_rule_id    命中了哪条规则，排查时能追到源头
+            status='4'      看板上的"已屏蔽"。人工屏蔽就是 mute，不区分
+                            "人设的4"和"规则设的4"，统一这一个值
+
+        判窗口用的是**这条告警的发生时间**（decision["ingest_ts"]），
+        不是当前时刻：告警什么时候发生的，就按那一刻在不在窗口内算。
+        判完就定了，窗口过了也不回头改这条告警 —— 窗口之后新产生的
+        告警自然判出来 muted=0。
+
+        state（open/clear）不参与判断 —— 它只影响展示标签，是"告警中/
+        已恢复"的事实记录，和该不该通知无关。
 
         :return: decision
         """
         if not decision:
             return decision
-        # 两个字段一定有值，不管走哪条分支 —— L9 不用判 key 在不在
+        # 三个字段一定有值，不管走哪条分支 —— L9 不用判 key 在不在
         decision.setdefault("muted", False)
         decision.setdefault("mute_rule_id", 0)
-        if not decision.get("notify"):
-            return decision
+        decision.setdefault("status", "")
 
         clock = int(now if now is not None else (decision.get("ingest_ts") or time.time()))
         rule = self.rule_of(decision.get("ip"), decision.get("event_code"),
@@ -376,12 +408,14 @@ class MuteFilter(object):
         if rule is None:
             decision["muted"] = False
             decision["mute_rule_id"] = 0
+            # 不命中时不写 status，让 L9 按自己的逻辑定（ignore 段='5'、
+            # 其余='0'）。写成 '0' 会把 ignore 段的 '5' 冲掉
             return decision
 
         decision["muted"] = True
         decision["mute_rule_id"] = rule.rule_id
-        # rule 是 self._index 里的同一个实例，直接累加；只在这里加
-        # （真正判定要静默的这一刻），sweep() 复判还命不命中时不计数
+        decision["status"] = STATUS_MUTED
+        # rule 是 self._index 里的同一个实例，直接累加
         rule.hits += 1
         with self._lock:
             self._muted_count += 1
@@ -390,77 +424,6 @@ class MuteFilter(object):
                     decision.get("alarm_object"), rule.rule_id, rule.descr)
         return decision
 
-    def sweep(self, now=None):
-        """
-        窗口到期：把还在告警中但已经不命中任何规则的放出来
-
-        必须定时扫，不能等日志驱动。窗口到期是时间到了，不是来了新日志 ——
-        一个口在割接窗口里 down 了一直没好，窗口结束之后不会再有新日志进
-        管线（L7 看到已有活跃告警只累加，也不会重新判 mute），这条告警就
-        永远 muted，割接结束了、故障还在，但没人收到通知。
-
-        扫描时 state 仍是 open 就补发通知：窗口结束故障还在，值班应该被叫醒。
-
-        :return: [{alarm_id, fingerprint, ip, event_code, alarm_object,
-                   severity, notify}]，交给 L9 补发通知
-        """
-        now = int(now if now is not None else time.time())
-        try:
-            rows = self.db.getMutedOpenAlarms()
-        except Exception as err:
-            logger.error("======MuteFilter sweep error========\n%s", err)
-            return []
-
-        released = []
-        for row in rows or []:
-            # keyword 列存的是 event_code，沿用 central-server 的老结构
-            rule = self.rule_of(row.get("ip"), row.get("keyword"),
-                                row.get("alarm_object"), now=now)
-            if rule is not None:
-                # 还在窗口内（或命中了另一条规则），继续静默
-                continue
-
-            alarm_id = row.get("alarm_id")
-            try:
-                result = self.db.setAlarmMute(alarm_id, False)
-            except Exception as err:
-                logger.error("======MuteFilter setAlarmMute error========\n%s", err)
-                continue
-            if result == "failed":
-                continue
-
-            released.append({
-                # 只补通知，不再动 alarm_list —— muted 这一列上面
-                # 已经改过了，别让 L9 拿默认值把 last_seen/counter 冲掉
-                "action": ACTION_NOTIFY_ONLY,
-                "alarm_id": alarm_id,
-                "fingerprint": row.get("fingerprint", ""),
-                "ip": row.get("ip", ""),
-                "hostname": "",
-                "event_code": row.get("keyword", ""),
-                "alarm_object": row.get("alarm_object", ""),
-                "severity": row.get("severity", 3),
-                "severity_name": severity_name(row.get("severity", 3)),
-                "counter": row.get("counter", 0),
-                "first_seen": row.get("first_seen", ""),
-                "last_seen": row.get("last_seen", ""),
-                "state": "open",
-                "message": "",
-                "ingest_ts": now,
-                "muted": False,
-                "mute_rule_id": 0,
-                "notify": True,
-                "reason": "mute_expired",
-            })
-
-        if released:
-            with self._lock:
-                self._released_count += len(released)
-            logger.warning("静默窗口到期，%s 条告警恢复通知（故障仍未恢复）",
-                           len(released))
-        return released
-
     def stats(self):
         with self._lock:
-            return {"rules": self._index.total, "muted": self._muted_count,
-                    "released": self._released_count}
+            return {"rules": self._index.total, "muted": self._muted_count}

@@ -225,27 +225,35 @@ class AlarmEmitter(object):
     worker 共享一个实例。落库走数据库连接各自开，通知通道内部自己加锁。
     """
 
-    def __init__(self, notifier=None, state_machine=None, db=None, notify=None):
+    def __init__(self, notifier=None, state_machine=None, db=None, notify=None,
+                 write_db=True):
         """
         :param notifier:      通知通道，不传按 config.notify_channel 建
         :param state_machine: L7 实例，insert 之后要把 alarm_id 回填进状态
         :param db:            数据源，由 db.get_alarm_db() 注入
         :param notify:        推不推通知，不传读 config.alarm_notify
+        :param write_db:      False=不落 alarm_list。给 test.py 这类调试
+                              脚本用：整条管线照常跑、通知照常输出到
+                              notify.log，只是不往库里写告警
 
-        只剩通知一个开关。原来还有个 write_db 控制落不落 alarm_list，
-        给"规则刚配完怕误报刷库"那个场景用 —— 但 alarm_list 是看板的
-        唯一数据源，关掉它看板就全空，真要对规则看 notify.log 就够了，
-        没人会去关它。留着反而多一条"看板为什么没数据"的排查路径
+        write_db 这个开关曾经去掉过，理由是"alarm_list 是看板的唯一数据
+        源，关掉看板就全空，运行态没人会关它"。现在加回来是为了调试：
+        test.py 要能拿真实日志过一遍完整管线看判定结果，但不该污染
+        生产库。**运行态不要关这个开关**，关了看板就没数据。
         """
         self._notifier = notifier if notifier is not None else build_notifier()
         self._state_machine = state_machine
         self._db = db
         self._notify_on = self._switch(notify, "alarm_notify")
+        self._write_db = bool(write_db)
         self._lock = threading.Lock()
-        # 没有 skipped：那个计数是给 write_db=False（跳过落库）用的，
-        # 开关去掉之后落库是必经路径，不存在"跳过"这种结果
+        # skipped 记 write_db=False 时跳过落库的条数，调试时用来确认
+        # "该落库的都走到了这一步"，和 failed（真的写失败）分开
         self._counts = {"inserted": 0, "updated": 0, "notified": 0,
-                        "muted": 0, "failed": 0, "ignored": 0}
+                        "muted": 0, "failed": 0, "ignored": 0, "skipped": 0}
+        # write_db=False 时发给 L7 的假 alarm_id，从 -1 开始递减。
+        # 见 _emit_without_db() 的注释
+        self._fake_alarm_seq = 0
         # alarm_id -> 上次同步出去的 (counter, last_seen)。没变就不写，
         # 否则一个 down 了一天的口每 10 秒白写一次 UPDATE。
         # 按 alarm_id 不按 fingerprint：一个指纹下有多行（每段一行）
@@ -341,8 +349,14 @@ class AlarmEmitter(object):
         决定好这一行是 open、clear（视野外恢复，生而恢复）还是 idle
         （ignore 段，它不是活跃告警，没有恢复的那一刻）。
 
-        status 只跟 ignored 走：ignore 段标 "5"（系统规则判定忽略，人工
-        操作选不到这个值），其余都是 "0" 待处理
+        status 三种来源，优先级从高到低：
+            ignore 段            "5"  系统规则判定忽略，人工操作选不到
+            L8 命中 mute 规则    "4"  已屏蔽（人工屏蔽就是 mute，不区分
+                                      "人点的"和"规则设的"），由 L8 的
+                                      handle() 填进 decision["status"]
+            其余                 "0"  待处理
+        ignore 优先级最高：那种段压根没过 L8（本层 handle() 在落库之后
+        就返回了，不读 muted），不可能带 mute 状态
         """
         is_ignore = bool(decision.get("ignored"))
         row_state = decision.get("state") or "open"
@@ -365,7 +379,9 @@ class AlarmEmitter(object):
             "object_alias": decision.get("object_alias", ""),
             "severity": decision.get("severity", 3),
             "state": row_state,
-            "status": "5" if is_ignore else "0",
+            # ignore 最高优先；否则用 L8 填的（命中mute='4'）；都没有就'0'
+            "status": ("5" if is_ignore
+                       else (decision.get("status") or "0")),
             "counter": decision.get("counter", 1),
             "first_seen": str(decision.get("first_seen") or now),
             "last_seen": str(decision.get("last_seen") or now),
@@ -379,6 +395,14 @@ class AlarmEmitter(object):
             "muted": False if is_ignore else decision.get("muted", False),
             "mute_rule_id": 0 if is_ignore else decision.get("mute_rule_id", 0),
         }
+        if not self._write_db:
+            # 不落库。给一个假的 alarm_id 让后面的通知分支照常跑完 ——
+            # 调试时要看的就是"这条会不会通知、通知内容长什么样"。
+            # 用负数，一眼能看出不是真的库里的 id
+            with self._lock:
+                self._counts["skipped"] += 1
+            return self._emit_without_db(decision, row, now, is_ignore)
+
         try:
             alarm_id = self.db.addAlarm(row)
         except Exception as err:
@@ -404,6 +428,35 @@ class AlarmEmitter(object):
         with self._lock:
             self._counts["inserted"] += 1
         # alarm_id 回填进 L7 的段状态，本段后面的事件全靠它定位这一行
+        if self._state_machine is not None:
+            try:
+                self._state_machine.bind_alarm(decision.get("fingerprint"), alarm_id)
+            except Exception as err:
+                logger.error("======AlarmEmitter bind_alarm error========\n%s", err)
+        return alarm_id
+
+    def _emit_without_db(self, decision, row, now, is_ignore):
+        """
+        write_db=False 时代替 _insert 的落库那一段
+
+        返回一个**负数**的假 alarm_id：
+          - 让 bind_alarm 照常回填，L7 的段状态里有了 id，本段后续的
+            update/clear 才会走 _update 分支而不是反复 insert ——
+            调试时能看到完整的"开告警 -> 累加 -> 恢复"动作序列
+          - 用负数是为了一眼看出不是库里的真 id，万一哪天误开了
+            write_db=False 又去查库，不会拿这个 id 去 WHERE
+
+        同一指纹多次 insert 要拿到不同的假 id（L7 按 id 区分段），
+        所以用一个递减的计数器，不是写死 -1
+        """
+        with self._lock:
+            self._fake_alarm_seq -= 1
+            alarm_id = self._fake_alarm_seq
+        logger.info("[write_db=False] 跳过落库 alarm_list：%s %s %s "
+                    "state=%s status=%s muted=%s（假id=%s）",
+                    row.get("ip"), row.get("keyword"), row.get("alarm_object"),
+                    row.get("state"), row.get("status"), row.get("muted"),
+                    alarm_id)
         if self._state_machine is not None:
             try:
                 self._state_machine.bind_alarm(decision.get("fingerprint"), alarm_id)
@@ -440,6 +493,14 @@ class AlarmEmitter(object):
             data["clear_time"] = str(decision.get("clear_time") or now)
 
         alarm_id = decision.get("alarm_id", 0)
+        if not self._write_db:
+            with self._lock:
+                self._counts["skipped"] += 1
+            logger.info("[write_db=False] 跳过更新 alarm_list：alarm_id=%s "
+                        "action=%s %s", alarm_id, action, data)
+            # 返回 alarm_id，和正常路径一致（调用方拿它去发通知）
+            return alarm_id
+
         try:
             result = self.db.updateAlarmById(alarm_id, data, reset_status=True)
         except Exception as err:
@@ -548,9 +609,15 @@ class AlarmEmitter(object):
 
         state 和 clear_time 不碰：那两列由 raise/reopen/clear 动作管。
 
+        write_db=False 时直接返回 0：这个方法的全部作用就是把 counter
+        同步进库，不写库它就没有存在意义
+
         :param snapshots: StateMachine.current_snapshots() 的输出
         :return: 刷新的行数
         """
+        if not self._write_db:
+            return 0
+
         # snapshots 为空也要往下走：那说明段都清掉了，
         # _synced 里的残留要清掉
         snapshots = snapshots or []

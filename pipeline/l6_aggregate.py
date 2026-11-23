@@ -165,7 +165,8 @@ class Aggregator(object):
 
     def __init__(self, max_lifetime=DEFAULT_MAX_LIFETIME, batch_size=DEFAULT_BATCH_SIZE,
                  flush_interval=DEFAULT_FLUSH_INTERVAL, buffer_limit=DEFAULT_BUFFER_LIMIT,
-                 retention_days=DEFAULT_LOG_RETENTION_DAYS, db=None):
+                 retention_days=DEFAULT_LOG_RETENTION_DAYS, db=None,
+                 write_db=True):
         """
         :param max_lifetime:   一段最长活多久（秒）
         :param batch_size:     alarm_log 攒够多少条刷一次
@@ -173,8 +174,13 @@ class Aggregator(object):
         :param buffer_limit:   缓冲上限，超了丢最老的
         :param retention_days: alarm_log 保留天数
         :param db:             数据源，由 db.get_alarm_db() 注入
+        :param write_db:       False=只读不写。flush() 不写 alarm_log、
+                               purge() 不删老数据。滑动窗口和指纹计算
+                               照常跑（那是纯内存的），只是不落库 ——
+                               给 test.py 这类调试脚本用
         """
         self._max_lifetime = int(max_lifetime)
+        self._write_db = bool(write_db)
         self._batch_size = int(batch_size)
         self._flush_interval = int(flush_interval)
         self._buffer_limit = int(buffer_limit)
@@ -317,6 +323,9 @@ class Aggregator(object):
 
         写失败不把这批塞回缓冲：数据库持续不可用的话塞回去只会越积越多，
         最后把内存吃爆。这张表是排查用的，丢了比拖垮管线好，但要记 error
+
+        write_db=False 时把缓冲清空但不写库 —— 清空是必须的，否则
+        调试跑长了缓冲会一直涨到 buffer_limit 开始丢数据、还报 dropped
         """
         now = int(now if now is not None else time.time())
         with self._lock:
@@ -326,6 +335,9 @@ class Aggregator(object):
             rows = self._buffer
             self._buffer = []
             self._last_flush = now
+
+        if not self._write_db:
+            return 0
 
         try:
             written = self.db.addAlarmLogs(rows)
@@ -366,8 +378,14 @@ class Aggregator(object):
         删过期的 alarm_log。分批删到删不动为止 ——
         一次删几十万行会长时间持锁
 
+        write_db=False 时直接返回 0：调试脚本不该删生产数据，这是
+        这个开关最该挡住的一类操作
+
         :return: 删掉的总行数
         """
+        if not self._write_db:
+            return 0
+
         now = int(now if now is not None else time.time())
         before = now - self._retention_days * 86400
         total = 0

@@ -264,17 +264,24 @@ class StateMachine(object):
     """
 
     def __init__(self, silence=DEFAULT_SILENCE, state_ttl=DEFAULT_STATE_TTL,
-                 restore_lookback=DEFAULT_RESTORE_LOOKBACK, db=None):
+                 restore_lookback=DEFAULT_RESTORE_LOOKBACK, db=None,
+                 write_db=True):
         """
         :param silence:          stateless 段静默多久算恢复
         :param state_ttl:        内存里的段状态保留多久
         :param restore_lookback: 启动回放往回捞多久的段
         :param db:               数据源，由 db.get_alarm_db() 注入
+        :param write_db:         False=只读不写，persist() 不回写
+                                 syslog_alarm_state。段状态照常在内存里
+                                 维护（动作判定、阈值、恢复全都正常），
+                                 只是进程退出就丢 —— 调试脚本本来就是
+                                 单次跑完就退，不需要持久化
         """
         self._silence = int(silence)
         self._state_ttl = int(state_ttl)
         self._restore_lookback = int(restore_lookback)
         self._db = db
+        self._write_db = bool(write_db)
 
         self._segments = {}        # fingerprint -> Segment
         self._dirty = set()        # 待落库的指纹
@@ -608,8 +615,15 @@ class StateMachine(object):
         只落 dirty 的 —— 全量 upsert 在指纹多的时候是白写。
         落库失败的留在 dirty 里，下一轮再试
 
+        write_db=False 时直接返回 0，dirty 集合也不清：留着不影响内存
+        判定（dirty 只是"该落库的清单"），而且万一调试中途想改成写库
+        也不会丢掉之前的变更
+
         :return: 落库成功的条数
         """
+        if not self._write_db:
+            return 0
+
         now = int(now if now is not None else time.time())
         with self._lock:
             if not self._dirty:

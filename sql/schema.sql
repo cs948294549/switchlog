@@ -499,25 +499,54 @@ VALUES
 INSERT IGNORE INTO syslog_event
     (event_code, state, object_type, window_sec, threshold, clear_code, descr)
 VALUES
+-- ============ raise 类的 window_sec 为什么是 21600(6h) ============
+-- window_sec 不是"告警多久过期"，是**相邻两条日志的间隔上限**（见
+-- l6_aggregate 的 _slide：now - last_seen > window_sec 就开新段）。
+-- 对 raise/clear 成对的事件码，它实际决定的是**恢复事件还能不能关掉
+-- 故障告警**：
+--   端口down开一行告警 -> 口一直down期间没有新日志 -> N分钟后up
+--   如果 N > window_sec，这条 IF_UP 落到新段，自己变成一行"生而恢复"
+--   的记录，原来那行 IF_DOWN 永久停在 open（l7 的 sweep() 明确不关
+--   raise 类，没有任何兜底机制会去关它——代码里没有 orphan clear）
+--
+-- 原来配 300(5min)，而现网故障超过5分钟是常态，等于大部分端口down
+-- 告警都关不掉，看板上堆积永不恢复的假告警。
+--
+-- 取值是两头夹：
+--   下限 > 故障典型持续时长（否则恢复关不上）
+--   上限 < 两次独立故障的间隔（否则第二次down会REOPEN第一次那行，
+--          把两次事故并成一行，还擦掉第一次的恢复时间）
+-- 6小时覆盖换模块/改线/割接这类处理周期，同一对象6小时内出两次
+-- 独立故障本来就该当成一次事故看。
+--
+-- clear 类那几行的 window_sec 填多少都不影响聚合（L6 取的是故障码
+-- 那一行的值，见 _window_sec 的注释），为了看着不困惑一起改成同值
+-- ================================================================
 -- 端口与聚合口
-('IF_DOWN',        'raise',     'interface', 300, 1, 'IF_UP',
- '端口down。物理层/链路协议/成员口同时刻产生的几条日志收敛成一条告警'),
-('IF_UP',          'clear',     'interface', 300, 1, '',
+('IF_DOWN',        'raise',     'interface', 21600, 1, 'IF_UP',
+ '端口down。物理层/链路协议/成员口同时刻产生的几条日志收敛成一条告警。窗口6h保证晚于5分钟的恢复也能关掉这行'),
+('IF_UP',          'clear',     'interface', 21600, 1, '',
  '端口up，按IF_DOWN的指纹回关告警'),
-('LAG_DOWN',       'raise',     'interface', 300, 1, 'LAG_UP',
- '聚合口全断，最后一个可用成员也没了'),
-('LAG_UP',         'clear',     'interface', 300, 1, '',
- '聚合口恢复'),
+-- LAG_DOWN / LAG_UP 已删除（本次改动），聚合口全断并入 IF_DOWN：
+--   原因：LAG_UP 没有任何 L3 规则会产生它（扫描确认 0 条），LAG_DOWN
+--   的告警开了就永久关不掉。并入 IF_DOWN 后恢复侧由 vendor='*' 的
+--   ETHPORT-5-IF_UP 接住（对象格式都是 port-channelN，同指纹）。
+--   代价：聚合口全断不再单独定级，跟 IF_DOWN 的阶梯走
+--   （csw=P1 / rsw=P3 / corp职场rsw=ignore / 其他=P2），
+--   因为 severity 规则没有 object 维度，没法只给 port-channel 配 P1。
+--   详见 syslog_rule 里 ETH_PORT_CHANNEL-5-FOP_CHANGED 那几行的注释。
+-- LAG_MEMBER_CHG 保留：它是"还有成员时的正常冗余切换"，和"全断"不是
+-- 一回事，stateless + ignore 定级，不参与 raise/clear 配对
 ('LAG_MEMBER_CHG', 'stateless', 'interface', 600, 1, '',
  '聚合口成员切换。有冗余的LAG每天都会发生，报出来就是噪声'),
 -- 路由邻居
-('BGP_DOWN',       'raise',     'peer',      300, 1, 'BGP_UP',
+('BGP_DOWN',       'raise',     'peer',      21600, 1, 'BGP_UP',
  'BGP邻居down。BFD会话down归到同一个码，同一指纹只出一条告警'),
-('BGP_UP',         'clear',     'peer',      300, 1, '',
+('BGP_UP',         'clear',     'peer',      21600, 1, '',
  'BGP邻居up'),
-('OSPF_DOWN',      'raise',     'peer',      300, 1, 'OSPF_UP',
+('OSPF_DOWN',      'raise',     'peer',      21600, 1, 'OSPF_UP',
  'OSPF邻居down'),
-('OSPF_UP',        'clear',     'peer',      300, 1, '',
+('OSPF_UP',        'clear',     'peer',      21600, 1, '',
  'OSPF邻居up'),
 -- 二层
 ('MAC_FLAP',       'stateless', 'mac',       600, 3, '',
@@ -525,9 +554,12 @@ VALUES
 ('STP_TC',         'stateless', 'interface', 600, 1, '',
  'STP拓扑变更'),
 -- 硬件
-('PSU_FAIL',       'raise',     'slot',      300, 1, 'PSU_OK',
- '电源/风扇/板卡故障'),
-('PSU_OK',         'clear',     'slot',      300, 1, '',
+-- 窗口给 604800(7天)，比其他 raise 类的 6h 长得多：电源/风扇/板卡
+-- 坏了要等备件到货加上门，处理周期按天算。同一槽位7天内出两次独立
+-- 硬件故障基本不存在，所以放这么长不会把两次事故并成一行
+('PSU_FAIL',       'raise',     'slot',      604800, 1, 'PSU_OK',
+ '电源/风扇/板卡故障。窗口7天：等备件的周期按天算，短了恢复日志关不掉这行'),
+('PSU_OK',         'clear',     'slot',      604800, 1, '',
  '电源/风扇/板卡恢复'),
 -- 管理面
 ('CONFIG_CHG',     'stateless', 'none',      600, 1, '',
@@ -540,13 +572,13 @@ VALUES
  'BFD会话删除/迁移，BGP_DOWN的伴生日志，建议配黑名单在L2截掉'),
 ('IF_ATTR_CHG',     'stateless', 'interface', 600, 1, '',
  '速率/双工/流控变化，端口up的伴生日志（一次up刷四条），建议配黑名单'),
--- 已废弃的码，留着不删：闪断升级那套（窗口内N次新开告警 -> 升级成
--- IF_FLAP、禁止自动恢复、需人工确认）已经从 L7 去掉，现在反复 down/up
--- 靠窗口段本身合并成一行（见 pipeline/l7_state_machine.py）。
--- 没有任何一层会再产生这个码，这一行和定级表里那一行永远不命中。
--- 留着是为了历史 alarm_list 里的 IF_FLAP 行还能查到事件属性
-('IF_FLAP',         'raise',     'interface', 1800, 3, '',
- '【已废弃】端口闪断。闪断升级已去掉，不会再产生这个码'),
+-- IF_FLAP 已删除（本次改动）：闪断升级那套（窗口内N次新开告警 -> 升级
+-- 成 IF_FLAP、禁止自动恢复、需人工确认）已经从 L7 去掉，现在反复
+-- down/up 靠窗口段本身合并成一行（见 pipeline/l7_state_machine.py）。
+-- 没有任何一层会产生这个码，而它 clear_code 是空的又不是 stateless，
+-- 万一历史上产生过就是一行永久 open 且无法自动恢复的告警。
+-- 代价：历史 alarm_list 里如果还有 IF_FLAP 行，查事件属性会查不到
+-- （只影响看板展示属性，不影响行本身的数据）
 -- 加密许可带宽饱和：撞 securityk9 的 85Mbps 上限。是容量项不是网络故障，
 -- 定级表里配了 ignore 不开告警，但日志照样解析归档。窗口给长，
 -- 因为持续发的时候按 300s 切段会产生大量碎窗口
@@ -638,9 +670,9 @@ VALUES
 -- 看板上是一行、counter看得出抖了多少条（见pipeline/l7_state_machine.py）。
 -- 这正是CRC错误典型的"光模块劣化/网线接触不良反复触发阈值"场景，
 -- 不该把每次单独当一条新告警看
-('CRC_ERROR', 'raise', 'interface', 600, 1, 'CRC_ERROR_CLEAR',
- '接口CRC错误率超阈值。通常是光模块劣化/网线问题/双工不匹配，需查物理层'),
-('CRC_ERROR_CLEAR', 'clear', 'interface', 600, 1, '',
+('CRC_ERROR', 'raise', 'interface', 21600, 1, 'CRC_ERROR_CLEAR',
+ '接口CRC错误率超阈值。通常是光模块劣化/网线问题/双工不匹配，需查物理层。窗口6h同IF_DOWN，换模块/改线的处理周期'),
+('CRC_ERROR_CLEAR', 'clear', 'interface', 21600, 1, '',
  'CRC错误率恢复，按CRC_ERROR的指纹回关告警');
 
 -- ============================================================
@@ -669,8 +701,9 @@ VALUES
 ('IF_DOWN',  '', '^rsw',       3, '',       50,
  '接入口down降P3。rsw是ToR，掉口影响一个机柜，有冗余时业务无感'),
 -- 各事件码的默认级别，没有设备判据
-('IF_DOWN',  '', '',           2, '',       100, '端口down的默认级别'),
-('LAG_DOWN', '', '',           1, '',       100, '聚合口全断，不分角色都是P1'),
+('IF_DOWN',  '', '',           2, '',       100, '端口down的默认级别。聚合口全断已并入IF_DOWN，所以这条也盖住port-channel'),
+-- LAG_DOWN 的定级规则已删除（本次改动），聚合口全断并入IF_DOWN后跟
+-- 上面那套 IF_DOWN 的阶梯走。原来这里是"不分角色都是P1"
 ('BGP_DOWN', '', '',           1, '',       100, 'BGP邻居down'),
 ('OSPF_DOWN','', '',           1, '',       100, 'OSPF邻居down'),
 -- 按网段定级：测试网段的漂移不用按生产环境的级别看
@@ -683,9 +716,8 @@ VALUES
 ('MAC_FLAP', '^10[.]19[.]9[.]', '',         3, '',       50,  '测试网段的MAC漂移降P3'),
 ('MAC_FLAP', '', '',           2, '',       100, 'MAC漂移'),
 ('PSU_FAIL', '', '',           2, '',       100, '电源/风扇/板卡故障'),
--- 已废弃，和 syslog_event 里那一行一起留着：闪断升级已从 L7 去掉，
--- 不会再有事件落到这个码上，这一行永远不命中
-('IF_FLAP',  '', '',           1, '',       100, '【已废弃】端口闪断，闪断升级已去掉'),
+-- IF_FLAP 的定级规则已删除（本次改动），和 syslog_event 里那一行一起删：
+-- 闪断升级已从 L7 去掉，不会再有事件落到这个码上
 -- 加密许可带宽饱和：撞 securityk9 的 85Mbps 上限。这是容量项，不是网络故障，
 -- 照常解析归档但不进告警列表。没配成黑名单是因为这条本身有信息量 ——
 -- 某天真出现 IPsec 会话建不起来时要回溯它到底什么时候开始撞的
@@ -829,21 +861,33 @@ VALUES
 ('cisco_nx', 'ETH_PORT_CHANNEL-5-PORT_UP', 'exact', '', '',
  'IF_UP', ':\\s+(\\S+)\\s+is\\s+up', 100,
  'port-channel3: Ethernet1/3 is up。和PORT_DOWN成对，对象是成员口'),
--- 聚合口：FOP_CHANGED 的 'to none' 才是全断，priority 小的先判。
+-- 聚合口全断：FOP_CHANGED 的 'to none' 才是全断，priority 小的先判。
 -- 原来靠"冒号+空格+名字+冒号"定位LAG名(':\\s+(\\S+?):')，行首有孤立
 -- 冒号杂质时会提前命中mnemonic自己尾部的冒号，把alarm_object抽成了
 -- mnemonic本身（现网实例：": ...%ETH_PORT_CHANNEL-5-FOP_CHANGED: ..."
 -- 这种带前导裸冒号的报文）。直接按'port-channelN'这个固定词形提取，
--- 不依赖冒号位置，更稳
+-- 不依赖冒号位置，更稳。
+--
+-- ===== LAG_DOWN 已并入 IF_DOWN（本次改动）=====
+-- 原来聚合口全断走独立的 LAG_DOWN（不分设备角色都是P1）。并入的理由：
+--   1. LAG_UP 在 syslog_rule 里没有任何规则会产生它，LAG_DOWN 的告警
+--      开了就永久关不掉（扫描确认 0 条规则）
+--   2. 并入 IF_DOWN 后，恢复侧由 vendor='*' 的 ETHPORT-5-IF_UP 接住
+--      （'Interface port-channel20 is up' 抽出 port-channel20，和这里
+--      抽出的对象格式一致 -> 同指纹 -> 关得掉）
+-- 代价（用户已确认接受）：聚合口全断不再能单独定级。severity 规则只
+-- 有 (event_code, ip_reg, sysname_reg) 三个维度、没有 object 维度，
+-- 所以 port-channel 没法保留 P1，只能跟 IF_DOWN 的阶梯走：
+--   csw=P1 / rsw=P3 / corp职场rsw=ignore不告警 / 其他=P2
 ('cisco_nx', 'ETH_PORT_CHANNEL-5-FOP_CHANGED', 'exact', '', 'to none',
- 'LAG_DOWN', '(port-channel\\d+)', 10,
- 'first operational port changed from Ethernet1/38 to none，最后一个成员没了'),
+ 'IF_DOWN', '(port-channel\\d+)', 10,
+ 'first operational port changed from Ethernet1/38 to none，最后一个成员没了。已并入IF_DOWN，恢复靠ETHPORT-5-IF_UP'),
 ('cisco_nx', 'ETH_PORT_CHANNEL-5-FOP_CHANGED', 'exact', '', '',
  'LAG_MEMBER_CHG', '(port-channel\\d+)', 200,
  'changed from Ethernet1/38 to Ethernet1/39，还有成员时是正常冗余切换'),
 ('cisco_nx', 'ETHPORT-5-IF_DOWN_PORT_CHANNEL_MEMBERS_DOWN', 'exact', '', '',
- 'LAG_DOWN', 'Interface\\s+([^\\s,(]+)', 100,
- 'Interface port-channel38 is down (No operational members)'),
+ 'IF_DOWN', 'Interface\\s+([^\\s,(]+)', 100,
+ 'Interface port-channel38 is down (No operational members)。已并入IF_DOWN'),
 -- Comware / 华为：同一 mnemonic，up/down 只差正文
 ('h3c', 'IFNET/3/PHY_UPDOWN', 'exact', '', 'changed to down',
  'IF_DOWN', 'interface (\\S+?) changed', 100,
@@ -879,6 +923,22 @@ VALUES
 ('h3c', 'IFNET/3/LINK_UPDOWN', 'exact', '', 'link status is UP',
  'IF_UP', '(\\S+) link status is', 100,
  'GigabitEthernet1/0/41 link status is UP.（现网样本，S5120-52SC-HI/Comware 5.20）'),
+-- Comware 的第四套写法，和上面 IFNET/3/LINK_UPDOWN 有三处不一样：
+--   1. 严重度数字 4 不是 3
+--   2. 分隔符是**空格**不是下划线：'LINK UPDOWN'。strip_mnemonic 的正则
+--      在斜杠最后一段碰到空格就截断，实际剥出来是 'IFNET/4/LINK'，
+--      所以 mnemonic 只能填到这里（和 DEV/1/FAN、IFNET/4/INTERFACE
+--      同一个坑），靠 body_match 认后面的 up/down
+--   3. 接口名后面多个冒号：'GigabitEthernet1/0/18: link status is DOWN'
+--      上面那两条用的 '(\\S+) link status is' 在这种正文下会把冒号一起
+--      抽进对象（抽成 'GigabitEthernet1/0/18:'），所以这里的字符类要
+--      排掉冒号，再把冒号写成可选匹配
+('h3c', 'IFNET/4/LINK', 'exact', '', 'link status is DOWN',
+ 'IF_DOWN', '([^\\s:]+)\\s*:?\\s+link status is', 100,
+ '%%10IFNET/4/LINK UPDOWN(l):-DevIP=10.39.240.35;   GigabitEthernet1/0/18: link status is DOWN（mnemonic带空格被截断成IFNET/4/LINK）'),
+('h3c', 'IFNET/4/LINK', 'exact', '', 'link status is UP',
+ 'IF_UP', '([^\\s:]+)\\s*:?\\s+link status is', 100,
+ '%%10IFNET/4/LINK UPDOWN(l):-DevIP=10.39.240.35;   GigabitEthernet1/0/18: link status is UP（和上面DOWN成对）'),
 ('huawei', 'IFNET/3/PHY_UPDOWN', 'exact', '', 'turned into DOWN',
  'IF_DOWN', 'interface (\\S+?) has', 100,
  'The interface XGigabitEthernet0/0/1 has turned into DOWN state.'),
@@ -1050,6 +1110,35 @@ VALUES
 ('cisco_nx', 'PLATFORM-2-PS_ABSENT', 'exact', '', '',
  'PSU_FAIL', 'Power supply\\s+(\\d+)', 100,
  'Power supply 2 is absent/shutdown, ps-redundancy might be affected'),
+-- 同一次电源故障在 cisco_nx 上还会由另外两个子系统各打一条，FACILITY
+-- 段和 PLATFORM 完全不同（PFMA = 平台管理，NOHMS = 硬件健康监控），
+-- 剥出来是三个不同的 mnemonic，dict 查不到彼此，必须各配一套：
+--   PLATFORM-2-PS_FAIL                   （上面那条）
+--   PFMA-2-PS_FAIL                       'Power supply 2 failed or shutdown (Serial number ...)'
+--   NOHMS-2-NOHMS_DIAG_ERR_PS_FAIL       'System minor alarm on power supply 2: failed or not powered up'
+-- 三条归同一个 PSU_FAIL、抽同一个电源编号 -> 同指纹 -> 一次故障只出
+-- 一条告警（和 IF_DOWN 收敛多条端口日志是同一个套路）。
+--
+-- object_regex 的 P 要写成 [Pp]：PLATFORM/PFMA 的正文是大写
+-- 'Power supply N'，而 NOHMS 的是小写 'power supply N'，原来那条
+-- 大写开头的正则在 NOHMS 上抽不出对象
+('cisco_nx', 'PFMA-2-PS_FAIL', 'exact', '', '',
+ 'PSU_FAIL', '[Pp]ower supply\\s+(\\d+)', 100,
+ '%PFMA-2-PS_FAIL: Power supply 2 failed or shutdown (Serial number LIT20472LF7)'),
+('cisco_nx', 'NOHMS-2-NOHMS_DIAG_ERR_PS_FAIL', 'exact', '', '',
+ 'PSU_FAIL', '[Pp]ower supply\\s+(\\d+)', 100,
+ '%NOHMS-2-NOHMS_DIAG_ERR_PS_FAIL: System minor alarm on power supply 2: failed or not powered up'),
+-- ===== 这是第一条 PSU_OK 恢复规则 =====
+-- 之前扫描发现 PSU_FAIL 的 clear_code=PSU_OK 在 syslog_rule 里一条规则
+-- 都没有，意味着电源告警开出来就永久 open 关不掉（l7 的 sweep() 不关
+-- raise 类）。现网终于拿到恢复日志样例（NOHMS 的 _PS_RECOVERED），
+-- 配上这条之后电源告警才真正能自动恢复。
+--
+-- 对象提取和上面故障侧完全一致（都抽电源编号 2）-> 同指纹 ->
+-- L6 按 raise_code 换算后落到 PSU_FAIL 那一段上，把 open 翻成 clear
+('cisco_nx', 'NOHMS-2-NOHMS_DIAG_ERR_PS_RECOVERED', 'exact', '', '',
+ 'PSU_OK', '[Pp]ower supply\\s+(\\d+)', 100,
+ '%NOHMS-2-NOHMS_DIAG_ERR_PS_RECOVERED: Recovered: System minor alarm on power supply 2: failed or not powered up'),
 -- 思科风扇低转速。单独事件码不并进 PSU_FAIL：没有恢复日志，
 -- 并进去会让 PSU_FAIL->PSU_OK 的配对关不掉它
 ('cisco_ios', 'ENVMON-4-ONE_FAN_LOW_RPM', 'exact', '', '',
@@ -1861,7 +1950,8 @@ VALUES
 -- ---------- 批量屏蔽：接口带宽变化 / 第三方管理面审计 / 非原厂光模块（23条）----------
 --
 -- 带宽变化：聚合口bandwidth值变化，是成员口增减/速率协商后的衍生通知，
--- 不是故障。真要发现聚合口异常，走 LAG_DOWN / LAG_MEMBER_CHG 那套
+-- 不是故障。真要发现聚合口异常，走 IF_DOWN（全断，原LAG_DOWN已并入）
+-- / LAG_MEMBER_CHG（成员切换）那套
 ('ETHPORT-5-IF_BANDWIDTH_CHANGE', 'mnemonic', '', 0, 1,
  '聚合口bandwidth值变化通知，是成员口增减/速率协商的衍生结果，不是故障'),
 -- Linux式syslog转发(sudo session opened/closed)，设备自己的操作系统审计，
@@ -1887,6 +1977,12 @@ VALUES
  'SSH用户登录trap(H3C写法)'),
 ('SSH/6/SSH_CONNECTION_CLOSE', 'mnemonic', '', 0, 1,
  'SSH连接关闭留痕(华为写法)'),
+-- 和下面已拉黑的 SSH/4/LOGOUT 内容完全一样（正文都是
+-- 'STEL user xxx (IP: x.x.x.x) logged out.'），只差严重度数字 6 vs 4
+-- 和名字 SSH_LOGOUT vs LOGOUT。数字不同就是两个 mnemonic，
+-- dict 查不到彼此，必须单独拉黑
+('SSH/6/SSH_LOGOUT', 'mnemonic', '', 0, 1,
+ 'STEL用户登出留痕，和SSH/4/LOGOUT同一事件的另一种写法(严重度6)'),
 ('SSH/4/TrapLogoff', 'mnemonic', '', 0, 1,
  'SSH用户登出trap(H3C写法)'),
 ('CFGMAN/4/TRAP', 'mnemonic', '', 0, 1,
@@ -2195,26 +2291,26 @@ SELECT '^10[.]19[.]19[.]', '', '', '', '', 0,
 --                       'syslog_severity_rule','syslog_mute_rule',
 --                       'syslog_alarm_state','alarm_list','alarm_log');
 --
--- 种子数据应为：
---   syslog_black_list    20  （全部 enabled=1，没有停用示例了）
---   syslog_rule          49
---   syslog_event         31  （含 3 个兜底码 + 已废弃的 IF_FLAP）
---   syslog_severity_rule 24  （其中 1 条 enabled=0 停用示例：BGP_UP）
+-- 种子数据应为（2026-11-19 核对，之前这段写的 20/49/31/24 早已过期）：
+--   syslog_black_list   193
+--   syslog_rule          98
+--   syslog_event         38  （含 3 个兜底码；IF_FLAP / LAG_DOWN / LAG_UP 已删除）
+--   syslog_severity_rule  27  （其中 1 条 enabled=0 停用示例：BGP_UP）
 --   syslog_mute_rule      3  （全部 enabled=0，不静默任何告警）
 --   其余三张表是数据表，重建后为空
 --
--- SELECT count(*) FROM syslog_black_list;      -- 20
--- SELECT count(*) FROM syslog_rule;            -- 49
--- SELECT count(*) FROM syslog_event;           -- 31
--- SELECT count(*) FROM syslog_severity_rule;   -- 24
+-- SELECT count(*) FROM syslog_black_list;      -- 193
+-- SELECT count(*) FROM syslog_rule;            -- 98
+-- SELECT count(*) FROM syslog_event;           -- 38
+-- SELECT count(*) FROM syslog_severity_rule;   -- 27
 -- SELECT count(*) FROM syslog_mute_rule;       -- 3
 --
--- 黑名单里 17 条是 scope=mnemonic、3 条是 scope=message。
--- 其中 9 条 mnemonic + 1 条 message 对应的 syslog_rule 仍在表里但永不命中
+-- 黑名单里 185 条是 scope=mnemonic、8 条是 scope=message。
+-- 其中一部分 mnemonic 对应的 syslog_rule 仍在表里但永不命中
 -- （见上面"死码清单"）。这不是配置错误，是故意留的开关
--- SELECT count(*) FROM syslog_black_list WHERE enabled=1;   -- 20
+-- SELECT count(*) FROM syslog_black_list WHERE enabled=1;   -- 193
 --
--- scope=message 这 3 条每条日志都要线性扫，实测 3 条约 0.1us、
+-- scope=message 这 8 条每条日志都要线性扫，实测 3 条约 0.1us、
 -- 剥一次 mnemonic 是 0.41us，所以现在这个量级可以忽略。
 -- 这一串要保持小：100 条就是 3.4us（8 倍剥 mnemonic），
 -- 能按 mnemonic 配的一律别放这里

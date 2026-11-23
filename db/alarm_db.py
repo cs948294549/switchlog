@@ -161,64 +161,6 @@ class AlarmDB(object):
             logger.error("======AlarmDB updateAlarmById error========\n%s", err)
             return "failed"
 
-    def setAlarmMute(self, alarm_id, muted, rule_id=0):
-        """
-        改一条已存在告警的静默标记
-
-        新开的告警不走这里 —— addAlarm 的时候 mute 已经判完，一次写进去。
-        这个方法只给"告警已经开着，静默状态后来变了"用，两个方向：
-
-            窗口开始：已开着的告警进了割接窗口 -> muted=1
-            窗口结束：窗口过了，告警还没好 -> muted=0，恢复通知
-
-        只动 muted / mute_rule_id 两列，不碰 status —— 那是人工处理状态。
-        两者分开存就是为了这一刻：窗口过了只需要把 muted 改回 0，
-        人工屏蔽（status=4）该留着，不能一起清掉。
-
-        :param muted: True=静默 False=恢复通知
-        :return: 影响行数；失败返回 "failed"
-        """
-        sql = "update alarm_list set muted=%s, mute_rule_id=%s where alarm_id=%s"
-        flag = 1 if muted else 0
-        try:
-            with MySQLConnection() as conn:
-                cursor = conn.cursor
-                cursor.execute(sql, (flag, int(rule_id) if flag else 0, int(alarm_id)))
-                conn.conn.commit()
-                return cursor.rowcount
-        except Exception as err:
-            logger.error("======AlarmDB setAlarmMute error========\n%s", err)
-            return "failed"
-
-    def getMutedOpenAlarms(self, limit=5000):
-        """
-        取还在告警中、且被静默的记录。L8 的到期扫描用
-
-        为什么需要这个扫描：窗口到期是时间到了，不是来了新日志。一个口在
-        割接窗口里 down 了一直没好，窗口结束之后不会再有新日志进管线
-        （L7 看到已有活跃告警只累加，也不会重新判 mute），这条告警就会
-        永远 muted —— 割接结束了故障还在，但没人收到通知。
-
-        所以 L8 要定期扫这些记录，重新判一遍当前时刻还命不命中静默规则，
-        不命中就 setAlarmMute(alarm_id, False) 放出来。
-
-        :return: [{...}]；失败返回 []
-        """
-        sql = '''
-        select alarm_id, fingerprint, ip, keyword, alarm_object, severity,
-               mute_rule_id, first_seen, last_seen
-        from alarm_list
-        where state='open' and muted=1 order by last_seen desc limit %s
-        '''
-        proper = ["alarm_id", "fingerprint", "ip", "keyword", "alarm_object", "severity",
-                  "mute_rule_id", "first_seen", "last_seen"]
-        try:
-            with MySQLConnection() as conn:
-                return conn.query(sql, params=(int(limit),), proper=proper)
-        except Exception as err:
-            logger.error("======AlarmDB getMutedOpenAlarms error========\n%s", err)
-            return []
-
     # ---------------- alarm_log ----------------
 
     def addAlarmLogs(self, rows):

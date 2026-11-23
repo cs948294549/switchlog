@@ -214,13 +214,18 @@ class BlacklistFilter(object):
     读路径只拿一次引用；计数是 int 自增，GIL 下不会丢（不要求精确）。
     """
 
-    def __init__(self, refresh_interval=DEFAULT_REFRESH, db=None):
+    def __init__(self, refresh_interval=DEFAULT_REFRESH, db=None, write_db=True):
         """
         :param refresh_interval: 刷新间隔（秒），0 表示只加载一次
         :param db: 数据源，由 db.get_rule_db() 注入
+        :param write_db: False=只读不写，persist() 不回写 hit_count。
+                         给 test.py 这类调试脚本用：规则照常加载、拦截
+                         照常判，只是不往库里留痕。规则的**读取**不受
+                         这个开关影响，否则没规则可判
         """
         self._refresh_interval = int(refresh_interval)
         self._db = db
+        self._write_db = bool(write_db)
         self._index = BlacklistIndex([])
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -297,8 +302,14 @@ class BlacklistFilter(object):
         增量 = 当前 hits - 上次刷过的值，不是整个 hits：数据库那一列
         存的是累计值，重复传 hits 会越刷越多。
 
+        write_db=False 时直接返回 0，连 deltas 都不算 —— 内存里的 hits
+        照常累加（stats() 还能看到），只是不回写库
+
         :return: 更新的行数
         """
+        if not self._write_db:
+            return 0
+
         with self._lock:
             deltas = {}
             rules = []

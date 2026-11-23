@@ -14,8 +14,21 @@ syslog_severity_rule 按 (event_code, ip, sysname) 定 severity。
 定级那段会打出命中的规则和它为什么命中。
 
 数据全部连真实 MySQL（config.py 的 mysql_config），不再有内存 mock。
-WRITE_DB=False（默认）时跑完 L1~L8 但不执行 L9 的实际落库，只打印
-"本该写进哪条记录"；改成 True 才会真的往 alarm_log/alarm_list 插入数据。
+
+WRITE_DB=False（默认）时**整条 L1~L9 都照常跑**，包括 L9 的 handle()，
+只是各层内部的写库那一句被跳过（靠各层的 write_db 开关）。所以走的是
+和线上一样的代码路径，能看到真实的动作判定和通知内容，不会污染生产库。
+改成 True 才会真的往 alarm_log/alarm_list/syslog_alarm_state 写数据。
+
+被 write_db 挡住的七个写库点：
+    L2  syslog_black_list.hit_count      黑名单命中数
+    L6  alarm_log 批量插入                原子日志
+    L6  删 7 天前的 alarm_log             数据清理
+    L7  syslog_alarm_state upsert         段状态持久化
+    L8  syslog_mute_rule.hit_count        静默规则命中数
+    L9  alarm_list insert                 新开告警
+    L9  alarm_list update                 更新/恢复告警
+规则表和设备表的**读取**不受影响 —— 不读就没规则可判。
 
 回放真实日志文件走 main.py --replay。
 """
@@ -42,16 +55,18 @@ VAL_WIDTH = 110
 GRADE_FIELDS = ("severity", "severity_name", "severity_rule_id", "raise_code")
 
 # 默认不落库：跑完整条链路只是为了看每层改了什么字段，不该顺手污染
-# alarm_log/alarm_list。确认过没问题、真要测落库效果时改成 True
+# alarm_log/alarm_list。确认过没问题、真要测落库效果时改成 True。
+# 这个值在 build() 里传给有写库操作的五层（L2/L6/L7/L8/L9）的
+# write_db 参数，不是在 test.py 里判断要不要调用那些层
 WRITE_DB = False
 
 # ============================================================
 # 要跑的报文：ip 是源 IP，message 是原始报文，timestamp 是采集时间
 # ============================================================
 a = {
-    "ip": "10.16.249.5",
-    "message": '''2026 Sep 22 15:15:25.144 bbs1_dc05_m01_new %ETHPORT-5-IF_DOWN_LINK_FAILURE: Interface Ethernet1/1 (description:pT:bbs1_dc07_m01:100G1/4) is down (Link failure)''',
-    "timestamp": 1762800000,
+    "ip": "10.39.240.32",
+    "message": '''Nov 20 16:25:24 2026 oob2_mdu11_prod_dc07_m01 %%10DEV/1/FAN STATE CHANGES TO FAILURE(t):-DevIP=10.39.240.32; Trap 1.3.6.1.4.1.25506.8.35.12.1.6<hh3cfanfailure>: fan ID is 1''',
+    "timestamp": 1795163044,
 }
 
 # 换着试的几条（取消注释即可）：
@@ -72,21 +87,30 @@ def build():
 
     refresh_interval=0：不起刷新线程，规则只加载一次（跑一条报文用不上
     定时刷新，起了线程进程退出还要等它）
+
+    write_db=WRITE_DB 传给有写库操作的五层（L2/L6/L7/L8/L9）：
+        WRITE_DB=False  规则照常从真库加载、判定照常跑，只是七个写库点
+                        全部跳过（黑名单hit_count、alarm_log、删老日志、
+                        syslog_alarm_state、静默hit_count、alarm_list的
+                        insert/update）
+        WRITE_DB=True   真的写进 MySQL
+    L3/L4/L5 只读规则表和设备表，没有写库操作，不需要这个参数
     """
     rule_db = get_rule_db()
     device_db = get_device_db()
     alarm_db = get_alarm_db()
 
-    sm = StateMachine(db=alarm_db)
+    sm = StateMachine(db=alarm_db, write_db=WRITE_DB)
     return (
-        BlacklistFilter(refresh_interval=0, db=rule_db),
+        BlacklistFilter(refresh_interval=0, db=rule_db, write_db=WRITE_DB),
         SyslogParser(refresh_interval=0, db=rule_db, device_db=device_db),
         DeviceEnricher(db=device_db),
         EventAttrs(refresh_interval=0, db=rule_db),
-        Aggregator(db=alarm_db),
+        Aggregator(db=alarm_db, write_db=WRITE_DB),
         sm,
-        MuteFilter(refresh_interval=0, db=alarm_db),
-        AlarmEmitter(notifier=FileNotifier(), state_machine=sm, db=alarm_db),
+        MuteFilter(refresh_interval=0, db=alarm_db, write_db=WRITE_DB),
+        AlarmEmitter(notifier=FileNotifier(), state_machine=sm, db=alarm_db,
+                     write_db=WRITE_DB),
     )
 
 
@@ -186,9 +210,12 @@ def show_emit(emitter, decision):
     """
     L9：落库 + 通知
 
-    WRITE_DB=False 时不调 emitter.handle()——那会真的执行
-    addAlarm/addAlarmLogs，往生产的 alarm_log/alarm_list 插数据。
-    只打印这条决策本该落成什么样，不产生副作用。
+    不管 WRITE_DB 是什么都**真的调 emitter.handle()** —— 落不落库由
+    AlarmEmitter 内部的 write_db 开关决定（build() 里传的）。这样走的是
+    和线上完全一样的代码路径，能看到真实的动作判定、通知内容、统计计数，
+    只是 WRITE_DB=False 时跳过那两句 SQL。
+
+    以前这里是"WRITE_DB=False 就不调 handle()"，等于 L9 整层没被测到。
     """
     print("\n--- L9 emit 落库 + 通知 ---")
     if not decision.get("notify"):
@@ -196,19 +223,16 @@ def show_emit(emitter, decision):
             decision.get("action")))
         return 0
 
-    if not WRITE_DB:
-        print("   WRITE_DB=False，不执行真实落库。本该写入：")
-        print("     action={}  severity={}  muted={}".format(
-            decision.get("action"), decision.get("severity_name"),
-            decision.get("muted")))
-        print("   把文件顶部 WRITE_DB 改成 True 才会真的写 alarm_log/alarm_list")
-        return 0
-
     result = emitter.handle(decision)
     print(" + {:<18}{}".format("alarm_id", result.get("alarm_id")))
     print(" + {:<18}{}".format("notified", result.get("notified")))
     print(" + {:<18}{}".format("muted", result.get("muted")))
-    print("\n   WRITE_DB=True，已经真的写进 MySQL 的 alarm_log/alarm_list 了。")
+    if WRITE_DB:
+        print("\n   WRITE_DB=True，已经真的写进 MySQL 的 alarm_log/alarm_list 了。")
+    else:
+        print("\n   WRITE_DB=False，没有写库（alarm_id 是负数假 id）。")
+        print("   通知照常输出到 logs/notify.log —— 对规则就看那个文件。")
+        print("   把文件顶部 WRITE_DB 改成 True 才会真的写 alarm_log/alarm_list")
     print("   emitter stats:", emitter.stats())
     return 0
 
@@ -261,7 +285,9 @@ def show_mute(mute, decision):
     print(" + {:<18}{}".format("muted", decision.get("muted")))
     print(" + {:<18}{}".format("mute_rule_id", decision.get("mute_rule_id")))
     print("\n   muted 是记录上的状态，不是入库开关 —— 被静默的告警照样入库")
-    print("   窗口过了靠 mute.sweep() 把还没好的放出来，不能等日志驱动")
+    print("   status 跟着写 4（已屏蔽）—— 人工屏蔽就是 mute，不区分谁设的")
+    print("   判窗口用的是这条告警的发生时间(ingest_ts)，判一次就定了，")
+    print("   没有定时扫描回头改：窗口过了之后新产生的告警自然判出 muted=0")
     return 0
 
 
@@ -289,7 +315,8 @@ def show_window(aggregator, event):
 
     print("\n   first_seen={} 就是段的身份，L7 拿它定位 alarm_list 的行".format(
         event.get("first_seen", "-")))
-    print("   alarm_log 的攒批还在内存里，没调 flush()/persist() 不会真的落库")
+    print("   alarm_log 的攒批还在内存里，没调 flush() 不会落库；")
+    print("   而且 WRITE_DB={} —— flush() 里那句 SQL 也被 write_db 开关挡着".format(WRITE_DB))
     print("   alarm_list 本层不写 —— 阈值 {} 的判断是 L7 的事".format(
         event.get("segment_threshold", event.get("threshold", "-"))))
     return 0
