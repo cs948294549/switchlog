@@ -424,8 +424,8 @@ CREATE TABLE alarm_list(
 -- 两段，但 L7 看到已有活跃告警只累加，仍是一条告警。所以下钻的边界用
 -- alarm_list 那一行的时间范围，不是 L6 的段标签 —— 用段标签只能查到其中一段。
 --
--- 过了 L2 黑名单的日志条条都写，包括噪声码（BFD_SESSION_CHG /
--- IF_ATTR_CHG）和没产生告警的，所以和 alarm_list 对得上 ——
+-- 过了 L2 黑名单的日志条条都写，包括噪声码（IF_ATTR_CHG 这类）和没产生
+-- 告警的，所以和 alarm_list 对得上 ——
 -- 指纹在 alarm_list 里查不到说明这组日志没到告警阈值，这本身是有用的信息。
 --
 -- 写入量就是收到的日志量，日志风暴时一分钟几万行，所以：
@@ -541,19 +541,38 @@ VALUES
 --   （csw=P1 / rsw=P3 / corp职场rsw=ignore / 其他=P2），
 --   因为 severity 规则没有 object 维度，没法只给 port-channel 配 P1。
 --   详见 syslog_rule 里 ETH_PORT_CHANNEL-5-FOP_CHANGED 那几行的注释。
--- LAG_MEMBER_CHG 保留：它是"还有成员时的正常冗余切换"，和"全断"不是
--- 一回事，stateless + ignore 定级，不参与 raise/clear 配对
-('LAG_MEMBER_CHG', 'stateless', 'interface', 600, 1, '',
- '聚合口成员切换。有冗余的LAG每天都会发生，报出来就是噪声'),
+-- LAG_MEMBER_CHG 也删了（本次改动），FOP_CHANGED 的非 'to none' 并入 IF_UP：
+--   现网 7 天的 FOP_CHANGED 只有两种正文，'...to none'(87条) 和
+--   '...from none to EthernetX'(86条)，一条成员间切换都没有。后者的语义
+--   就是"第一个可用成员起来了"，也就是聚合口从全断恢复，归 IF_UP 之后
+--   按 IF_DOWN 的指纹把 'to none' 开的那行关掉（对象都是 port-channelN）。
+--   原来归 LAG_MEMBER_CHG 时它是独立的 stateless 码，这 86 条各自在
+--   alarm_list 占一行 —— 而且定级表里并没有给它配 ignore（只有 syslog_event
+--   的注释这么写），实际落全局兜底的 '*' 按 P3 正常告警报出来。
+--   并入之后这批日志从"多出一行 P3"变成"关掉一行 IF_DOWN"。
+--   真出现 Ethernet1/38 to Ethernet1/39 这种成员间切换也归 IF_UP：那种
+--   情况下聚合口本来就是 up 的，没有 open 的行可关，重复 clear 在 L7
+--   被吃掉（ACTION_NONE）。详见 syslog_rule 里 FOP_CHANGED 那两行。
+--   线上库是 DELETE 掉这一行（本文件的 INSERT IGNORE 对已存在的行不生效）。
 -- 路由邻居
 ('BGP_DOWN',       'raise',     'peer',      21600, 1, 'BGP_UP',
- 'BGP邻居down。BFD会话down归到同一个码，同一指纹只出一条告警'),
+ 'BGP邻居down。BFD会话down本次改动已拆出独立的BFD_DOWN，不再并到这个码'),
 ('BGP_UP',         'clear',     'peer',      21600, 1, '',
  'BGP邻居up'),
 ('OSPF_DOWN',      'raise',     'peer',      21600, 1, 'OSPF_UP',
  'OSPF邻居down'),
 ('OSPF_UP',        'clear',     'peer',      21600, 1, '',
  'OSPF邻居up'),
+-- BFD 会话 down/up。本次改动拆出来的独立一对 raise/clear：原来
+-- STATE_DOWN 归 BGP_DOWN（借 BGP 的指纹，没有自己的恢复路径）、
+-- STATE_UP 归 BFD_SESSION_CHG（过程记录码，关不掉任何行）。
+-- 窗口 21600 跟 BGP/OSPF 那两对一致，都是路由邻居类。
+-- object_type='peer'，抽 neighbor IP，和 BGP_DOWN/OSPF_DOWN 同一种对象，
+-- 所以 STATE_DOWN/STATE_UP 两条正文抽出同一个 IP = 同指纹 = 关得掉
+('BFD_DOWN',       'raise',     'peer',      21600, 1, 'BFD_UP',
+ 'BFD会话down，转发路径探测不通。本次改动从BGP_DOWN拆出来独立成码'),
+('BFD_UP',         'clear',     'peer',      21600, 1, '',
+ 'BFD会话up，按BFD_DOWN的指纹回关'),
 -- 二层
 ('MAC_FLAP',       'stateless', 'mac',       600, 3, '',
  'MAC漂移。阈值3兼做降噪，虚机迁移造成的偶发单次不报'),
@@ -574,8 +593,11 @@ VALUES
  '登录失败，暴力破解类'),
 -- 噪声码：给它们事件码是为了不混进 UNKNOWN_MNEMONIC 的规则缺口清单，
 -- 真正的拦截在 syslog_suppress_rule 配 drop，不靠这里 enabled=0 关
-('BFD_SESSION_CHG', 'stateless', 'peer',      600, 1, '',
- 'BFD会话删除/迁移，BGP_DOWN的伴生日志，建议配黑名单在L2截掉'),
+--
+-- BFD_SESSION_CHG 已删除（本次改动）：原来接 SESSION_CREATED / REMOVED /
+-- MOVED / STATE_UP 四条。STATE_UP 拆去了新的 BFD_UP，剩下三条过程记录按
+-- 用户确认直接进 syslog_black_list 在 L2 拦掉，没有日志会落到这个码上了。
+-- 线上库是 DELETE 掉这一行（本文件的 INSERT IGNORE 对已存在的行不生效）。
 ('IF_ATTR_CHG',     'stateless', 'interface', 600, 1, '',
  '速率/双工/流控变化，端口up的伴生日志（一次up刷四条），建议配黑名单'),
 -- IF_FLAP 已删除（本次改动）：闪断升级那套（窗口内N次新开告警 -> 升级
@@ -593,6 +615,13 @@ VALUES
 -- 光模块电流/光功率越限：劣化前兆，没有标准clear写法，配 stateless
 ('SFP_HEALTH',      'stateless', 'interface', 1800, 1, '',
  '光模块电流/光功率告警，模块劣化前兆。沿用光模块告警窗口给长，避免抖动刷量'),
+-- H3C Comware9 的光模块 warning 档。和 SFP_HEALTH 分开：这边有明确的
+-- OPTICAL_WARNING_CLEAR 可以回关，配 raise/clear；SFP_HEALTH 是 stateless，
+-- 并进去就没法回关了。定级表里配 ignore，原因见定级行注释
+('SFP_WARN',        'raise',     'interface', 1800, 1, 'SFP_WARN_CLEAR',
+ 'H3C光模块warning档越限（电压/温度/收光/偏流）。只归档不告警，真故障看OPTICAL_ALARM和IF_DOWN'),
+('SFP_WARN_CLEAR',  'clear',     'interface', 1800, 1, '',
+ 'H3C光模块warning档恢复，按SFP_WARN的指纹回关'),
 -- 全部AAA服务器无响应。没有显式恢复日志（下次认证成功不会提这次失败），
 -- 配stateless。object_type用none：正文不带服务器地址，对象没法归一
 ('TACACS_FAIL',     'stateless', 'none',      600,  1, '',
@@ -650,6 +679,17 @@ VALUES
  '温度异常，需要IDC介入。三家厂商的温度告警/高温/严重告警都归这里'),
 ('TEMP_OK',    'clear', 'none', 3600, 1, '',
  '温度恢复，按TEMP_ALARM的指纹回关告警'),
+-- M-LAG（H3C 的 vPC）keepalive 链路状态。object_type=none：正文一个可变
+-- 字段都没有（"Keepalive link came up." 就这一句），一台设备一条。
+-- keepalive 是每台设备一条，不抽对象也不会串。
+--
+-- 只配 UP 等于配一个没有 raise 的 clear，所以成对配。但 DOWN 侧的
+-- mnemonic 名是按 UP 对称推的，现网和设备 logbuffer 里都没有样本，
+-- 见 syslog_rule 里那条规则的注释。
+('MLAG_KEEPALIVE_DOWN', 'raise', 'none', 3600, 1, 'MLAG_KEEPALIVE_UP',
+ 'M-LAG keepalive链路down。冗余降级：业务还靠peer-link转发，但此时peer-link再断就会双主'),
+('MLAG_KEEPALIVE_UP',   'clear', 'none', 3600, 1, '',
+ 'M-LAG keepalive链路恢复，按MLAG_KEEPALIVE_DOWN的指纹回关'),
 -- TCAM 资源水线。不抽对象，一台设备一条。
 --
 -- stateless 不配 raise：没有恢复日志 —— TCAM 用量降下来设备不会打
@@ -712,6 +752,15 @@ VALUES
 -- 上面那套 IF_DOWN 的阶梯走。原来这里是"不分角色都是P1"
 ('BGP_DOWN', '', '',           1, '',       100, 'BGP邻居down'),
 ('OSPF_DOWN','', '',           1, '',       100, 'OSPF邻居down'),
+-- BFD_DOWN 给 P2 不给 P1：BFD 探测不通的后果通常由 BGP_DOWN（P1）顶在
+-- 前面报出来，这里再给 P1 等于同一次链路故障出两条 P1。但也不降到全局
+-- 兜底的 P3 —— 转发路径探测不通是真故障，而且 BFD 不一定只给 BGP 用
+-- （现网样例挂在 Vlan101/103/105/107 这些 SVI 上）。
+-- 要改成和 BGP_DOWN 齐平就把 severity 改 1
+('BFD_DOWN', '', '',           2, '',       100, 'BFD会话down。给P2不给P1：后果通常由BGP_DOWN顶在前面报'),
+-- keepalive 断了业务还在转（peer-link 还通），是冗余降级不是中断，所以
+-- 不给 P1。但也不能 ignore：此时 peer-link 再断就会双主，是真实风险
+('MLAG_KEEPALIVE_DOWN', '', '', 2, '',      100, 'M-LAG keepalive链路down。给P2：业务未断但失去双主保护，peer-link再断就裂脑'),
 -- 按网段定级：测试网段的漂移不用按生产环境的级别看
 -- 职场设备的 MAC 漂移不告警。priority=10 必须小于下面测试网段那条（50），
 -- 否则 corp 职场里恰好落在 10.19.9.x 的设备会先命中那条被降成 P3 正常告警。
@@ -741,6 +790,17 @@ VALUES
  'PoE终端插拔是办公网日常行为，不告警。留日志回溯AP/话机掉线时间'),
 ('BUFFER_THRESHOLD',  '', '', 3, 'ignore', 100,
  'Nexus缓存水线属容量项，走容量审计。留日志用于回溯丢包投诉'),
+-- 配ignore的依据是查过设备实测值，不是因为它叫warning：
+-- 10.26.252.14 的 400GE1/0/57 报"voltage too high"，现场读数 3.39V，
+-- 告警门限 3.53V、预警门限 3.47V，都没越；温度 51℃ 对 75/70℃ 同理，
+-- display transceiver alarm 回 None。而且 50 秒后就打 CLEAR，值一个字没变。
+-- 10/27 的 400GE1/0/60 是同一套路（3.33V/47℃，50秒自清）。
+-- 即固件在 DDM 位上误置了一下，正文照搬，不是真越限。开告警就是误报。
+-- 归档保留是为了回溯模块劣化趋势——真越限会同时打 OPTMOD/2/OPTICAL_ALARM
+('SFP_WARN',          '', '', 3, 'ignore', 100,
+ 'H3C光模块warning档现网实测是固件误报（值未越限、50秒自清），只归档不告警'),
+('SFP_WARN_CLEAR',    '', '', 3, 'ignore', 100,
+ '恢复类日志，回关用，不单独告警'),
 ('MAC_FLAP_RECOVER',  '', '', 3, 'ignore', 100,
  '恢复类日志，MAC_FLAP本身stateless静默即恢复，不需要告警'),
 ('CLOCK_CHG',         '', '', 3, 'ignore', 100,
@@ -855,6 +915,32 @@ VALUES
 ('cisco_nx', 'ETHPORT-5-IF_DOWN_CFG_CHANGE', 'exact', '', '',
  'IF_DOWN', 'Interface\\s+([^\\s,(]+)', 100,
  'Interface Ethernet1/1 (description:) is down(Config change)'),
+-- 人工 shutdown / no shutdown 一对，归 IF_DOWN / IF_UP。和上面
+-- CFG_CHANGE 同性质（都是运维操作而非故障），但口确实不转发了，所以照样
+-- 走告警 —— 办公网那批 rsw 的 IF_DOWN 定级表里本来就配了 ignore。
+--
+-- 和 IF_HARDWARE 插模块那次的区别：shut/no-shut 是同一个动作的两端，
+-- no-shut 回关自己 shut 开的告警是对的。唯一的坑是真链路故障期间有人
+-- shut/no-shut 排查，no-shut 会把 LINK_FAILURE 开的告警一起关掉 ——
+-- 但链路没真恢复的话设备立刻再打一条 IF_DOWN_LINK_FAILURE 重新开，
+-- 误关窗口只有几秒，不值得为它拆事件码
+('cisco_nx', 'ETHPORT-5-IF_DOWN_ADMIN_DOWN', 'exact', '', '',
+ 'IF_DOWN', 'Interface\\s+([^\\s,(]+)', 100,
+ 'Interface Ethernet1/33 (description:9F_meeting) is down (Administratively down)'),
+('cisco_nx', 'ETHPORT-5-IF_ADMIN_UP', 'exact', '', '',
+ 'IF_UP', 'Interface\\s+([^\\s,(]+)', 100,
+ 'Interface Ethernet1/33 is admin up .，按IF_DOWN的指纹回关'),
+-- 光模块在位状态变化。现网成对出现：No-Transceiver(拔模块) 7 条 +
+-- 25G(插回去) 7 条，所以不能整条 mnemonic 归 IF_DOWN，否则插模块也开 down 告警。
+--   拔模块 -> IF_DOWN。和同时打的 ETHPORT-5-IF_DOWN 同对象同指纹，合成一条告警
+--   插模块 -> IF_ATTR_CHG(stateless)。插上模块不等于链路起来(可能没插纤)，
+--           不能用它回关 IF_DOWN；真正的回关走 vendor='*' 的 ETHPORT-5-IF_UP
+('cisco_nx', 'ETHPORT-5-IF_HARDWARE', 'exact', '', 'No-Transceiver',
+ 'IF_DOWN', 'Interface\\s+([^\\s,(]+)', 10,
+ 'Interface Ethernet1/4, hardware type changed to No-Transceiver，模块被拔掉'),
+('cisco_nx', 'ETHPORT-5-IF_HARDWARE', 'exact', '', '',
+ 'IF_ATTR_CHG', 'Interface\\s+([^\\s,(]+)', 200,
+ 'hardware type changed to 25G，模块插回去。兜底行不写body_match，以后出现40G/100G等写法一样命中'),
 ('cisco_nx', 'LINEPROTO-5-UPDOWN', 'exact', '', 'changed state to down',
  'IF_DOWN', 'on Interface\\s+([^,\\s]+),', 100,
  'Line protocol on Interface Ethernet1/38, changed state to down'),
@@ -867,6 +953,14 @@ VALUES
 ('cisco_nx', 'ETH_PORT_CHANNEL-5-PORT_UP', 'exact', '', '',
  'IF_UP', ':\\s+(\\S+)\\s+is\\s+up', 100,
  'port-channel3: Ethernet1/3 is up。和PORT_DOWN成对，对象是成员口'),
+-- 成员口被suspend（LACP协商不成/配置不一致/vPC一致性检查失败），归IF_DOWN：
+-- 口已经不转发流量了。对象是成员口，和PORT_DOWN/PORT_UP一致。
+-- 正文把接口名重复了两遍（'Ethernet1/37: Ethernet1/37 is suspended'），
+-- 不数冒号、直接按'名字+is suspended'的固定词形提取，避开FOP_CHANGED踩过的
+-- 前导裸冒号坑。恢复侧由 PORT_UP / ETHPORT-5-IF_UP 接住（同抽成员口，同指纹）
+('cisco_nx', 'ETH_PORT_CHANNEL-5-PORT_SUSPENDED', 'exact', '', '',
+ 'IF_DOWN', '(\\S+)\\s+is\\s+suspended', 100,
+ 'Ethernet1/37: Ethernet1/37 is suspended，成员口被挂起不转发，已并入IF_DOWN'),
 -- 聚合口全断：FOP_CHANGED 的 'to none' 才是全断，priority 小的先判。
 -- 原来靠"冒号+空格+名字+冒号"定位LAG名(':\\s+(\\S+?):')，行首有孤立
 -- 冒号杂质时会提前命中mnemonic自己尾部的冒号，把alarm_object抽成了
@@ -888,9 +982,21 @@ VALUES
 ('cisco_nx', 'ETH_PORT_CHANNEL-5-FOP_CHANGED', 'exact', '', 'to none',
  'IF_DOWN', '(port-channel\\d+)', 10,
  'first operational port changed from Ethernet1/38 to none，最后一个成员没了。已并入IF_DOWN，恢复靠ETHPORT-5-IF_UP'),
+-- 非 'to none' 的兜底行，原来归 LAG_MEMBER_CHG，本次改动归 IF_UP。
+-- body_match 故意留空、不写成 'from none to'：
+--   现网样本只有 'from none to EthernetX'（聚合口从全断恢复），归 IF_UP
+--   正是要的结果 —— 和上面那行同一个对象 port-channelN，同指纹，
+--   把 'to none' 开的那行 IF_DOWN 关掉。
+--   万一出现 'from Ethernet1/38 to Ethernet1/39' 这种成员间切换，落到这行
+--   也归 IF_UP：那时聚合口本来就是 up 的，没有 open 的行可关，L7 按
+--   "同段内重复 clear"返回 ACTION_NONE，不会误关也不会多插行。
+--   写成 'from none to' 反而有害：成员间切换就谁都不命中，掉进
+--   UNKNOWN_MNEMONIC 去污染规则缺口清单。
+-- 线上库是把原来那行的 event_code 从 LAG_MEMBER_CHG 改成 IF_UP
+-- （UPDATE，不是插新行：event_code 不在 uniq_match 里，改向不算新规则）。
 ('cisco_nx', 'ETH_PORT_CHANNEL-5-FOP_CHANGED', 'exact', '', '',
- 'LAG_MEMBER_CHG', '(port-channel\\d+)', 200,
- 'changed from Ethernet1/38 to Ethernet1/39，还有成员时是正常冗余切换'),
+ 'IF_UP', '(port-channel\\d+)', 200,
+ 'changed from none to Ethernet1/38，第一个可用成员起来了=聚合口恢复。已并入IF_UP，按IF_DOWN的指纹回关'),
 ('cisco_nx', 'ETHPORT-5-IF_DOWN_PORT_CHANNEL_MEMBERS_DOWN', 'exact', '', '',
  'IF_DOWN', 'Interface\\s+([^\\s,(]+)', 100,
  'Interface port-channel38 is down (No operational members)。已并入IF_DOWN'),
@@ -976,30 +1082,41 @@ VALUES
 ('*', 'BGP-5-ADJCHANGE', 'exact', '', 'Up',
  'BGP_UP', 'neighbor\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)', 100,
  'neighbor 172.28.2.133 Up'),
--- BFD 掉了就是 BGP 掉了，归到同一个 event_code，同一指纹只出一条告警
+-- ===== BFD 本次改动：五条 mnemonic 拆成"状态对 + 拉黑"两部分 =====
+--
+-- 改之前：
+--   STATE_DOWN                        -> BGP_DOWN（借BGP的指纹）
+--   STATE_UP / CREATED / REMOVED / MOVED -> BFD_SESSION_CHG（过程记录码）
+-- 改之后：
+--   STATE_DOWN -> BFD_DOWN（raise）    STATE_UP -> BFD_UP（clear）
+--   CREATED / REMOVED / MOVED          -> syslog_black_list，L2 拦掉
+--   BFD_SESSION_CHG 事件码删除
+--
+-- 推翻的两个原决定（用户已确认）：
+--   1. "BFD 掉了就是 BGP 掉了，归同一个码只出一条告警" —— 现在 BFD 有自己
+--      的一对 raise/clear，不再挖 BGP 的指纹。代价：一次 BGP 链路故障会同时
+--      出 BFD_DOWN 和 BGP_DOWN 两条告警（原来合成一条）。换来的是 BFD 能
+--      自动回关 —— 原来 STATE_DOWN 开的那行 BGP_DOWN 只能等 BGP-5-ADJCHANGE
+--      的 Up，BFD 自己恢复了也关不掉。
+--   2. "四条连起来能还原一次邻居震荡的全过程，所以不拉黑" —— 见
+--      syslog_black_list 里 BFD 那三条。
+--
+-- 两条正文抽出的都是 neighbor IP（实测 'BFD session 1090519096 to neighbor
+-- 172.28.2.14 on interface Vlan101 has gone down. Reason: Path Down.' 和
+-- '... is up.' 都抽出 172.28.2.14）-> 同指纹 -> 关得掉。
+-- 正文里的 session ID（1090519096）每次不同，不能拿来当对象。
+--
+-- 线上库是把这两行的 event_code 从 BGP_DOWN / BFD_SESSION_CHG 改成
+-- BFD_DOWN / BFD_UP（UPDATE，不是插新行：event_code 不在 uniq_match 里）。
 ('*', 'BFD-5-SESSION_STATE_DOWN', 'exact', '', '',
- 'BGP_DOWN', 'neighbor\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)', 100,
- 'BFD session to neighbor 172.28.2.133 on interface Eth1/6 has gone down'),
--- 噪声类：照常给事件码，L8 配 drop 拦掉
-('*', 'BFD-5-SESSION_REMOVED', 'exact', '', '',
- 'BFD_SESSION_CHG', 'neighbor\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)', 100,
- 'BFD 会话删除，down 之后的必然结果'),
-('*', 'BFD-5-SESSION_MOVED', 'exact', '', '',
- 'BFD_SESSION_CHG', '', 100,
- 'BFD 会话在板卡间迁移，正文里没有邻居IP'),
--- 另两条 BFD 会话事件，和上面两条一起归 BFD_SESSION_CHG。
--- 四条连起来能还原一次邻居震荡的全过程：
---   STATE_DOWN -> BGP_DOWN（真告警，P1）
---   REMOVED / MOVED / CREATED / STATE_UP -> BFD_SESSION_CHG（过程记录）
--- STATE_UP 没归到 BGP_UP：BGP 邻居恢复由 BGP-5-ADJCHANGE 的 Up 那条负责，
--- BFD 会话 up 只是底层探测通了，两件事。归过去会让 BGP_DOWN 的告警
--- 被一条 BFD 事件关掉，而 BGP 邻居可能还没起来
-('*', 'BFD-5-SESSION_CREATED', 'exact', '', '',
- 'BFD_SESSION_CHG', 'neighbor\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)', 100,
- 'BFD 会话建立。正文格式未对现网核实，正则沿用 SESSION_REMOVED 那条'),
+ 'BFD_DOWN', 'neighbor\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)', 100,
+ 'BFD session 1090519096 to neighbor 172.28.2.14 on interface Vlan101 has gone down. Reason: Path Down.'),
 ('*', 'BFD-5-SESSION_STATE_UP', 'exact', '', '',
- 'BFD_SESSION_CHG', 'neighbor\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)', 100,
- 'BFD 会话UP。正则沿用 SESSION_STATE_DOWN 那条（同一对事件，正文格式一致）'),
+ 'BFD_UP', 'neighbor\\s+(\\d+\\.\\d+\\.\\d+\\.\\d+)', 100,
+ 'BFD session 1090519100 to neighbor 172.28.2.14 on interface Vlan101 is up.，按BFD_DOWN的指纹回关'),
+-- SESSION_CREATED / SESSION_REMOVED / SESSION_MOVED 三条规则已删除（本次
+-- 改动），对应 mnemonic 进了 syslog_black_list。和别处"规则留着当开关"的
+-- 做法不同：这三条是用户明确要拉黑的过程记录，不保留恢复识别的入口。
 ('*', 'ETHPORT-5-SPEED', 'exact', '', '',
  'IF_ATTR_CHG', 'Interface\\s+([^\\s,(]+)', 100,
  '协商速率变化，端口up的伴生日志'),
@@ -1202,6 +1319,17 @@ VALUES
 ('cisco_nx', 'ETHPORT-3-IF_SFP_ALARM', 'exact', '', '',
  'SFP_HEALTH', 'Interface\\s+([^\\s,]+),', 100,
  'Interface Ethernet1/9, High Rx Power Alarm'),
+-- H3C Comware9 光模块 warning 档，OCCUR/CLEAR 成对。对象取 PhysicalName
+-- 而不是 RelativeResource 里的 interface：同一个口两种写法
+-- (FourHundredGigE1/0/57 vs 400GE1/0/57)，混用会出两个指纹。
+-- CLEAR 侧有通道级写法(多带 channel:N)，PhysicalName 仍是口级，
+-- 四个通道回关同一指纹，L7 判重走 ACTION_NONE，不会重复清
+('h3c', 'OPTMOD/4/OPTICAL_WARNING_OCCUR', 'exact', '', '',
+ 'SFP_WARN', 'PhysicalName=([^\\s,)]+)', 100,
+ 'ErrorCode=600010 Reason=Transceiver voltage was too high:CurrentValue = 3.39 V, Threshold =3.53 V'),
+('h3c', 'OPTMOD/4/OPTICAL_WARNING_CLEAR', 'exact', '', '',
+ 'SFP_WARN_CLEAR', 'PhysicalName=([^\\s,)]+)', 100,
+ 'ErrorCode=600010 Reason=Transceiver voltage decreased to the normal range，按SFP_WARN的指纹回关'),
 -- ---------- 以下两条 mnemonic 留空，只对剥不出 mnemonic 的报文生效 ----------
 --
 -- 这两条不得不走 fuzzy：它们的 header 格式 strip_mnemonic 剥不出来。
@@ -1346,6 +1474,20 @@ VALUES
  'TEMP_ALARM', '', 100, '华三温度告警（预警）。严重度数字待现网样例核实'),
 ('h3c', 'DEV/5/TEMPERATURE_NORMAL', 'exact', '', '',
  'TEMP_OK', '', 100, '华三温度恢复'),
+-- M-LAG keepalive。FAC 段带中划线，实测走 MNEMONIC_REGS[1] 能剥出
+-- 'M-LAG/6/MLAG_KEEPALIVELINK_UP'，不用走 fuzzy。
+-- object_regex 留空：正文没有任何可变字段。
+--
+-- !! DOWN 侧的 mnemonic 名没有现网样本，是按 UP 对称推的（Comware 的
+--    UP/DOWN、OCCUR/CLEAR 都是这个构词法）。推错的话这条规则永不命中，
+--    keepalive 断了不会告警，而 UP 那条会变成关不掉任何东西的 clear。
+--    下次现网出现 keepalive down，照缺口清单里的实际 mnemonic 名修这一条
+('h3c', 'M-LAG/6/MLAG_KEEPALIVELINK_DOWN', 'exact', '', '',
+ 'MLAG_KEEPALIVE_DOWN', '', 100,
+ '按UP对称推的mnemonic名，无现网样本待核实。正文推测形如Keepalive link went down.'),
+('h3c', 'M-LAG/6/MLAG_KEEPALIVELINK_UP', 'exact', '', '',
+ 'MLAG_KEEPALIVE_UP', '', 100,
+ 'Keepalive link came up.，按MLAG_KEEPALIVE_DOWN的指纹回关'),
 -- SIC 模块温度控制电路异常。老系统归在同一条规则里，照搬
 ('h3c', 'HSC/4/SICTMPEXC', 'exact', '', '',
  'TEMP_ALARM', '', 100, 'SIC模块温度控制电路异常'),
@@ -1403,11 +1545,22 @@ VALUES
 -- 只拦某台设备：进 (ip, mnemonic) 那张 dict，不参与全量流量
 ('ETHPORT-5-IF_DOWN_CHANNEL_ADMIN_DOWN', 'mnemonic', '10.16.249.5', 0, 1,
  '该设备成员口人工 shutdown 后持续刷，确认过无影响'),
--- BFD 那几条曾经在这里（SESSION_MOVED / SESSION_REMOVED），现在移出去了：
--- 四条 BFD 会话事件统一走 L3 的 BFD_SESSION_CHG 事件码，见 syslog_rule。
--- 理由是 BFD 会话的创建/迁移/删除/UP 连起来能还原一次邻居震荡的过程，
--- 在 L2 丢掉就什么都不剩了。不想看告警的话去 syslog_severity_rule
--- 配 action=ignore —— 那样日志照样落 alarm_log 可回溯，只是不开告警。
+-- BFD 会话的三条过程记录。这里推翻了之前"移出黑名单、四条连起来能还原
+-- 一次邻居震荡的全过程"那个决定（用户已确认）：BFD 的告警价值已经由新拆出
+-- 的 BFD_DOWN / BFD_UP 一对 raise/clear 承担（见 syslog_rule 里 BFD 那节），
+-- 这三条既不是状态变化、也抽不出稳定对象，留着只是噪声：
+--   CREATED  'BFD session to neighbor 172.28.2.14 on interface Vlan101 has
+--            been created'  会话建立，配置下发/邻居起来时打
+--   REMOVED  '... has been removed'  会话删除，down 之后或删配置时打
+--   MOVED    'BFD session 0x4100003c: Installed on LC 1'  板卡间迁移，
+--            正文里只有 session ID 和板卡号，没有 neighbor IP，抽不出 peer
+-- 代价：不再能用五条日志串起来还原震荡过程，只剩 down/up 两个状态点。
+('BFD-5-SESSION_CREATED', 'mnemonic', '', 0, 1,
+ 'BFD会话建立，过程记录非状态变化。真正的状态走BFD_UP(SESSION_STATE_UP)'),
+('BFD-5-SESSION_REMOVED', 'mnemonic', '', 0, 1,
+ 'BFD会话删除，down之后的必然结果或删配置留痕，不是独立故障'),
+('BFD-5-SESSION_MOVED', 'mnemonic', '', 0, 1,
+ 'BFD会话在板卡间迁移，正文只有session ID和板卡号，抽不出neighbor对象'),
 ('LICENSE-6-VIOLATION', 'mnemonic', '', 0, 1,
  'License特性用量超授权数的周期性提示，非故障，每分钟刷一次。容量问题走license审计，不进告警管线'),
 -- PoE 端口功率周期回显：几秒一条、每次数值都不一样（Power=2400/1100/3100），
@@ -1444,8 +1597,9 @@ VALUES
 -- 没有删掉那些 syslog_rule：黑名单这一行就是开关 —— 哪天想重新看某一类，
 -- 把这里对应的行 enabled=0，L3 的规则和定级原样还在，立刻恢复识别。
 -- 规则删了反而要重新配一遍正则。
--- BFD-5-SESSION_REMOVED 曾经在这里，已移出 —— 四条 BFD 会话事件统一走
--- L3 的 BFD_SESSION_CHG，见 syslog_rule 那一节
+-- BFD-5-SESSION_REMOVED 本次改动又加回黑名单了（连同 CREATED / MOVED），
+-- 位置在上面 LICENSE-6-VIOLATION 之前那一组，不在这一批里 ——
+-- 这一批的特点是"规则留着当开关"，BFD 那三条的规则是直接删掉的
 ('DAEMON-3-SYSTEM_MSG', 'mnemonic', '', 0, 1,
  'Nexus守底进程杂项消息，现网见到的是NTP丢弃公网扫描报文。非网络故障'),
 -- 内核杂项消息，和上面 DAEMON-3-SYSTEM_MSG 是同一类大杂烩 mnemonic。
@@ -1687,9 +1841,15 @@ VALUES
 -- H3C 设备重启留痕，和cisco_nx的LOG-6-SYSTEM_MSG同族
 ('SYSLOG/6/SYSLOG_RESTART', 'mnemonic', '', 0, 1,
  'H3C设备syslog进程重启留痕，设备重启时必打，无告警价值'),
--- 手工ping命令的统计结果留痕，不是自动化探测，是人在排查时自己敲的
+-- 手工ping命令的统计结果留痕，不是自动化探测，是人在排查时自己敲的。
+-- 查过 10.26.252.14：没有任何 nqa 配置，logbuffer 里的间隔也不规律
+-- （22:42~22:45 四次，包数 3/3/20/5），确认是人敲的不是定时探测
 ('PING/6/PING_STATISTICS', 'mnemonic', '', 0, 1,
  '手工执行ping命令的统计结果留痕（丢包率等），是操作记录不是告警，真实连通性故障走BFD/接口状态那套'),
+-- 同族不同码：带 VPN instance 的 ping 走这个 mnemonic，PING_STATISTICS
+-- 的黑名单行拦不住它，之前落在 UNKNOWN_MNEMONIC 缺口清单里
+('PING/6/PING_VPN_STATISTICS', 'mnemonic', '', 0, 1,
+ 'VPN实例内手工ping的统计结果留痕，同PING_STATISTICS，操作记录不是告警'),
 ('SSHS/6/SSHS_LOG', 'mnemonic', '', 0, 1,
  'SSH登录接受留痕，txt第375行'),
 ('SSHS/6/SSHS_CONNECT', 'mnemonic', '', 0, 1,
@@ -1865,6 +2025,14 @@ VALUES
  'NTP层级变化留痕，H3C另一种严重度写法，和NTP/5/NTP_CHANGE_STRATUM同族'),
 ('NTP/5/NTP_STRATUM_CHANGE', 'mnemonic', '', 0, 1,
  'NTP层级变化，H3C写法(带冒号无括号变体)，和NTP_CHANGE_STRATUM同族'),
+-- 下面两条是严重度 5 的写法。原来只拉了 NTP/4/NTP_LEAP_CHANGE，
+-- 现网 new_csw1_dc19_m01 发的是 /5/，拦不住，落在了缺口清单里。
+-- CLOCK_CHANGE 这条和已有的 CLOCK_CHG 事件码同族（那个码定级配的是
+-- ignore），用户已确认按噪声直接拉黑，不并进 CLOCK_CHG
+('NTP/5/NTP_CLOCK_CHANGE', 'mnemonic', '', 0, 1,
+ '系统时钟被NTP校准的留痕，对时的正常结果，和SYSMIB/4/CLKCHANGE(CLOCK_CHG)同族，用户已确认拉黑'),
+('NTP/5/NTP_LEAP_CHANGE', 'mnemonic', '', 0, 1,
+ 'NTP leap秒状态变化，严重度5写法，和已拉黑的NTP/4/NTP_LEAP_CHANGE同族'),
 ('NTP/4/NTP_STRATUM_CHANGE', 'mnemonic', '', 0, 1,
  'NTP层级变化，华为写法，和H3C的NTP_STRATUM_CHANGE同族'),
 ('NTP/4/STRATUM_CHANGE', 'mnemonic', '', 0, 1,
@@ -1956,8 +2124,8 @@ VALUES
 -- ---------- 批量屏蔽：接口带宽变化 / 第三方管理面审计 / 非原厂光模块（23条）----------
 --
 -- 带宽变化：聚合口bandwidth值变化，是成员口增减/速率协商后的衍生通知，
--- 不是故障。真要发现聚合口异常，走 IF_DOWN（全断，原LAG_DOWN已并入）
--- / LAG_MEMBER_CHG（成员切换）那套
+-- 不是故障。真要发现聚合口异常，走 IF_DOWN / IF_UP 那套
+-- （原 LAG_DOWN 和 LAG_MEMBER_CHG 都已并入，见上面 FOP_CHANGED 的注释）
 ('ETHPORT-5-IF_BANDWIDTH_CHANGE', 'mnemonic', '', 0, 1,
  '聚合口bandwidth值变化通知，是成员口增减/速率协商的衍生结果，不是故障'),
 -- Linux式syslog转发(sudo session opened/closed)，设备自己的操作系统审计，
@@ -2106,7 +2274,13 @@ VALUES
 -- 用户已确认按设备标准行为处理，不单独记录始发路由器(LsdbRouterId)
 -- 异常这条线索，真正的邻居失联走OSPF_DOWN
 ('OSPF/5/MAXAGE_LSA', 'mnemonic', '', 0, 1,
- 'OSPF LSA老化(MaxAge)，标准生命周期行为，不代表邻居down或路由异常，用户已确认按噪声拉黑');
+ 'OSPF LSA老化(MaxAge)，标准生命周期行为，不代表邻居down或路由异常，用户已确认按噪声拉黑'),
+-- vPC 的 layer3 peer-router 固定提示（cisco_nx）。严重度写的是 2，但设备
+-- 并没有真去比对两边配置，正文也没有任何可变字段，抽不出告警对象。真正的
+-- vPC 故障(peer-link down / peer-keepalive 超时 / vPC 口 suspend)是另外的
+-- mnemonic，拦这条不影响发现——但那几个 mnemonic 目前一条规则都没配
+('VPC-2-L3_VPC_UNEQUAL_WEIGHT', 'mnemonic', '', 0, 1,
+ 'vPC启用layer3 peer-router的固定提示，非检测到配置不一致，无可变字段，用户已确认按噪声拉黑');
 
 -- ============================================================
 -- 种子数据：L8 静默规则模板（三条，全部 enabled=0）
@@ -2257,9 +2431,11 @@ SELECT '^10[.]19[.]19[.]', '', '', '', '', 0,
 --   NTP_DROP          DAEMON-3-SYSTEM_MSG
 --   DHCP_TIMEOUT      DHCP/5/WAITOFFER_TIMEOUT
 --   CLOCK_CHG         SYSMIB/4/CLKCHANGE
---   IF_ATTR_CHG       ETHPORT-5-SPEED / IF_DUPLEX /
---                     IF_RX_FLOW_CONTROL / IF_TX_FLOW_CONTROL
 --   CERT_EXPIRED      PKI/4/LOCAL_EXPIRED
+--
+-- IF_ATTR_CHG 已不再是死码：ETHPORT-5-SPEED / IF_DUPLEX /
+-- IF_RX_FLOW_CONTROL / IF_TX_FLOW_CONTROL 四条确实还被黑名单挡着，但
+-- 新加的 ETHPORT-5-IF_HARDWARE 兜底行（插模块方向）没被拦，会落到这个码上
 --   BUFFER_THRESHOLD  被 scope=message 的 BUFFER_THRESHOLD_EXCEEDED 拦下。
 --                     它那条 syslog_rule 是 fuzzy（mnemonic 为空），
 --                     所以下面那条按 pattern 关联的自查 SQL 查不到它，
@@ -2298,23 +2474,27 @@ SELECT '^10[.]19[.]19[.]', '', '', '', '', 0,
 --                       'syslog_alarm_state','alarm_list','alarm_log');
 --
 -- 种子数据应为（2026-11-19 核对，之前这段写的 20/49/31/24 早已过期）：
---   syslog_black_list   193
---   syslog_rule          98
---   syslog_event         38  （含 3 个兜底码；IF_FLAP / LAG_DOWN / LAG_UP 已删除）
---   syslog_severity_rule  27  （其中 1 条 enabled=0 停用示例：BGP_UP）
+--   syslog_black_list   201
+--   syslog_rule         109
+--   syslog_event         42  （含 3 个兜底码；IF_FLAP / LAG_DOWN / LAG_UP /
+--                              LAG_MEMBER_CHG / BFD_SESSION_CHG 已删除，
+--                              BFD_DOWN / BFD_UP / SFP_WARN /
+--                              SFP_WARN_CLEAR / MLAG_KEEPALIVE_DOWN /
+--                              MLAG_KEEPALIVE_UP 新增）
+--   syslog_severity_rule  31  （其中 1 条 enabled=0 停用示例：BGP_UP）
 --   syslog_mute_rule      3  （全部 enabled=0，不静默任何告警）
 --   其余三张表是数据表，重建后为空
 --
--- SELECT count(*) FROM syslog_black_list;      -- 193
--- SELECT count(*) FROM syslog_rule;            -- 98
--- SELECT count(*) FROM syslog_event;           -- 38
--- SELECT count(*) FROM syslog_severity_rule;   -- 27
+-- SELECT count(*) FROM syslog_black_list;      -- 201
+-- SELECT count(*) FROM syslog_rule;            -- 109
+-- SELECT count(*) FROM syslog_event;           -- 42
+-- SELECT count(*) FROM syslog_severity_rule;   -- 31
 -- SELECT count(*) FROM syslog_mute_rule;       -- 3
 --
--- 黑名单里 185 条是 scope=mnemonic、8 条是 scope=message。
+-- 黑名单里 193 条是 scope=mnemonic、8 条是 scope=message。
 -- 其中一部分 mnemonic 对应的 syslog_rule 仍在表里但永不命中
 -- （见上面"死码清单"）。这不是配置错误，是故意留的开关
--- SELECT count(*) FROM syslog_black_list WHERE enabled=1;   -- 193
+-- SELECT count(*) FROM syslog_black_list WHERE enabled=1;   -- 201
 --
 -- scope=message 这 8 条每条日志都要线性扫，实测 3 条约 0.1us、
 -- 剥一次 mnemonic 是 0.41us，所以现在这个量级可以忽略。

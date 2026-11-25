@@ -12,6 +12,7 @@
 | severity 用 emergency..debug 八级 | 用 P1/P2/P3 整数 | syslog level 和告警级别没有对应关系(§4.1.9 自己也提到 `%BGP-5-ADJCHANGE` 是 level 5 但对我们是 P1) |
 | §4.5 状态机按"有没有活跃告警"判 raise/clear | 按"窗口段"判:一个段 = `alarm_list` 的一行 | 见下面的「聚合模型的修订」 |
 | §4.5 闪断识别(窗口内 N 次开告警 → `IF_FLAP`) | 整套去掉 | 同上 |
+| §4.7 / §5 的 `LAG_DOWN` / `LAG_UP` / `LAG_MEMBER_CHG` 三个聚合口事件码 | 全部删除,并入 `IF_DOWN` / `IF_UP` | `LAG_UP` 没有任何规则会产生,`LAG_DOWN` 开了永久关不掉;`LAG_MEMBER_CHG` 实际收到的全是"聚合口恢复"。见 §4.7 和 `sql/schema.sql` 里 `FOP_CHANGED` 那两行 |
 
 另外 §4.1.2 的"语法族"没有落地成代码里的分派:三种 mnemonic 写法
 (Cisco / Comware / FortiGate)对每条报文一起试,厂商只用来查规则表。
@@ -524,22 +525,26 @@ ZREMRANGEBYSCORE 清理窗口外 → ZCARD 取计数
 
 #### 收敛结果:两个指纹
 
+事件码都是 `IF_DOWN`(原 `LAG_DOWN` 已并入),但**对象不同,所以仍是两个指纹**:
+
 | event_code | object | 命中 | 指纹 | count |
 |---|---|---|---|---|
-| `LAG_DOWN` | `port-channel38` | 1、3、5 | `md5(ip\|LAG_DOWN\|port-channel38)` | 3 |
+| `IF_DOWN` | `port-channel38` | 1、3、5 | `md5(ip\|IF_DOWN\|port-channel38)` | 3 |
 | `IF_DOWN` | `Ethernet1/38` | 2、4 | `md5(ip\|IF_DOWN\|Ethernet1/38)` | 2 |
 
 对应规则行:
 
 | vendor | mnemonic | body_match | event_code | 备注 |
 |---|---|---|---|---|
-| `cisco_nx` | `ETH_PORT_CHANNEL-5-FOP_CHANGED` | `to none` | `LAG_DOWN` | |
-| `cisco_nx` | `ETH_PORT_CHANNEL-5-FOP_CHANGED` | (其余) | `LAG_MEMBER_CHG` | P3,还有成员时是正常冗余切换 |
+| `cisco_nx` | `ETH_PORT_CHANNEL-5-FOP_CHANGED` | `to none` | `IF_DOWN` | priority 10,排在兜底行前面 |
+| `cisco_nx` | `ETH_PORT_CHANNEL-5-FOP_CHANGED` | (其余) | `IF_UP` | priority 200,`from none to X` = 聚合口恢复 |
 | `cisco_nx` | `ETH_PORT_CHANNEL-5-PORT_DOWN` | | `IF_DOWN` | |
-| `cisco_nx` | `ETHPORT-5-IF_DOWN_PORT_CHANNEL_MEMBERS_DOWN` | | `LAG_DOWN` | |
+| `cisco_nx` | `ETHPORT-5-IF_DOWN_PORT_CHANNEL_MEMBERS_DOWN` | | `IF_DOWN` | |
 | `cisco_nx` | `ETHPORT-5-IF_DOWN_LINK_FAILURE` | | `IF_DOWN` | |
 
-`FOP_CHANGED` 必须用 `body_match` 分开:`to none` 才是 LAG 全断;变成 `to Ethernet1/39` 是成员切换,有冗余的 LAG 每天都会发生,报出来就是噪声。
+`FOP_CHANGED` 仍然要用 `body_match` 分开,但分的是 `IF_DOWN` / `IF_UP` 两头,不再有独立的 LAG 事件码:`to none` 是最后一个成员没了(全断),其余正文(现网只见过 `from none to EthernetX`)是第一个可用成员起来了,也就是全断恢复。两头抽的对象都是 `port-channelN`,同指纹,所以恢复那条关得掉 down 那条。
+
+原来这里写的 `LAG_DOWN` / `LAG_MEMBER_CHG` 两个码都已删除:`LAG_DOWN` 的恢复码 `LAG_UP` 没有任何规则会产生,告警开了永久关不掉;`LAG_MEMBER_CHG` 是独立 stateless 码,恢复日志各自在 `alarm_list` 占一行。合并的代价是聚合口全断不再单独定级(`severity` 规则没有 object 维度),跟 `IF_DOWN` 的阶梯走。
 
 #### 为什么不能把两个指纹合成一个
 
@@ -565,7 +570,7 @@ inc:{ip}:{lag}  →  hash {incident_id, created, root_cause, alarms:[...]}   ttl
 
 1. **因果关系是反的。** LAG down(.585)在前,成员 down(.612)在后,差 27ms。§4.3 的 `depend`(上游先 down → 下游挂起)在这里用不上,因为根因后到。所以事件单必须事后回捞:LAG 告警先建单,30 秒内成员告警进来再补 `root_cause`。反方向也成立,谁先到谁建单。
 
-   注意回捞靠的是 `port_lag_member` 查出来的归属,时序只用来确定"谁先到",不用来推断"谁属于谁"。先到的是不是根因,同样要看 `event_code` 的层级关系(`IF_DOWN` 在成员口上 → `LAG_DOWN` 在 LAG 上),不是看时间戳先后。
+   注意回捞靠的是 `port_lag_member` 查出来的归属,时序只用来确定"谁先到",不用来推断"谁属于谁"。先到的是不是根因,同样要看层级关系(成员口上的 `IF_DOWN` → LAG 上的 `IF_DOWN`),不是看时间戳先后。两层现在是同一个事件码,区分靠 `alarm_object` 是 `EthernetX/Y` 还是 `port-channelN`。
 
 2. **#3 和 #5 是重复日志。** mnemonic、正文、对象全同,隔 30ms。在现有设计下不会多一条告警 —— L5 的 `raise` 遇到已有活跃告警只累加 `count`;闪断计数又只数"新开告警"这一跳,所以不会被刷爆。`count` 会多 1,但 `count` 不参与任何次数判断。
 
@@ -716,10 +721,8 @@ create table port_lag_member (
 
 | event_code | severity | state | object_type | Cisco NX-OS | H3C | 华为 | 恢复事件 |
 |---|---|---|---|---|---|---|---|
-| `IF_DOWN` | P2 | raise | interface | `%ETHPORT-5-IF_DOWN`、`...IF_DOWN_LINK_FAILURE`、`%LINEPROTO-5-UPDOWN ... down`、`%ETH_PORT_CHANNEL-5-PORT_DOWN` | `IFNET/3/PHY_UPDOWN`、`IFNET/5/LINK_UPDOWN` | `IFNET/3/PHY_UPDOWN`、`IFNET/5/LINK_UPDOWN` | `IF_UP` |
-| `IF_UP` | P3 | clear | interface | `%ETHPORT-5-IF_UP`、`%LINEPROTO-5-UPDOWN ... up` | `IFNET/3/PHY_UPDOWN`、`IFNET/5/LINK_UPDOWN` | `IFNET/3/PHY_UPDOWN`、`IFNET/5/LINK_UPDOWN` | — |
-| `LAG_DOWN` | P1 | raise | interface | `%ETHPORT-5-IF_DOWN_PORT_CHANNEL_MEMBERS_DOWN`、`%ETH_PORT_CHANNEL-5-FOP_CHANGED` + `to none` | `LAGG/.../LAG_STATE` | `Eth-Trunk/.../TRUNK_STATE` | `LAG_UP` |
-| `LAG_MEMBER_CHG` | P3 | stateless | interface | `%ETH_PORT_CHANNEL-5-FOP_CHANGED`(非 `to none`) | — | — | 窗口自动恢复 |
+| `IF_DOWN` | 按角色定级 | raise | interface | `%ETHPORT-5-IF_DOWN`、`...IF_DOWN_LINK_FAILURE`、`%LINEPROTO-5-UPDOWN ... down`、`%ETH_PORT_CHANNEL-5-PORT_DOWN`、`...IF_DOWN_PORT_CHANNEL_MEMBERS_DOWN`、`%ETH_PORT_CHANNEL-5-FOP_CHANGED` + `to none` | `IFNET/3/PHY_UPDOWN`、`IFNET/5/LINK_UPDOWN` | `IFNET/3/PHY_UPDOWN`、`IFNET/5/LINK_UPDOWN` | `IF_UP` |
+| `IF_UP` | P3 | clear | interface | `%ETHPORT-5-IF_UP`、`%LINEPROTO-5-UPDOWN ... up`、`%ETH_PORT_CHANNEL-5-PORT_UP`、`%ETH_PORT_CHANNEL-5-FOP_CHANGED`(非 `to none`) | `IFNET/3/PHY_UPDOWN`、`IFNET/5/LINK_UPDOWN` | `IFNET/3/PHY_UPDOWN`、`IFNET/5/LINK_UPDOWN` | — |
 | `BGP_DOWN` | P1 | raise | peer | `%BGP-5-ADJCHANGE ... Down` | `BGP/5/BGP_STATE_CHANGED ... Established to` | `BGP/2/hwBgpPeerBackwardTransition` | `BGP_UP` |
 | `OSPF_DOWN` | P1 | raise | peer | `%OSPF-5-ADJCHANGE ... to DOWN` | `OSPF/5/OSPF_NBR_CHG ... to Down` | `OSPF/.../NBR_CHANGE ... Down` | `OSPF_UP` |
 | `MAC_FLAP` | P2 | stateless | mac | `MAC_MOVE` / `MACFLAP` | `MAC/4/MAC_FLAPPING` | `MAC/.../MACFLAPPING` | 窗口自动恢复 |

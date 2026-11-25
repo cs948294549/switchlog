@@ -29,12 +29,10 @@ from db import get_rule_db, get_device_db
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOG_FILES = [
     os.path.join(HERE, "logs", "raw_packets.log"),
-    os.path.join(HERE, "logs", "raw_packets.log.2026-11-19"),
-    os.path.join(HERE, "logs", "raw_packets.log.2026-11-18"),
-    os.path.join(HERE, "logs", "raw_packets.log.2026-11-17"),
-    os.path.join(HERE, "logs", "raw_packets.log.2026-11-16"),
-    os.path.join(HERE, "logs", "raw_packets.log.2026-11-15"),
-    os.path.join(HERE, "logs", "raw_packets.log.2026-11-14"),
+    # os.path.join(HERE, "logs", "raw_packets.log.2026-11-23"),
+    # os.path.join(HERE, "logs", "raw_packets.log.2026-11-22"),
+    # os.path.join(HERE, "logs", "raw_packets.log.2026-11-21"),
+    # os.path.join(HERE, "logs", "raw_packets.log.2026-11-19"),
 ]
 
 # L1 产出字段契约（pipeline/__init__.py）
